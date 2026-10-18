@@ -625,6 +625,52 @@ impl Store {
 
     // ---------- alterações de arquivo ----------
 
+    /// Última alteração registrada numa sessão, com o diff completo — usada
+    /// pelo `/undo` para desfazer sem depender de git.
+    pub fn ultima_alteracao(&self, session_id: &str) -> Result<Option<AlteracaoRecente>> {
+        self.with(|c| {
+            let linha = c
+                .query_row(
+                    "SELECT path, change_type, diff FROM file_changes \
+                     WHERE session_id = ?1 AND diff IS NOT NULL ORDER BY id DESC LIMIT 1",
+                    params![session_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(linha.map(|(path, tipo, diff)| AlteracaoRecente {
+                path,
+                change_type: tipo,
+                diff: diff.unwrap_or_default(),
+            }))
+        })
+    }
+
+    /// Todas as alterações da sessão (para o `/diff`).
+    pub fn alteracoes(&self, session_id: &str) -> Result<Vec<AlteracaoRecente>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT path, change_type, diff FROM file_changes \
+                 WHERE session_id = ?1 AND diff IS NOT NULL ORDER BY id ASC",
+            )?;
+            let linhas = stmt
+                .query_map(params![session_id], |r| {
+                    Ok(AlteracaoRecente {
+                        path: r.get(0)?,
+                        change_type: r.get(1)?,
+                        diff: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(linhas)
+        })
+    }
+
     pub fn record_file_change(
         &self,
         session_id: &str,
@@ -827,6 +873,15 @@ impl Store {
             })
         })
     }
+}
+
+/// Alteração de arquivo registrada, com o diff guardado — usado pelo
+/// `/undo` (desfazer) e pelo `/diff` (revisar).
+#[derive(Clone, Debug)]
+pub struct AlteracaoRecente {
+    pub path: String,
+    pub change_type: String,
+    pub diff: String,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

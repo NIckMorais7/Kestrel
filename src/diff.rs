@@ -128,6 +128,128 @@ pub fn stats(old: &str, new: &str) -> DiffStats {
     diff(old, new).stats
 }
 
+/// Reaplica um diff no sentido inverso, devolvendo o texto anterior.
+///
+/// O diff do Kestrel é linha a linha (`+` adicionada, `-` removida, ` `
+/// contexto), então reverter é mecânico: as linhas `+` saem e as linhas `-`
+/// voltam — nenhuma correspondência com o arquivo atual é necessária, o diff
+/// já descreve as duas pontas. Usado pelo `/undo`, para desfazer a alteração de
+/// um arquivo sem depender de git.
+///
+/// O único requisito é que o arquivo atual seja de fato a ponta "depois" do
+/// diff; por isso conferimos as linhas de contexto. Se não baterem, devolvemos
+/// `None` e o chamador avisa em vez de escrever porcaria.
+pub fn reverter(diff_texto: &str, atual: &str) -> Option<String> {
+    let atuais: Vec<&str> = if atual.is_empty() {
+        Vec::new()
+    } else {
+        atual.lines().collect()
+    };
+    let mut operacoes: Vec<(char, &str)> = Vec::new();
+    for linha in diff_texto.lines() {
+        if let Some(resto) = linha.strip_prefix('+') {
+            operacoes.push(('+', resto));
+        } else if let Some(resto) = linha.strip_prefix('-') {
+            operacoes.push(('-', resto));
+        } else if let Some(resto) = linha.strip_prefix(' ') {
+            operacoes.push((' ', resto));
+        }
+    }
+    if operacoes.is_empty() {
+        return None;
+    }
+    // Reconstrução: as operações do diff, na ordem, descrevem a ponta "depois"
+    // nas linhas de contexto e de `+`. Caminhamos o arquivo atual por esse
+    // caminho para provar que ele ainda é essa ponta.
+    let mut esperado: Vec<&str> = Vec::new();
+    for (sinal, conteudo) in &operacoes {
+        if *sinal == '+' || *sinal == ' ' {
+            esperado.push(conteudo);
+        }
+    }
+    if atuais.len() < esperado.len() || atuais[..esperado.len()] != esperado[..] {
+        return None;
+    }
+    // Reverso: onde o diff removeu (`-`) a linha volta; onde acrescentou (`+`)
+    // ela sai; o contexto permanece nos dois.
+    let mut saida: Vec<&str> = Vec::new();
+    for (sinal, conteudo) in operacoes {
+        if sinal != '+' {
+            saida.push(conteudo);
+        }
+    }
+    // Linhas acrescentadas depois do diff (por outra edição) são preservadas.
+    if atuais.len() > esperado.len() {
+        saida.extend_from_slice(&atuais[esperado.len()..]);
+    }
+    let mut texto = saida.join("\n");
+    texto.push('\n');
+    Some(texto)
+}
+
+/// O diff do Kestrel é linha a linha, então reverter é mecânico. Sem isso o
+/// `/undo` (desfazer sem git) não teria base.
+#[test]
+fn reverter_devolve_o_texto_anterior() {
+    let antes = "linha um\nlinha dois\nlinha tres\n";
+    let depois = "linha um\nlinha DOIS alterada\nlinha tres\nlinha quatro\n";
+    let d = diff(antes, depois);
+    assert_eq!(d.stats.additions, 2);
+    assert_eq!(d.stats.deletions, 1);
+    let recuperado = reverter(&d.text, depois).expect("deveria reverter");
+    assert_eq!(recuperado, antes);
+}
+
+/// Reverter é reversível: ida e volta dão no mesmo lugar.
+#[test]
+fn reverter_e_estavel_em_duas_chamadas() {
+    let a = "um\ndois\ntres\n";
+    let b = "um\nDOIS\ntres\n";
+    // diff(a→b); para desfazer, o estado atual é a ponta final (`b`).
+    let ida = diff(a, b);
+    let de_volta = reverter(&ida.text, b).expect("volta");
+    assert_eq!(de_volta, a);
+    // No sentido inverso, diff(b→a) com o estado `a` devolve `b`.
+    let volta = diff(b, a);
+    assert_eq!(
+        reverter(&volta.text, a).as_deref(),
+        Some(b),
+        "reverter não é reversível"
+    );
+}
+
+/// Arquivo que mudou desde a alteração registrada: o diff não bate mais e o
+/// reverso é recusado em vez de escrever porcaria.
+#[test]
+fn reverter_recusa_quando_o_arquivo_mudou() {
+    let antes = "a\nb\n";
+    let depois = "a\nB\n";
+    let d = diff(antes, depois);
+    let estado_atual = "completamente diferente\noutra linha\n";
+    assert!(reverter(&d.text, estado_atual).is_none());
+}
+
+/// Mudança que só remove linhas também reverte.
+#[test]
+fn reverter_remocao_de_linhas() {
+    let antes = "fica\nsai\ntambem fica\n";
+    let depois = "fica\ntambem fica\n";
+    let d = diff(antes, depois);
+    let recuperado = reverter(&d.text, depois).expect("remocao deveria reverter");
+    assert_eq!(recuperado, antes);
+}
+
+/// Crescer o arquivo depois do fato não deve impedir o reverso.
+#[test]
+fn reverter_preserva_linhas_acrescentadas_depois() {
+    let antes = "a\nb\n";
+    let depois = "a\nB\n";
+    let d = diff(antes, depois);
+    let atual = "a\nB\nc nova\nd nova\n";
+    let recuperado = reverter(&d.text, atual).expect("deveria reverter");
+    assert_eq!(recuperado, "a\nb\nc nova\nd nova\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

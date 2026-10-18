@@ -770,6 +770,8 @@ impl App {
                     }
                 }
             }
+            "/undo" | "/desfazer" => self.desfazer_ultima(),
+            "/diff" | "/mudancas" => self.mostrar_diff(),
             "/cost" | "/custo" | "/tokens" => {
                 self.mostrar_custo();
             }
@@ -1039,6 +1041,85 @@ impl App {
     /// enquanto o agente trabalhava. Quem está acompanhando o fim já é
     /// posicionado pelo desenho da conversa (`ui::desenhar_conversa`).
     fn acompanhar_fim(&mut self) {}
+
+    /// `/undo`: desfaz a última alteração de arquivo da sessão, aplicando o
+    /// diff guardado no sentido inverso. Não depende de git.
+    fn desfazer_ultima(&mut self) {
+        let Some(alt) = self.store.ultima_alteracao(&self.sessao_id).unwrap_or(None) else {
+            self.avisar("Nada para desfazer: esta sessão ainda não alterou arquivos.".into());
+            return;
+        };
+        // O caminho é relativo ao projeto; reconstrói o absoluto.
+        let caminho = std::path::Path::new(&alt.path);
+        let absoluto = if caminho.is_absolute() {
+            caminho.to_path_buf()
+        } else {
+            self.config.workdir().join(caminho)
+        };
+        let atual = match std::fs::read_to_string(&absoluto) {
+            Ok(t) => t,
+            Err(e) => {
+                self.avisar(format!(
+                    "Não foi possível ler {}: {e}. O arquivo pode ter sido removido.",
+                    absoluto.display()
+                ));
+                return;
+            }
+        };
+        match crate::diff::reverter(&alt.diff, &atual) {
+            Some(anterior) => {
+                if std::fs::write(&absoluto, &anterior).is_err() {
+                    self.avisar(format!("Falha ao escrever {}", absoluto.display()));
+                    return;
+                }
+                self.avisar(format!(
+                    "Desfeito: {} voltou ao estado anterior ({} caracteres).",
+                    alt.path,
+                    anterior.chars().count()
+                ));
+            }
+            None => {
+                self.avisar(format!(
+                    "Não foi possível desfazer {}: o arquivo mudou desde a alteração                      registrada (o diff não bate mais com o conteúdo).",
+                    alt.path
+                ));
+            }
+        }
+    }
+
+    /// `/diff`: lista as alterações da sessão com o diff real de cada uma.
+    fn mostrar_diff(&mut self) {
+        let alteracoes = self.store.alteracoes(&self.sessao_id).unwrap_or_default();
+        if alteracoes.is_empty() {
+            self.avisar("Nenhuma alteração de arquivo nesta sessão.".into());
+            return;
+        }
+        let mut linhas = vec![Line::from(Span::styled(
+            format!(" {} alteração(ões) nesta sessão ", alteracoes.len()),
+            theme::rotulo(),
+        ))];
+        for alt in &alteracoes {
+            linhas.push(Line::from(vec![
+                Span::styled(format!(" {} ", alt.change_type), theme::apagado()),
+                Span::styled(alt.path.clone(), theme::texto()),
+            ]));
+            for linha in alt.diff.lines().take(60) {
+                let estilo = if let Some(resto) = linha.strip_prefix('+') {
+                    Span::styled(format!(" +{resto}"), theme::sucesso())
+                } else if let Some(resto) = linha.strip_prefix('-') {
+                    Span::styled(format!(" -{resto}"), theme::falha())
+                } else {
+                    Span::styled(format!(" {}", linha.trim_start()), theme::apagado())
+                };
+                linhas.push(Line::from(estilo));
+            }
+        }
+        self.modal = Some(Modal::Texto {
+            titulo: "Alterações da sessão".into(),
+            linhas,
+            scroll: 0,
+        });
+    }
 
     /// Contabilidade de tokens: números reais do provedor, somados da sessão
     /// inteira (o banco guarda cada resposta).

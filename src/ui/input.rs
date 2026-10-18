@@ -290,6 +290,16 @@ pub const COMANDOS_SLASH: &[ComandoSlash] = &[
         descricao: "escolhe o esforço de raciocínio quando o modelo suporta",
     },
     ComandoSlash {
+        nome: "/undo",
+        argumentos: "",
+        descricao: "desfaz a última alteração de arquivo feita nesta sessão",
+    },
+    ComandoSlash {
+        nome: "/diff",
+        argumentos: "",
+        descricao: "mostra as alterações de arquivo da sessão, uma a uma",
+    },
+    ComandoSlash {
         nome: "/cost",
         argumentos: "",
         descricao: "mostra os tokens gastos na sessão (entrada, saída e raciocínio)",
