@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Versão atual do esquema. Suba sempre que uma migração for acrescentada.
-pub const VERSAO_ATUAL: i64 = 2;
+pub const VERSAO_ATUAL: i64 = 3;
 
 /// Migrações; o índice 0 corresponde à versão 1.
 const MIGRACOES: &[(i64, &str)] = &[

@@ -290,6 +290,11 @@ pub const COMANDOS_SLASH: &[ComandoSlash] = &[
         descricao: "escolhe o esforço de raciocínio quando o modelo suporta",
     },
     ComandoSlash {
+        nome: "/cost",
+        argumentos: "",
+        descricao: "mostra os tokens gastos na sessão (entrada, saída e raciocínio)",
+    },
+    ComandoSlash {
         nome: "/thinking",
         argumentos: "[on|off]",
         descricao: "mostra ou oculta o raciocínio do modelo na conversa (padrão: oculto)",

@@ -175,6 +175,17 @@ pub fn redact_secrets(input: &str) -> String {
     re.replace_all(input, "[SEGREDO-REDIGIDO]").to_string()
 }
 
+/// Formata um número grande com separador de milhar (12.4k, 1,2M).
+pub fn formatar_num(n: u64) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        return format!("{:.1}k", n as f64 / 1000.0);
+    }
+    format!("{:.1}M", n as f64 / 1_000_000.0)
+}
+
 /// Formata bytes de forma legível.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -292,6 +303,14 @@ mod tests {
     fn estimativa_de_tokens_cresce_com_texto() {
         assert!(estimate_tokens("a") >= 1);
         assert!(estimate_tokens(&"palavra ".repeat(100)) > estimate_tokens("palavra"));
+    }
+
+    #[test]
+    fn formata_numeros_grandes() {
+        assert_eq!(formatar_num(0), "0");
+        assert_eq!(formatar_num(999), "999");
+        assert_eq!(formatar_num(12400), "12.4k");
+        assert_eq!(formatar_num(2_470_000), "2.5M");
     }
 
     #[test]

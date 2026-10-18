@@ -435,6 +435,9 @@ pub struct App {
     /// Área clicável do atalho "voltar para o último" (definida no desenho).
     pub area_voltar: Option<ratatui::layout::Rect>,
     pub mostrar_raciocinio: bool,
+    /// Uso de tokens da última resposta e o total da sessão.
+    pub tokens: (u32, u32, u32),
+    pub token_total: (u64, u64, u64),
     pub estado: EstadoMascote,
     pub estado_expira: Option<u64>,
     pub estado_texto: String,
@@ -497,6 +500,8 @@ impl App {
             scroll: 0,
             seguir_fim: true,
             area_voltar: None,
+            tokens: (0, 0, 0),
+            token_total: (0, 0, 0),
             mostrar_raciocinio,
             estado: EstadoMascote::Ocioso,
             estado_expira: None,
@@ -765,6 +770,9 @@ impl App {
                     }
                 }
             }
+            "/cost" | "/custo" | "/tokens" => {
+                self.mostrar_custo();
+            }
             "/thinking" | "/pensamento" | "/raciocinio" => {
                 // Liga/desliga a exibição do raciocínio do modelo. Desligado
                 // (padrão), o pensamento não entra na conversa: o estado aparece
@@ -1031,6 +1039,34 @@ impl App {
     /// enquanto o agente trabalhava. Quem está acompanhando o fim já é
     /// posicionado pelo desenho da conversa (`ui::desenhar_conversa`).
     fn acompanhar_fim(&mut self) {}
+
+    /// Contabilidade de tokens: números reais do provedor, somados da sessão
+    /// inteira (o banco guarda cada resposta).
+    fn mostrar_custo(&mut self) {
+        let stats = self
+            .store
+            .session_stats(&self.sessao_id)
+            .unwrap_or_default();
+        let total = stats.total_tokens();
+        let raciocinio = if stats.reasoning_tokens > 0 {
+            format!(
+                " · raciocínio {}",
+                crate::util::formatar_num(stats.reasoning_tokens)
+            )
+        } else {
+            String::new()
+        };
+        self.avisar(format!(
+            "Turnos desta sessão: {} tokens de entrada + {} de saída{raciocinio} = {} no total.\n\
+             Ferramentas: {} execuções ({} com falha) · {} arquivo(s) alterado(s).",
+            crate::util::formatar_num(stats.prompt_tokens),
+            crate::util::formatar_num(stats.completion_tokens),
+            crate::util::formatar_num(total),
+            stats.tool_runs,
+            stats.tool_failures,
+            stats.files_touched,
+        ));
+    }
 
     fn avisar(&mut self, mensagem: String) {
         self.empurrar_bloco(Bloco::Aviso(mensagem));
@@ -1475,6 +1511,18 @@ impl App {
             }
             AgentEvent::Contexto { usados, capacidade } => {
                 self.contexto = (usados, capacidade);
+            }
+            AgentEvent::Tokens {
+                prompt,
+                completion,
+                raciocinio,
+            } => {
+                self.tokens = (prompt, completion, raciocinio);
+                self.token_total = (
+                    self.token_total.0.saturating_add(prompt as u64),
+                    self.token_total.1.saturating_add(completion as u64),
+                    self.token_total.2.saturating_add(raciocinio as u64),
+                );
             }
             AgentEvent::DossieCriado {
                 resumo,

@@ -420,12 +420,19 @@ fn parse_tool_call(valor: &Value) -> Option<ToolCall> {
 
 fn parse_usage(valor: Option<&Value>) -> Option<Usage> {
     let v = valor?;
+    // Provedores compatíveis informam o raciocínio em `completion_tokens_details`.
+    let detalhes = v.get("completion_tokens_details");
+    let raciocinio = detalhes
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0) as u32;
     Some(Usage {
         prompt_tokens: v.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0) as u32,
         completion_tokens: v
             .get("completion_tokens")
             .and_then(|t| t.as_u64())
             .unwrap_or(0) as u32,
+        reasoning_tokens: raciocinio,
     })
 }
 

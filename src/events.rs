@@ -177,6 +177,12 @@ pub enum AgentEvent {
         usados: u32,
         capacidade: u32,
     },
+    /// Uso de tokens informado pelo provedor ao fim de uma geração.
+    Tokens {
+        prompt: u32,
+        completion: u32,
+        raciocinio: u32,
+    },
     DossieCriado {
         resumo: String,
         nova_sessao: String,

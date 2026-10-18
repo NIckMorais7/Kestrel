@@ -880,7 +880,25 @@ async fn executar_turno(
         };
 
         let completion = match resultado {
-            Ok(c) => c,
+            Ok(c) => {
+                // Contabilidade real: o usage vem do provedor e era descartado.
+                if let Some(uso) = c.usage {
+                    comp.store
+                        .record_usage(
+                            &sessao.id,
+                            uso.prompt_tokens,
+                            uso.completion_tokens,
+                            uso.reasoning_tokens,
+                        )
+                        .ok();
+                    comp.evento(AgentEvent::Tokens {
+                        prompt: uso.prompt_tokens,
+                        completion: uso.completion_tokens,
+                        raciocinio: uso.reasoning_tokens,
+                    });
+                }
+                c
+            }
             Err(erro) => {
                 let transitorio = erro.transitorio();
                 let classe = if erro.resposta_invalida() {

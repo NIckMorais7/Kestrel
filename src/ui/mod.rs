@@ -142,6 +142,15 @@ fn desenhar_barra_estado(f: &mut Frame, app: &App, area: Rect) {
             .fg(theme::cor_nivel(app.nivel))
             .add_modifier(Modifier::BOLD),
     ));
+    // Custo real da sessão, quando já houve alguma resposta do provedor.
+    if app.token_total.0 + app.token_total.1 > 0 {
+        let total = app.token_total.0 + app.token_total.1;
+        spans.push(Span::styled("  │  ", theme::borda()));
+        spans.push(Span::styled(
+            format!("{} tok", crate::util::formatar_num(total)),
+            theme::apagado(),
+        ));
+    }
     // O raciocínio só é mencionado quando está visível.
     if app.mostrar_raciocinio {
         spans.push(Span::styled("  │  thinking ", theme::borda()));

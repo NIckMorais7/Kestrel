@@ -109,6 +109,16 @@ CREATE TABLE IF NOT EXISTS context_state (
     updated_at   TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS usage (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_session ON usage(session_id, id);
+
 CREATE TABLE IF NOT EXISTS kv (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
@@ -210,6 +220,30 @@ impl Store {
             .lock()
             .map_err(|e| anyhow::anyhow!("lock do banco: {e}"))?;
         f(&guard)
+    }
+
+    /// Registra o uso de tokens de uma resposta do provedor.
+    pub fn record_usage(
+        &self,
+        session_id: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        reasoning_tokens: u32,
+    ) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO usage (session_id, prompt_tokens, completion_tokens, reasoning_tokens, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    session_id,
+                    prompt_tokens,
+                    completion_tokens,
+                    reasoning_tokens,
+                    crate::util::now_rfc3339()
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     // ---------- sessões ----------
@@ -773,12 +807,23 @@ impl Store {
                 params![session_id],
                 |r| r.get(0),
             )?;
+            let (p_tok, c_tok, r_tok): (i64, i64, i64) = c
+                .query_row(
+                    "SELECT COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), \
+                     COALESCE(SUM(reasoning_tokens),0) FROM usage WHERE session_id = ?1",
+                    params![session_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap_or((0, 0, 0));
             Ok(SessionStats {
                 tool_runs: tools as usize,
                 tool_failures: failed as usize,
                 additions: adds as usize,
                 deletions: dels as usize,
                 files_touched: files as usize,
+                prompt_tokens: p_tok.max(0) as u64,
+                completion_tokens: c_tok.max(0) as u64,
+                reasoning_tokens: r_tok.max(0) as u64,
             })
         })
     }
@@ -791,6 +836,19 @@ pub struct SessionStats {
     pub additions: usize,
     pub deletions: usize,
     pub files_touched: usize,
+    /// Tokens de entrada somados de todas as respostas do provedor.
+    pub prompt_tokens: u64,
+    /// Tokens de saída (incluindo raciocínio, quando o provedor separa).
+    pub completion_tokens: u64,
+    /// Tokens de raciocínio, quando informados.
+    pub reasoning_tokens: u64,
+}
+
+impl SessionStats {
+    /// Total de tokens gastos na sessão.
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+    }
 }
 
 fn map_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
@@ -953,6 +1011,24 @@ mod tests {
         let stats = s.session_stats("s1").unwrap();
         assert_eq!(stats.additions, 10);
         assert_eq!(stats.files_touched, 1);
+    }
+
+    /// O uso de tokens informado pelo provedor precisa ser persistido: antes
+    /// `completion.usage` era parseado e descartado, então não havia como
+    /// saber quanto a sessão tinha gasto.
+    #[test]
+    fn usage_e_somado_na_sessao() {
+        let s = store();
+        s.create_session("s1", "/tmp", "t", "m", None, "semi", None)
+            .unwrap();
+        assert_eq!(s.session_stats("s1").unwrap().total_tokens(), 0);
+        s.record_usage("s1", 1200, 350, 100).unwrap();
+        s.record_usage("s1", 800, 120, 0).unwrap();
+        let stats = s.session_stats("s1").unwrap();
+        assert_eq!(stats.prompt_tokens, 2000);
+        assert_eq!(stats.completion_tokens, 470);
+        assert_eq!(stats.reasoning_tokens, 100);
+        assert_eq!(stats.total_tokens(), 2470);
     }
 
     #[test]
