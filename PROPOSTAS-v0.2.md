@@ -75,8 +75,9 @@ herda o defeito.
 | D5 | **Atalhos configuráveis** (`keybindings` no config.toml) | Todas as teclas estão fixas no código (`F2` = thinking, `Shift+Tab` = permissão, …) | P2 | 1d |
 | D6 | **Modo watch**: observar arquivos e re-rodar build/teste a cada salvamento | Nenhum watcher de arquivos existe; o laço de build→corrigir é sempre manual | P2 | 2d |
 | D7 | **Acessibilidade**: tema de alto contraste, respeito a `NO_COLOR`/`TERM=dumb`, e modo "sem mascote" já existe — revisar contraste de todos os pares de cor | O fundo foi clareado agora (24,27,34) e os contrastes não foram medidos; não há alternativa para daltonismo | P2 | 1,5d |
+| D8 | **`/person` — Comps (personalidades)**: criar, editar, alternar e remover comportamentos do agente, cada um com seu bloco de instruções no prompt; um Comp ativo por sessão, gravado em `comps/<nome>.toml` | Hoje a personalidade é fixa em `prompt.rs`: não há como trocar o estilo (amigável, técnico, conciso, mentor) sem editar código e recompilar — e o usuário quer **criar** personalidades pelo próprio Kestrel | P1 | 2,5d |
 
-**Subtotal D: ~11,5 dias.**
+**Subtotal D: ~14 dias.**
 
 ---
 
@@ -107,6 +108,90 @@ D3 (contexto), B3 (fallback de modelos), E4 (provedores).
 
 **v0.4.0 — "ecossistema"** (~22 dias)
 C4 (patch), C5 (qualidade), C6 (MCP), D4–D7, E1–E5, B4–B6.
+
+---
+
+## Anexo A — design de `/person` (Comps)
+
+### O conceito
+
+Um **Comp** é uma personalidade do agente: um nome e um bloco de instruções que
+entra no system prompt. Você cria, edita, remove e alterna sem recompilar.
+
+**Exemplo de uso:**
+
+```
+/person                    → lista os Comps, qual está ativo, e ativa/desativa
+/person new Lazy           → abre o editor de texto dentro do Kestrel
+/person use Lazy           → ativa a partir do próximo turno
+/person edit Lazy          → reabre o editor com o conteúdo atual
+/person see Lazy           → mostra as instruções e o tamanho (custo em tokens)
+/person remove Lazy        → remove, com confirmação
+```
+
+E por conversa: *"crie um Comp Técnico, sério e preciso, que pesquise na web
+sempre que dúvidar de uma API"* → o agente redige, **mostra o texto**, pede
+confirmação e grava.
+
+### Onde entra no prompt
+
+Bloco novo, **depois** das Regras de trabalho e **antes** de Ambiente:
+
+```
+## Regras de trabalho        ← autoridade máxima, sempre aplicada
+## Comp — Lazy               ← instruções da personalidade ativa
+## Ambiente                  ← permissão, modo, diretório
+```
+
+A ordem não é estética: o bloco de Regras termina com uma linha dizendo que
+instruções de nenhum Comp substituem as regras de segurança (permissão, modo,
+nunca inventar resultados, nunca pedir segredos). Sem isso, um Comp colado da
+internet poderia, em tese, instruir o agente a ignorar o nível de permissão.
+
+### Formato de arquivo
+
+Um arquivo por Comp em `~/.config/kestrel/comps/` — fácil de editar à mão,
+copiar e versionar:
+
+```toml
+nome = "Tecnico"
+descricao = "seco, preciso e cético; pesquisa antes de afirmar"
+instrucoes = """
+Responda de forma técnica e direta. Sem elogios, sem rodeios.
+Quando não tiver certeza de uma API ou versão, pesquise na web antes de
+afirmar, e diga qual fonte usou.
+"""
+```
+
+### Decisões tomadas (18/10/2026)
+
+| Decisão | Escolha | Consequência no design |
+|---|---|---|
+| O que um Comp controla | **só comportamento** — nada de config | Nenhum campo de modelo, esforço ou permissão no arquivo; um Comp nunca mexe em configuração |
+| Como criar | **dois caminhos**: `/person new <nome>` (editor dentro do Kestrel) **e** por pedido em linguagem natural, com o agente criando | Exige ferramenta dedicada e validada, não `write_file` genérico |
+| Presets de fábrica | **começar vazio** | A lista nasce vazia; `/person` sem Comps mostra "nenhum Comp criado" |
+| Implementação | **só design agora** | Nada de código nesta sessão |
+
+### Criação pelo agente: ferramenta dedicada, não `write_file`
+
+O agente escreve arquivos, mas **só dentro do projeto**; a pasta de Comps está
+fora dele — então `write_file` não alcança, e é isso que queremos: o único
+caminho de escrita é uma ferramenta própria, com validação:
+
+- nome: slug `[a-z0-9-_]`, no máximo 32 caracteres e único (sobrescrever exige
+  confirmação);
+- `descricao` até 120 caracteres; `instrucoes` até 4000 (o teto também protege
+  o orçamento de contexto);
+- grava exclusivamente em `comps/<slug>.toml`, em nenhum outro lugar;
+- **remover** Comp fica só na interface (`/person remove`) — o agente não remove
+  personalidades, para não perder uma por engano;
+- a confirmação reutiliza o canal existente (`PedirConfirmacao`), então o texto
+  aparece na sua tela antes de qualquer gravação.
+
+### Custo de contexto
+
+Cada Comp soma tokens ao system prompt em **todo** turno. `/person see` mostra
+o tamanho, e um Comp gigante e vago é o pior dos dois mundos: caro e ineficaz.
 
 ---
 
