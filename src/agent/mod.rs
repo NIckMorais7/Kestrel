@@ -767,6 +767,8 @@ async fn executar_turno(
         Duration::from_secs(cfg.agent.recovery_timeout_secs),
     );
     let mut dossie_ativo: Option<String> = None;
+    // Contador informativo (vai para o estado da interface). Não há mais
+    // limite de iterações: o agente segue até terminar ou ser interrompido.
     let mut iteracoes = 0u32;
     let mut malformadas_seguidas = 0u32;
 
@@ -779,16 +781,13 @@ async fn executar_turno(
                 concluido: false,
             };
         }
-        if iteracoes >= cfg.agent.max_iterations {
-            break ResultadoTurno {
-                resumo: format!(
-                    "Limite de {} iterações atingido. O progresso foi preservado; envie uma nova instrução para continuar.",
-                    cfg.agent.max_iterations
-                ),
-                concluido: false,
-            };
-        }
+        // Sem limite de iterações: o agente segue até concluir a tarefa, ser
+        // interrompido pelo usuário ou a compactação de contexto não conseguir
+        // mais manter a conversa. Um teto fixo só fazia o trabalho parar no
+        // meio e exigir que o usuario reenviasse a instrução — e iterações
+        // longas são justamente o caso normal de uma tarefa grande.
         iteracoes += 1;
+        comp.estado_ui(format!("trabalhando… {iteracoes}ª interação"));
 
         // Orçamento de contexto.
         let sistema = montar_prompt(&comp, &cfg, dossie_ativo.as_deref());
@@ -2168,7 +2167,11 @@ mod tests {
         usar_roteiro(
             &ambiente,
             vec![
-                chamada("c1", "run_command", json!({"comando": "rm -rf dados"})),
+                chamada(
+                    "c1",
+                    "run_command",
+                    json!({"comando": "chmod -R 777 dados"}),
+                ),
                 resposta("Comando executado."),
             ],
         );
@@ -2190,7 +2193,20 @@ mod tests {
             .unwrap();
         tarefa.await.unwrap().unwrap();
 
-        assert!(!dir.join("dados").exists(), "o comando aprovado não rodou");
+        // O chmod rodou: o arquivo continua lá, mas com permissão 777.
+        assert!(
+            dir.join("dados/arquivo.txt").exists(),
+            "o comando aprovado não rodou"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let modo = std::fs::metadata(dir.join("dados/arquivo.txt"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(modo & 0o777, 0o777, "o chmod não foi aplicado: {modo:o}");
+        }
         let eventos = drenar_eventos(&mut ambiente);
         assert!(eventos.iter().any(|e| matches!(
             e,
@@ -2225,7 +2241,11 @@ mod tests {
         usar_roteiro(
             &ambiente,
             vec![
-                chamada("c1", "run_command", json!({"comando": "rm -rf dados"})),
+                chamada(
+                    "c1",
+                    "run_command",
+                    json!({"comando": "chmod -R 777 dados"}),
+                ),
                 resposta("Ok, não executei."),
             ],
         );

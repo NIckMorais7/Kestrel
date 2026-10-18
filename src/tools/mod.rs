@@ -225,14 +225,6 @@ impl ToolContext {
             .expect("lock de permitidos")
             .insert(format!("sempre:{chave}", chave = chave.into()));
     }
-
-    /// Consulta uma decisão "permitir sempre" já tomada na sessão.
-    pub fn ja_permitido_sempre(&self, chave: &str) -> bool {
-        self.permitidos
-            .lock()
-            .expect("lock de permitidos")
-            .contains(&format!("sempre:{chave}"))
-    }
 }
 
 /// Interface de uma ferramenta.
@@ -401,42 +393,35 @@ impl ToolRegistry {
         let detalhe = tool.detalhe(&args);
 
         // Verificação de escopo para caminhos (relativos ao projeto).
+        //
+        // A regra é por **operação**, não por muro: ler fora do projeto é
+        // permitido em qualquer nível; escrever fora do projeto é permitido de
+        // Write em diante e bloqueado em Read. Antes qualquer escrita fora do
+        // projeto era bloqueada ou confirmada por nível, o que impedia o
+        // agente de instalar algo ou criar um arquivo em outro diretório.
+        let so_leitura = matches!(crate::perm::tool_risk(nome), crate::perm::ToolRisk::Leitura);
         for caminho in tool.caminhos(&args) {
             let norm = resolver_caminho(ctx, &caminho.to_string_lossy());
             if !ctx.roots.iter().any(|r| norm.starts_with(r)) {
-                let decisao = match ctx.level {
-                    PermissionLevel::Read | PermissionLevel::Write => Decision::Bloquear,
-                    PermissionLevel::Semi => Decision::Confirmar,
-                    PermissionLevel::Full => Decision::Permitir,
-                };
-                match decisao {
-                    Decision::Bloquear => {
-                        return Err(ToolError::Permissao(format!(
-                            "o caminho {} está fora do projeto e o nível {} não permite. \
-                             Adicione o diretório em /config ou mude o nível com /permissions.",
-                            norm.display(),
-                            ctx.level
-                        )));
-                    }
-                    Decision::Confirmar => {
-                        // "Permitir sempre" fica registrado na sessão: sem isso
-                        // o mesmo caminho seria perguntado a cada acesso.
-                        let chave = format!("Acesso fora do projeto: {}", norm.display());
-                        if !ctx.ja_permitido_sempre(&chave)
-                            && !ctx
-                                .pedir_confirmacao(
-                                    chave.clone(),
-                                    format!("A ferramenta `{nome}` quer operar em um caminho fora do projeto."),
-                                )
-                                .await?
-                        {
-                            return Err(ToolError::Permissao(format!(
-                                "acesso a {} negado pelo usuário",
+                // Leitura sempre pode; escrita só do Write em diante.
+                let pode = so_leitura || ctx.level != PermissionLevel::Read;
+                if !pode {
+                    ctx.store
+                        .audit(
+                            Some(&ctx.session_id),
+                            "permissao",
+                            Some(&format!(
+                                "escrita fora do projeto bloqueada em nível Read: {}",
                                 norm.display()
-                            )));
-                        }
-                    }
-                    Decision::Permitir => {}
+                            )),
+                            Some("bloqueado"),
+                        )
+                        .ok();
+                    return Err(ToolError::Permissao(format!(
+                        "o caminho {} está fora do projeto e o nível Read não permite escrita. \\
+                         Use /permissions para mudar de nível.",
+                        norm.display()
+                    )));
                 }
             }
         }
@@ -882,6 +867,79 @@ mod tests {
         );
         assert!(resolvido.ends_with("sub/novo-arquivo.txt"), "{resolvido:?}");
         let _ = std::fs::remove_dir_all(&projeto);
+    }
+
+    /// Fora do projeto não é um muro: ler funciona em qualquer nível, escrever
+    /// funciona do Write em diante. Antes a escrita fora era bloqueada em
+    /// Read/Write e confirmada em Semi — o agente não conseguia instalar nada.
+    #[tokio::test]
+    async fn escopo_se_adapta_a_operacao_e_ao_nivel() {
+        let base = std::env::temp_dir().join(format!("kestrel-escopo-{}", uuid::Uuid::new_v4()));
+        let projeto = base.join("projeto");
+        let fora = base.join("fora");
+        std::fs::create_dir_all(&projeto).unwrap();
+        std::fs::create_dir_all(&fora).unwrap();
+        let alvo = fora.join("nota.txt");
+        std::fs::write(&alvo, "conteudo").unwrap();
+        let reg = ToolRegistry::novo();
+
+        // Leitura fora do projeto: permitida até em Read.
+        {
+            let mut ctx = crate::tools::git::tests::contexto(&projeto);
+            ctx.level = crate::perm::PermissionLevel::Read;
+            let saida = reg
+                .executar(
+                    "read_file",
+                    serde_json::json!({"path": alvo.display().to_string()}),
+                    &ctx,
+                )
+                .await;
+            assert!(
+                saida.is_ok(),
+                "leitura fora do projeto não deveria ser bloqueada em Read: {saida:?}"
+            );
+        }
+
+        // Escrita fora do projeto: bloqueada em Read.
+        {
+            let mut ctx = crate::tools::git::tests::contexto(&projeto);
+            ctx.level = crate::perm::PermissionLevel::Read;
+            let saida = reg
+                .executar(
+                    "write_file",
+                    serde_json::json!({"path": alvo.display().to_string(), "content": "x"}),
+                    &ctx,
+                )
+                .await;
+            assert!(
+                matches!(&saida, Err(ToolError::Permissao(_))),
+                "escrita fora do projeto deveria ser bloqueada em Read"
+            );
+        }
+
+        // Escrita fora do projeto: permitida em Write, Semi e Full.
+        for nivel in [
+            crate::perm::PermissionLevel::Write,
+            crate::perm::PermissionLevel::Semi,
+            crate::perm::PermissionLevel::Full,
+        ] {
+            let mut ctx = crate::tools::git::tests::contexto(&projeto);
+            ctx.level = nivel;
+            let destino = fora.join(format!("de-{nivel:?}.txt"));
+            let saida = reg
+                .executar(
+                    "write_file",
+                    serde_json::json!({"path": destino.display().to_string(), "content": "ok"}),
+                    &ctx,
+                )
+                .await;
+            assert!(
+                saida.is_ok(),
+                "escrita fora do projeto deveria ser permitida em {nivel:?}"
+            );
+            assert!(destino.exists(), "o arquivo não foi criado em {nivel:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
