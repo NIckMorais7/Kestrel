@@ -562,6 +562,248 @@ pub fn from_config(cfg: &crate::config::Config) -> anyhow::Result<OpenAiCompatPr
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Testes de streaming SSE do cliente OpenAI-compatível.
+    //
+    // `chat_com_stream` é o caminho mais crítico do produto e não tinha nenhum
+    // teste: dois bugs reais saíram dele (`[DONE]` não encerrava o laço externo, e
+    // `index` de tool_call sem limite). Estes testes sobem um servidor HTTP local
+    // em porta efêmera e alimentam o cliente com bytes de verdade, inclusive
+    // fragmentados no meio de uma linha.
+
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Ajudante: sobe um servidor HTTP minúsculo que responde com `corpo`,
+    /// escrevendo em pedaços de `pedaco` bytes para simular fragmentação de rede.
+    ///
+    /// Devolve a URL base (já com o caminho `/v1`) e o contador de requisições.
+    async fn servir_sse(
+        corpo: String,
+        pedaco: usize,
+        atraso_ms: u64,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        // Listener assíncrono desde o início: aceitar em `tokio::spawn` (nenhum
+        // `LocalSet` envolvido).
+        let ouvinte = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta efemera");
+        let endereco = ouvinte.local_addr().unwrap();
+        let requisicoes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let contador = requisicoes.clone();
+        let base = format!("http://{endereco}/v1");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut soquete, _)) = ouvinte.accept().await else {
+                    continue;
+                };
+                let corpo = corpo.clone();
+                let pedaco = pedaco.max(1);
+                let atraso = atraso_ms;
+                let contador = contador.clone();
+                tokio::spawn(async move {
+                    contador.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Lê os cabeçalhos até a linha vazia.
+                    let mut lido = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !lido.windows(4).any(|j| j == b"\r\n\r\n") {
+                        match soquete.read(&mut buf).await {
+                            Ok(0) => return,
+                            Ok(n) => lido.extend_from_slice(&buf[..n]),
+                            Err(_) => return,
+                        }
+                    }
+                    let cabecalho = concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "content-type: text/event-stream\r\n",
+                        "\r\n"
+                    );
+                    if soquete.write_all(cabecalho.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let bytes = corpo.into_bytes();
+                    for parte in bytes.chunks(pedaco) {
+                        if soquete.write_all(parte).await.is_err() {
+                            return;
+                        }
+                        if atraso > 0 {
+                            tokio::time::sleep(Duration::from_millis(atraso)).await;
+                        }
+                    }
+                    let _ = soquete.flush().await;
+                    // Fecha logo em seguida: o cliente deve ter terminado no [DONE].
+                    drop(soquete);
+                });
+            }
+        });
+
+        (base, requisicoes)
+    }
+
+    /// Sink descartável: obriga o caminho de streaming mesmo quando o teste não
+    /// quer observar os eventos delta.
+    fn pia() -> (
+        mpsc::UnboundedSender<StreamEvent>,
+        mpsc::UnboundedReceiver<StreamEvent>,
+    ) {
+        mpsc::unbounded_channel()
+    }
+
+    fn cliente(base: &str) -> OpenAiCompatProvider {
+        OpenAiCompatProvider::new(base, "NVIDIA_API_KEY", Some("chave".into()), 10, 1, None)
+            .expect("cliente de teste")
+    }
+
+    #[tokio::test]
+    async fn stream_termina_no_done_sem_pendurar() {
+        let corpo = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"oi \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"mundo\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base, _reqs) = servir_sse(corpo.to_string(), 64, 0).await;
+        let p = cliente(&base);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let inicio = std::time::Instant::now();
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                CancellationToken::new(),
+                Some(tx),
+            )
+            .await
+            .expect("stream deveria funcionar");
+        // Sem o `break 'leitura`, o `[DONE]` só sairia do laço interno e a
+        // requisição ficaria pendurada até o timeout (10s aqui).
+        assert!(
+            inicio.elapsed() < Duration::from_secs(3),
+            "o stream não terminou no [DONE]: {:?}",
+            inicio.elapsed()
+        );
+        assert_eq!(saida.text, "oi mundo");
+        // Os dois deltas chegaram ao sink.
+        let mut conteudos = Vec::new();
+        while let Ok(evento) = rx.try_recv() {
+            if let StreamEvent::Texto(t) = evento {
+                conteudos.push(t);
+            }
+        }
+        assert_eq!(conteudos, vec!["oi ", "mundo"]);
+    }
+
+    #[tokio::test]
+    async fn stream_suporta_linha_fragmentada() {
+        // A quebra de linha cai no meio de um JSON: o parser tem que juntar.
+        let corpo = concat!(
+            "data: {\"choices\":[{\"delta\":{\"cont",
+            "ent\":\"fragmentado\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base, _reqs) = servir_sse(corpo.to_string(), 7, 0).await;
+        let p = cliente(&base);
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect("stream fragmentado deveria funcionar");
+        assert_eq!(saida.text, "fragmentado");
+    }
+
+    #[tokio::test]
+    async fn stream_ignora_linhas_invalidas_e_keepalive() {
+        let corpo = concat!(
+            ": comentario do servidor\n\n",
+            "data: \n\n",
+            "data: nao-e-json\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base, _reqs) = servir_sse(corpo.to_string(), 23, 0).await;
+        let p = cliente(&base);
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect("linhas inválidas não deveriam derrubar o stream");
+        assert_eq!(saida.text, "ok");
+    }
+
+    #[tokio::test]
+    async fn stream_remonta_chamada_de_ferramenta_fragmentada() {
+        let corpo = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"list_",
+            "files\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":",
+            "\\\".\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base, _reqs) = servir_sse(corpo.to_string(), 11, 0).await;
+        let p = cliente(&base);
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("liste")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect("chamada fragmentada deveria ser remontada");
+        assert_eq!(saida.tool_calls.len(), 1);
+        let chamada = &saida.tool_calls[0];
+        assert_eq!(chamada.id, "c1");
+        assert_eq!(chamada.name, "list_files");
+        assert_eq!(chamada.arguments, "{\"path\":\".\"}");
+    }
+
+    #[tokio::test]
+    async fn erro_no_meio_do_stream_interrompe() {
+        let corpo = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"parcial\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"estouro de cota\"}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base, _reqs) = servir_sse(corpo.to_string(), 40, 0).await;
+        let p = cliente(&base);
+        let erro = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect_err("erro no meio do stream deveria interromper");
+        assert!(erro.to_string().contains("estouro de cota"), "{erro}");
+    }
+
+    #[tokio::test]
+    async fn cancelamento_para_o_stream() {
+        let corpo = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"devagar\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base, _reqs) = servir_sse(corpo.to_string(), 30, 400).await;
+        let p = cliente(&base);
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancel2.cancel();
+        });
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                cancel,
+                Some(pia().0),
+            )
+            .await
+            .expect_err("cancelamento deveria interromper");
+        assert!(matches!(saida, ProviderError::Cancelado), "{saida:?}");
+    }
 
     #[test]
     fn corpo_inclui_ferramentas_e_esforco() {
