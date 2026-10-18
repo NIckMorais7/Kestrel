@@ -225,10 +225,10 @@ mod tests {
     }
 
     #[test]
-    fn mini_tem_os_olhos_vazados_e_ocupa_uma_linha() {
+    fn mini_tem_os_olhos_vazados_e_ocupa_duas_linhas() {
         let desenhado = linhas(TamanhoMascote::Mini, AnimacaoPip::default());
         // Uma linha: o Pip foi reduzido à metade (era 6x4 texels = 2 linhas).
-        assert_eq!(desenhado.len(), 1);
+        assert_eq!(desenhado.len(), 2);
         for olho in tex::OLHOS_MINI {
             // O olho é um furo na arte: em repouso o texel não tem cor própria
             // (aparece o fundo escuro do aplicativo) e na piscada ele desaparece
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn altura_em_linhas_nao_muda_com_a_respiracao() {
         // Uma linha, sempre: o Pip não pode crescer nem encolher.
-        assert_eq!(linhas_ocupadas(TamanhoMascote::Mini), 1);
+        assert_eq!(linhas_ocupadas(TamanhoMascote::Mini), 2);
         for tamanho in [TamanhoMascote::Mini] {
             for deslocamento in [0, 1] {
                 let desenhado = linhas(
@@ -350,13 +350,14 @@ mod tests {
     #[test]
     fn mascote_nunca_passou_de_duas_linhas() {
         // Regressão: o Pip já foi desenhado com 17 linhas (28x34 texels) como
-        // "companheiro da conversa", com 7 linhas no assistente e com 2 linhas
-        // no indicador. Agora ele cabe em uma única linha, em qualquer uso.
-        assert_eq!(tex::LARGURA_MINI, 3);
-        assert_eq!(tex::ALTURA_MINI, 2);
+        // "companheiro da conversa" e com 7 linhas no assistente. Ele já foi
+        // reduzido a 1 linha (3x2 texels) e virou bloco — o menor tamanho em
+        // que o rosto, os olhos e as patas continuam reconhecíveis é 6x4.
+        assert_eq!(tex::LARGURA_MINI, 6);
+        assert_eq!(tex::ALTURA_MINI, 4);
         assert_eq!(
             linhas(TamanhoMascote::Mini, AnimacaoPip::default()).len(),
-            1
+            2
         );
     }
 }

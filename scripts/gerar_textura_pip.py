@@ -41,16 +41,18 @@ ORIGEM = RAIZ / "assets" / "pip.png"
 DESTINO = RAIZ / "src" / "ui" / "pip_textura.rs"
 
 # Resoluções (em texels) usadas pela interface: cada texel vira meia célula.
-# A restrição pode ser dada pela largura ou pela altura; a outra dimensão é
-# calculada mantendo a proporção da imagem original.
 #
-# Uma única resolução, de propósito: o Pip aparece no máximo em uma linha do
-# terminal (indicador de trabalho e assistente de configuração). Dois texels
-# de altura = exatamente uma linha — a metade do tamanho anterior (2 linhas),
-# o menor tamanho em que o rosto e as patinhas do desenho original continuam
-# reconhecíveis.
+# A miniatura do Pip é derivada por **largura**, não por altura: a célula do
+# terminal é 1:2, então a proporção real da imagem (≈1,53:1, mais larga que
+# alta) significa que 6 colunas de texels dão 4 texels de altura = 2 linhas —
+# e é aí que o rosto, os olhos e as patas continuam reconhecíveis.
+#
+# Já se mediram: com só 2 texels de altura (1 linha) o desenho virou um bloco
+# (`### ###`), porque a silhueta da imagem não cabe em 6 texels. A derivada
+# `altura:2` foi o que produziu os "bloquinhos animados" que o usuário
+# rejeitou.
 TAMANHOS = [
-    ("Mini", {"altura": 2}),
+    ("Mini", {"largura": 6}),
 ]
 
 # Massa branca: fração mínima do texel para ele ficar visível.

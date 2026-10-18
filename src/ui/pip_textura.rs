@@ -20,30 +20,32 @@ pub struct OlhoTexel {
 }
 
 /// Largura da textura mini em texels.
-pub const LARGURA_MINI: usize = 3;
+pub const LARGURA_MINI: usize = 6;
 /// Altura da textura mini em texels.
-pub const ALTURA_MINI: usize = 2;
+pub const ALTURA_MINI: usize = 4;
 
 /// Pixels (0xAARRGGBB; alfa 0 = vazado) da textura mini.
-pub static PIXELS_MINI: [u32; 6] = [
-    0x00000000, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+pub static PIXELS_MINI: [u32; 24] = [
+    0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0x00000000,
+    0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+    0xFFFFFFFF, 0x00000000, 0x00000000, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
 ];
 
 /// Olhos da textura mini, na proporção da imagem original.
 pub const OLHOS_MINI: [OlhoTexel; 2] = [
     OlhoTexel {
-        x0: 0,
-        y0: 0,
-        x1: 0,
-        y1: 0,
+        x0: 1,
+        y0: 1,
+        x1: 1,
+        y1: 1,
         pelagem: 0xFFFFFFFF,
         palpebra: 0xFFFFFFFF,
     },
     OlhoTexel {
-        x0: 2,
-        y0: 0,
-        x1: 2,
-        y1: 0,
+        x0: 4,
+        y0: 1,
+        x1: 4,
+        y1: 1,
         pelagem: 0xFFFFFFFF,
         palpebra: 0xFFFFFFFF,
     },
