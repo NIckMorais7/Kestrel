@@ -26,9 +26,10 @@ herda o defeito.
 | A8 | `browser_render` sem validação de esquema (`file://` legível) e com `--no-sandbox`; `fetch_url` sem proteção SSRF | `tools/web.rs` | Alto — leitura de arquivos locais e acesso à rede interna | 0,5d |
 | A9 | `Interromper` durante confirmação não faz nada; colar texto com modal aberto é descartado em silêncio | `app.rs` | Baixo/Médio | 0,25d |
 | A10 | Histórico multilinha corrompido no disco (entrada com `\n` vira N entradas) | `app.rs` | Baixo | 0,25d |
-| A11 | Clarear o indicador: `strip_ansi` não remove sequências OSC (saída de ferramenta com hyperlink vaza escape) | `util.rs` | Baixo | 0,25d |
+| A11 | **Permissão: rodar código do projeto pedia confirmação** (corrigido) | `node script.js`, `python app.py`, `bun test` caiam no passo "comando desconhecido" e pediam confirmação até no nível Full — e `Modificacao` mantinha o `Confirmar` original em todos os níveis. Runtimes entram na lista de build; `Modificacao`/`Build` passam a ser rotina em `semi`/`full` (destrutivo continua confirmando) | P0 | corrigido |
+| A12 | Clarear o indicador: `strip_ansi` não remove sequências OSC (saída de ferramenta com hyperlink vaza escape) | `util.rs` | Baixo | 0,25d |
 
-**Subtotal A: ~5,5 dias.**
+**Subtotal A: ~5,5 dias (A11 corrigido, ver commit).**
 
 ---
 

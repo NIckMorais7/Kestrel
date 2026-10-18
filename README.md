@@ -75,12 +75,18 @@ central:
 |--------|----------------------------------------------------------------------|
 | read   | ler, buscar e analisar; nada de escrita ou execução                  |
 | write  | ler e editar arquivos; operações sensíveis pedem confirmação         |
-| semi   | autonomia com confirmação para operações sensíveis                   |
-| full   | autonomia máxima; comandos catastróficos continuam bloqueados        |
+| semi   | autônomo: build, testes, rodar código do projeto e modificações dentro dele não pedem confirmação; operações sensíveis e destrutivas pedem |
+| full   | o mesmo do semi, mais instalações e rede sem confirmação; **destrutivo continua pedindo** |
+
+Rodar código do projeto (`node script.js`, `python app.py`, `bun test`, `go run .`, …) e
+compilar/testar são fluxo de desenvolvimento: em `semi` e `full` passam sem confirmação.
+Modificações dentro do projeto (`cp`, `mv`, `mkdir`, comandos desconhecidos que mexem em
+arquivo) também.
 
 Comandos destrutivos (remoção de raiz, `dd` em disco, `mkfs`, fork bombs,
-etc.) são bloqueados em qualquer nível, e a leitura/escrita fora do projeto
-respeita os diretórios extra autorizados.
+`rm -rf`, `git reset --hard`, `curl | bash`, etc.) são bloqueados ou exigem
+confirmação em qualquer nível, e a leitura/escrita fora do projeto respeita os
+diretórios extra autorizados.
 
 ## Comandos da interface
 

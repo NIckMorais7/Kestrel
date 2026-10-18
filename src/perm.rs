@@ -574,30 +574,81 @@ fn classificar_parte(cmd: &str, ctx: &AnalysisContext) -> Analysis {
         );
     }
 
-    // 13. Build/testes.
+    // 13. Build/testes: ferramentas de desenvolvimento em geral.
+    //
+    // Antes esta lista só cobria o que o próprio Kestrel usa (cargo/npm/make).
+    // Rodar código do projeto com `node script.js`, `python app.py` ou
+    // `bun test` caía no passo 15 ("efeito não pôde ser avaliado") e pedia
+    // confirmação até no nível Full — o mesmo tratamento de `dd` em disco.
+    // Runtimes rodam código do projeto: são fluxo de desenvolvimento, como
+    // `cargo run`.
     let build = [
+        // Rust / C / C++
         "cargo build",
         "cargo test",
         "cargo check",
         "cargo clippy",
         "cargo fmt",
         "cargo run",
-        "npm test",
-        "npm run",
-        "yarn ",
-        "pnpm ",
-        "pytest",
-        "python -m pytest",
-        "make",
+        "cargo bench",
+        "cargo nextest",
         "cmake",
-        "go build",
-        "go test",
-        "tsc",
+        "make",
+        "ninja",
+        "meson",
         "gradle",
         "mvn ",
-        "dotnet build",
-        "dotnet test",
-        "bun ",
+        // Node / TypeScript / Deno / Bun
+        "npm",
+        "npx ",
+        "pnpm",
+        "yarn",
+        "bun",
+        "bunx",
+        "node",
+        "nodejs",
+        "deno",
+        "tsx",
+        "ts-node",
+        "tsc",
+        // Python
+        "python",
+        "python3",
+        "pytest",
+        "pipenv",
+        "poetry",
+        "uv run",
+        "uv pip",
+        "pip",
+        "pip3",
+        // Outras linguagens e task runners
+        "go build",
+        "go test",
+        "go run",
+        "go vet",
+        "dotnet",
+        "ruby",
+        "rake",
+        "php",
+        "composer",
+        "swift",
+        "kotlin",
+        "java",
+        "scalac",
+        "sbt",
+        "elixir",
+        "mix ",
+        "erl",
+        "perl",
+        "Rscript",
+        "julia",
+        "zig",
+        "dart",
+        "flutter",
+        "just",
+        "task ",
+        "dune",
+        "stack",
     ];
     if contem_algum(cmd, &build).is_some() || programa == "make" {
         return Analysis::new(
@@ -740,6 +791,10 @@ pub fn apply_level(base: Analysis, level: PermissionLevel) -> Analysis {
             CommandCategory::Sensivel | CommandCategory::Destrutiva => {
                 Analysis::new(Decision::Confirmar, base.category, base.reason)
             }
+            // Modificação dentro do projeto é o trabalho normal: não confirma.
+            CommandCategory::Modificacao | CommandCategory::Build => {
+                Analysis::new(Decision::Permitir, base.category, base.reason)
+            }
             _ => base,
         },
         PermissionLevel::Full => match base.category {
@@ -747,7 +802,7 @@ pub fn apply_level(base: Analysis, level: PermissionLevel) -> Analysis {
             CommandCategory::Sensivel => Analysis::new(
                 Decision::Permitir,
                 base.category,
-                format!("nível Full permite autonomous: {}", base.reason),
+                format!("nível Full permite execução autônoma: {}", base.reason),
             ),
             CommandCategory::Destrutiva => Analysis::new(
                 Decision::Confirmar,
@@ -757,6 +812,11 @@ pub fn apply_level(base: Analysis, level: PermissionLevel) -> Analysis {
                     base.reason
                 ),
             ),
+            // Modificação dentro do projeto (cp, mv, mkdir, comando desconhecido
+            // que mexe em arquivo) é rotina em nível máximo.
+            CommandCategory::Modificacao | CommandCategory::Build => {
+                Analysis::new(Decision::Permitir, base.category, base.reason)
+            }
             _ => base,
         },
     }
@@ -983,6 +1043,84 @@ mod tests {
                 toml::from_str(&format!("permission = \"{texto}\""))
                     .unwrap_or_else(|e| panic!("{texto}: {e}"));
             assert_eq!(lido.permission, esperado, "{texto}");
+        }
+    }
+
+    /// Rodar código do projeto (node, python, bun…) é fluxo de desenvolvimento:
+    /// não pode pedir confirmação no nível Full como se fosse `dd` em disco.
+    #[test]
+    fn rodar_codigo_do_projeto_nao_pede_confirmacao() {
+        for level in [PermissionLevel::Semi, PermissionLevel::Full] {
+            for cmd in [
+                "node script.js",
+                "node dist/index.js",
+                "python app.py",
+                "python3 treinar.py",
+                "bun test",
+                "deno run main.ts",
+                "tsx src/cli.tsx",
+                "ruby app.rb",
+                "php index.php",
+                "go run .",
+                "mix phx.server",
+                "just build",
+            ] {
+                let a = apply_level(analyze_command(cmd, &ctx(level)), level);
+                assert_eq!(
+                    a.decision,
+                    Decision::Permitir,
+                    "{level:?} pediu confirmação para `{cmd}` ({})",
+                    a.reason
+                );
+                assert_eq!(a.category, CommandCategory::Build, "{cmd}");
+            }
+        }
+    }
+
+    /// O read continua sendo read: nada de execução.
+    #[test]
+    fn read_ainda_bloqueia_execucao() {
+        let a = apply_level(
+            analyze_command("node script.js", &ctx(PermissionLevel::Read)),
+            PermissionLevel::Read,
+        );
+        assert_eq!(a.decision, Decision::Bloquear);
+    }
+
+    /// Comando desconhecido que modifica o projeto é rotina em Semi/Full,
+    /// mas segue pedindo confirmação em Write (nível mais restrito).
+    #[test]
+    fn modificacao_dentro_do_projeto_e_rotina_em_niveis_autonomos() {
+        for level in [PermissionLevel::Semi, PermissionLevel::Full] {
+            let a = apply_level(
+                analyze_command("sincronizador-empresa --config x.toml", &ctx(level)),
+                level,
+            );
+            assert_eq!(
+                a.decision,
+                Decision::Permitir,
+                "{level:?} não deveria confirmar modificação"
+            );
+        }
+        let w = apply_level(
+            analyze_command(
+                "sincronizador-empresa --config x.toml",
+                &ctx(PermissionLevel::Write),
+            ),
+            PermissionLevel::Write,
+        );
+        assert_eq!(w.decision, Decision::Confirmar);
+    }
+
+    /// O destrutivo continua pedindo confirmação em qualquer nível.
+    #[test]
+    fn destrutivo_continua_confirmando_em_todos_os_niveis() {
+        for level in [PermissionLevel::Semi, PermissionLevel::Full] {
+            let a = apply_level(
+                analyze_command("rm -rf /home/user/projeto/target", &ctx(level)),
+                level,
+            );
+            assert_eq!(a.decision, Decision::Confirmar, "{level:?}");
         }
     }
 
