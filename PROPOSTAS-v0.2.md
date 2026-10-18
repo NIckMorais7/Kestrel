@@ -226,19 +226,29 @@ o tamanho, e um Comp gigante e vago é o pior dos dois mundos: caro e ineficaz.
 
 ### Proposta: 3 camadas
 
-#### 1. Paleta (monocromática + 1 acento + semântica)
+#### 1. Paleta: preto + ciano contido (direção escolhida pelo usuário)
 
-| Papel | Cor proposta | Uso |
+Minimalismo, fundo **quase preto** (não preto puro, para não cansar) e **ciano
+que não grita**: o acento aparece só onde há intenção — glifo do prompt, borda
+focada, item selecionado e links.
+
+| Papel | Cor | Uso |
 |---|---|---|
-| fundo | `#1f2026` (quente, não preto) | aplicação inteira |
-| superfície | `#26272e` | barras e realces |
-| texto | `#d9d6cd` | corpo |
-| apagado | `#8b8a83` | dicas, metadados |
-| **acento** | **`#e0a458`** (âmbar) | foco, seleção, prompt, links |
-| borda | `#3a3b42` | contornos discretos |
-| ok / aviso / erro | `#7cb87b` / `#d9b45a` / `#cf7a72` | estados |
+| fundo | `#0d0f13` | aplicação inteira |
+| superfície | `#13161b` | barra de estado e campo de mensagem |
+| texto | `#c9d1d9` | corpo |
+| apagado | `#7a858f` | dicas, metadados, caminho do projeto |
+| borda | `#22272e` | contorno da conversa (bem discreto) |
+| **acento** | **`#6cb6c4`** | prompt `❯`, borda focada, seleção, links |
+| acento fraco | `#40707c` | prefixo `┊` de ferramenta, barra de estado |
+| ok / aviso / erro | `#62a876` / `#ba9452` / `#c15a54` | estados |
+| Pip | `#e8e6e0` | a massa branca do mascote |
 
-Regras: **encerrar o azul** (`#96b4e6`/`#78b4ff` viram acento); no máximo 4 cores por tela; símbolo sempre acompanha cor (`✓`, `✗`, `⚠`, `●`).
+Regras: no máximo 4 cores por tela; símbolo sempre acompanha cor (`✓`, `✗`,
+`⚠`, `●`); o ciano **nunca** pinta bloco de texto — só glifos e contornos.
+
+**Mockups gerados** (`/tmp/opencode/mockup_{kestrel,mono,daylight}.png`):
+telas desenhadas célula a célula com a paleta acima, comparando as três skins.
 
 #### 2. Estrutura (3 faixas, 1 centro)
 
@@ -260,6 +270,14 @@ Regras: **encerrar o azul** (`#96b4e6`/`#78b4ff` viram acento); no máximo 4 cor
 
 #### 3. Skins (o sistema, não só um visual)
 
+Três prontos, na direção escolhida:
+
+| skin | caráter |
+|---|---|
+| `kestrel` | preto + ciano contido (padrão) |
+| `mono` | só cinzas — para gravar tela ou terminal mínimo |
+| `daylight` | claro, para terminal claro |
+
 Separado de `/person`, exatamente como o Hermes separa **skin** de **personality**:
 
 ```
@@ -268,10 +286,8 @@ Separado de `/person`, exatamente como o Hermes separa **skin** de **personality
 /skin daylight       → tema claro
 ```
 
-`~/.config/kestrel/skins/<nome>.toml` com as chaves de cor acima; 3 prontos:
-**kestrel** (escuro quente, padrão), **mono** (só cinzas, para gravar tela),
-**daylight** (claro, para terminal claro). Detecção de terminal claro via
-`COLORFGBG`/OSC 11, com `KESTREL_SKIN` para forçar.
+`~/.config/kestrel/skins/<nome>.toml` com as chaves de cor acima. Detecção de
+terminal claro via `COLORFGBG`/OSC 11, com `KESTREL_SKIN` para forçar.
 
 ### Custo
 
