@@ -507,16 +507,31 @@ impl ToolRegistry {
 
         ctx.checar_cancelamento()?;
         let inicio = std::time::Instant::now();
+        // Fotografia dos processos já em execução: se o tempo limite estourar
+        // aqui (e não dentro da ferramenta), os processos que ela criou
+        // precisam ser encerrados — senão ficam órfãos, porque o future
+        // descartado no estouro do timeout ninguém mais os mata.
+        let processos_antes = ctx.processos.ids_ativas();
         let resultado = tokio::select! {
             _ = ctx.cancel.cancelled() => Err(ToolError::Cancelado),
             r = tokio::time::timeout(tool.timeout(), tool.executar(args.clone(), ctx)) => {
                 match r {
                     Ok(Ok(out)) => Ok(out),
                     Ok(Err(e)) => Err(e),
-                    Err(_) => Err(ToolError::Mensagem(format!(
-                        "a ferramenta `{nome}` excedeu o tempo limite de {}s",
-                        tool.timeout().as_secs()
-                    ))),
+                    Err(_) => {
+                        // Rede de segurança: mata só o que esta chamada criou.
+                        let novos: Vec<String> = ctx
+                            .processos
+                            .ids_ativas()
+                            .into_iter()
+                            .filter(|id| !processos_antes.contains(id))
+                            .collect();
+                        ctx.processos.encerrar_varios(&novos);
+                        Err(ToolError::Mensagem(format!(
+                            "a ferramenta `{nome}` excedeu o tempo limite de {}s",
+                            tool.timeout().as_secs()
+                        )))
+                    }
                 }
             }
         };
@@ -652,6 +667,15 @@ pub fn validar_args(spec: &ToolSpec, args: &Value) -> Result<(), ToolError> {
 
 /// Resolve um caminho informado pelo modelo, aceitando caminhos relativos ao
 /// projeto, absolutos e com `~`.
+/// Resolve um caminho para o alvo real no disco.
+///
+/// Sem o `canonicalize`, a verificação de escopo é puramente léxica: um symlink
+/// dentro do projeto apontando para `/etc` passava no teste `starts_with(root)`
+/// e as ferramentas liam/escreviam fora do projeto.
+///
+/// Quando o caminho ainda não existe (criação), canoniciza o ancestral mais
+/// próximo existente e reconcat o resto — assim `novo/arquivo.txt` continua
+/// resolvendo normalmente sem perder a checagem dos componentes que existem.
 pub fn resolver_caminho(ctx: &ToolContext, entrada: &str) -> PathBuf {
     let bruto = crate::util::expand_tilde(entrada.trim());
     let caminho = if bruto.is_absolute() {
@@ -659,7 +683,33 @@ pub fn resolver_caminho(ctx: &ToolContext, entrada: &str) -> PathBuf {
     } else {
         ctx.workdir.join(bruto)
     };
-    normalize_path(&caminho)
+    let normalizado = normalize_path(&caminho);
+    match std::fs::canonicalize(&normalizado) {
+        Ok(real) => real,
+        Err(_) => {
+            // Sobe até o primeiro ancestral que exista, canoniciza ele e
+            // reconcató os componentes que faltam (do mais Fundo ao mais raso).
+            let mut ancestral = normalizado.as_path();
+            let mut faltando: Vec<std::ffi::OsString> = Vec::new();
+            loop {
+                if let Ok(base) = std::fs::canonicalize(ancestral) {
+                    let mut saida = base;
+                    for parte in faltando.iter().rev() {
+                        saida.push(parte);
+                    }
+                    return normalize_path(&saida);
+                }
+                match (ancestral.file_name(), ancestral.parent()) {
+                    (Some(nome), Some(pai)) => {
+                        faltando.push(nome.to_os_string());
+                        ancestral = pai;
+                    }
+                    _ => break,
+                }
+            }
+            normalizado
+        }
+    }
 }
 
 /// Lê um argumento textual obrigatório.
@@ -700,6 +750,39 @@ pub fn recortar_saida(texto: &str, max: usize) -> String {
     )
 }
 
+/// Ferramenta de teste que roda um comando longo — o tempo limite que estoura
+/// é o do registro, não o dela.
+#[cfg(test)]
+struct FerramentaLonga;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Tool for FerramentaLonga {
+    fn nome(&self) -> &'static str {
+        "longa"
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.nome().into(),
+            description: "teste".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn timeout(&self) -> Duration {
+        // Curto de propósito: o registro estoura antes da ferramenta.
+        Duration::from_millis(700)
+    }
+
+    async fn executar(&self, _args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        // O comando leva 30s; só o timeout do registro pode pará-lo.
+        shell::executar_comando(ctx, "sleep 30", &ctx.workdir, Some(Duration::from_secs(30)))
+            .await?;
+        Ok(ToolOutput::texto("nunca chega aqui"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,9 +807,83 @@ mod tests {
         assert!(!permitida_no_chat("ferramenta-inexistente"));
     }
 
-    /// `run_command` com `cwd` fora do projeto precisa cair na verificação de
-    /// escopo como qualquer outro caminho: antes a ferramenta marcava
-    /// `checagem_propria` e ninguém olhava o diretório de execução.
+    /// O tempo limite do registro precisa encerrar os processos que a
+    /// ferramenta criou: sem isso o future descartado os deixava órfãos.
+    #[tokio::test]
+    async fn timeout_do_registro_mata_o_processo_da_ferramenta() {
+        let dir = std::env::temp_dir().join(format!("kestrel-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        // Registro só com a ferramenta de teste.
+        let registro = ToolRegistry {
+            tools: vec![Arc::new(FerramentaLonga)],
+        };
+        let inicio = std::time::Instant::now();
+        let saida = registro
+            .executar("longa", serde_json::json!({}), &ctx)
+            .await;
+        assert!(saida.is_err(), "deveria estourar o tempo limite");
+        assert!(
+            inicio.elapsed() < Duration::from_secs(5),
+            "o timeout nao disparou: {:?}",
+            inicio.elapsed()
+        );
+        let lista = ctx.processos.listar();
+        eprintln!("processos apos o timeout: {lista:?}");
+        let ativas = ctx.processos.ids_ativas();
+        eprintln!("ativas: {ativas:?}");
+        assert!(ativas.is_empty(), "processo orfao continuou rodando");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Um symlink dentro do projeto apontando para fora escapava da checagem de
+    /// escopo, porque `normalize_path` é puramente léxico.
+    #[test]
+    fn symlink_para_fora_do_projeto_nao_passa_do_escopo() {
+        let base = std::env::temp_dir().join(format!("kestrel-link-{}", uuid::Uuid::new_v4()));
+        let projeto = base.join("projeto");
+        let fora = base.join("fora");
+        std::fs::create_dir_all(&projeto).unwrap();
+        std::fs::create_dir_all(&fora).unwrap();
+        std::fs::write(fora.join("segredo.txt"), "conteudo").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&fora, projeto.join("atalho")).unwrap();
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&fora, projeto.join("atalho")).unwrap();
+
+        let ctx = crate::tools::git::tests::contexto(&projeto);
+        // O caminhoresolve para fora do projeto.
+        let resolvido = super::resolver_caminho(&ctx, "atalho/segredo.txt");
+        assert!(
+            resolvido.starts_with(&fora),
+            "deveria resolver para fora: {}",
+            resolvido.display()
+        );
+        // Portanto a checagem de escopo (starts_with nas raízes) reprova.
+        let dentro = ctx.roots.iter().any(|r| resolvido.starts_with(r));
+        assert!(
+            !dentro,
+            "o symlink não deve ser considerado dentro do projeto"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Caminho que ainda não existe continua resolvendo normalmente.
+    #[test]
+    fn caminho_inexistente_resolve_para_dentro_do_projeto() {
+        let projeto = std::env::temp_dir().join(format!("kestrel-novo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&projeto).unwrap();
+        let ctx = crate::tools::git::tests::contexto(&projeto);
+        let resolvido = super::resolver_caminho(&ctx, "sub/novo-arquivo.txt");
+        assert!(
+            resolvido.starts_with(&projeto),
+            "deveria continuar dentro do projeto: {}",
+            resolvido.display()
+        );
+        assert!(resolvido.ends_with("sub/novo-arquivo.txt"), "{resolvido:?}");
+        let _ = std::fs::remove_dir_all(&projeto);
+    }
+
     #[test]
     fn run_command_declara_o_cwd_para_verificacao_de_escopo() {
         use crate::tools::shell::RunCommand;

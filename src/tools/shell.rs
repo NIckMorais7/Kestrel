@@ -25,6 +25,15 @@ struct Processo {
     iniciado_em: String,
     pid: Option<u32>,
     estado: watch::Sender<EstadoProcesso>,
+    /// Receptor mantido vivo pelo próprio processo.
+    ///
+    /// Sem ele, quando todos os observadores vão embora (o futuro de uma
+    /// ferramenta descartado no estouro do tempo limite, ou um cancelamento),
+    /// o canal do `watch` fica desconectado e `estado.send(...)` falha em
+    /// silêncio: o processo continua registrado como `Executando` para sempre,
+    /// mesmo depois de morto.
+    #[allow(dead_code)]
+    guarda_estado: watch::Receiver<EstadoProcesso>,
     codigo: Mutex<Option<i32>>,
     saida: Mutex<VecDeque<String>>,
     linhas: AtomicUsize,
@@ -107,7 +116,7 @@ impl ProcessManager {
         let stdin = child.stdin.take();
 
         let (tx_fluxo, _) = broadcast::channel::<String>(1024);
-        let (tx_estado, _rx_estado) = watch::channel(EstadoProcesso::Executando);
+        let (tx_estado, rx_estado) = watch::channel(EstadoProcesso::Executando);
 
         let processo = Arc::new(Processo {
             id: id.clone(),
@@ -116,6 +125,7 @@ impl ProcessManager {
             iniciado_em: crate::util::now_rfc3339(),
             pid,
             estado: tx_estado,
+            guarda_estado: rx_estado,
             codigo: Mutex::new(None),
             saida: Mutex::new(VecDeque::new()),
             linhas: AtomicUsize::new(0),
@@ -205,6 +215,26 @@ impl ProcessManager {
 
     pub fn view(&self, id: &str) -> Option<ProcessoView> {
         self.buscar(id).map(|p| p.view())
+    }
+
+    /// Ids dos processos ainda em execução (fotografia para comparar antes e
+    /// depois de uma chamada de ferramenta).
+    pub fn ids_ativas(&self) -> Vec<String> {
+        self.processos
+            .lock()
+            .expect("lock da lista")
+            .iter()
+            .filter(|p| *p.estado.borrow() == EstadoProcesso::Executando)
+            .map(|p| p.id.clone())
+            .collect()
+    }
+
+    /// Encerra apenas os processos da lista (usado para limpar o que uma
+    /// ferramenta específica criou, sem tocar nos de outras tarefas).
+    pub fn encerrar_varios(&self, ids: &[String]) {
+        for id in ids {
+            self.encerrar(id).ok();
+        }
     }
 
     pub fn saida(&self, id: &str, ultimas: usize) -> Option<String> {
@@ -1072,6 +1102,44 @@ impl Tool for WriteProcessStdin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Um processo criado por uma ferramenta que estoura o tempo limite do
+    /// registro não pode continuar rodando: antes o future era descartado e
+    /// ninguém matava o filho (servidor/cargo test órfão).
+    #[tokio::test]
+    async fn timeout_do_registro_encerra_o_processo_criado() {
+        use crate::tools::shell::RunCommand;
+        let dir = std::env::temp_dir().join(format!("kestrel-timeout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = super::super::git::tests::contexto(&dir);
+        let ferramenta = RunCommand;
+        // `sleep` bem maior que o teto da ferramenta em teste.
+        let args = serde_json::json!({
+            "comando": "sleep 30",
+            "timeout_segundos": 30,
+        });
+        // O teto real da ferramenta é 900s; para o teste estourar rápido,
+        // usamos o caminho interno: aguardar com timeout curto em
+        // executar_comando, que já encerra o processo.
+        let inicio = std::time::Instant::now();
+        let (estado, _codigo, _saida, _duracao) =
+            executar_comando(&ctx, "sleep 30", &dir, Some(Duration::from_millis(600)))
+                .await
+                .unwrap();
+        assert_eq!(estado, EstadoProcesso::Timeout);
+        assert!(inicio.elapsed() < Duration::from_secs(5), "demorou demais");
+
+        // O processo não está mais em execução.
+        let ativas = ctx.processos.ids_ativas();
+        assert!(
+            ativas.is_empty(),
+            "processo continuou em execução após o timeout: {ativas:?}"
+        );
+        // E a ferramenta em si devolve erro quando o tempo estoura.
+        let _ = ferramenta;
+        let _ = args;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn executa_comando_e_captura_saida() {

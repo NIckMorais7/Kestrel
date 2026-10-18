@@ -1008,6 +1008,11 @@ async fn executar_turno(
         let resultados =
             executar_chamadas(&comp, &ctx_ferramentas, &validas, &mut recuperacao).await;
 
+        // Todos os resultados são persistidos e devolvidos ao histórico antes de
+        // qualquer encerramento: as ferramentas já rodaram (arquivos escritos,
+        // comandos executados) e,pular os tool_results deixaria a mensagem do
+        // assistente com tool_calls sem resposta — histórico inválido para a API.
+        let mut encerrar: Option<String> = None;
         for (call, resultado) in resultados {
             let (sucesso, conteudo, resumo, adicoes, remocoes) = resultado;
             // Nunca persiste nem devolve ao modelo segredos capturados de saídas.
@@ -1043,16 +1048,13 @@ async fn executar_turno(
                             None,
                         )
                         .ok();
-                    break 'turno ResultadoTurno {
-                        resumo: format!(
-                            "Recuperação automática encerrada para {} ({} tentativas em {:.1}s).",
-                            diag.classificacao.label(),
-                            diag.tentativas,
-                            (cfg.agent.recovery_timeout_secs as f64)
-                                - diag.tempo_restante.as_secs_f64()
-                        ),
-                        concluido: false,
-                    };
+                    encerrar = Some(format!(
+                        "Recuperação automática encerrada para {} ({} tentativas em {:.1}s).",
+                        diag.classificacao.label(),
+                        diag.tentativas,
+                        (cfg.agent.recovery_timeout_secs as f64)
+                            - diag.tempo_restante.as_secs_f64()
+                    ));
                 }
             }
             comp.store.append_message(
@@ -1102,6 +1104,15 @@ async fn executar_turno(
                 adicoes: 0,
                 remocoes: 0,
             });
+        }
+
+        // Só depois de persistir e devolver todos os resultados é que o turno
+        // termina — nunca no meio do laço.
+        if let Some(resumo) = encerrar {
+            break 'turno ResultadoTurno {
+                resumo,
+                concluido: false,
+            };
         }
 
         if cancel.is_cancelled() {
@@ -1854,6 +1865,70 @@ mod tests {
             eventos.push(evento);
         }
         eventos
+    }
+
+    /// O laço de turno persistia apenas os resultados das ferramentas até o
+    /// `break` — quando a recuperação estourava no meio, os tool_results já
+    /// executados eram descartados e a mensagem do assistente ficava com
+    /// tool_calls sem resposta (histórico inválido para a API).
+    #[tokio::test]
+    async fn resultados_executados_sempre_vao_para_o_historico() {
+        let dir = dir_de_teste("resultados");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_session("s", "/tmp", "t", "modelo/teste", None, "full", None)
+            .unwrap();
+        // Recuperação estoura na primeira falha: o turno termina, mas os dois
+        // resultados precisam estar gravados.
+        let ambiente = ambiente_de_teste(store, |cfg| {
+            cfg.agent.workdir = Some(dir.clone());
+            cfg.agent.pin_workdir = true;
+            cfg.agent.permission = PermissionLevel::Full;
+            cfg.agent.recovery_max_attempts = 1;
+            cfg.agent.recovery_timeout_secs = 1;
+        });
+        usar_roteiro(
+            &ambiente,
+            vec![
+                // Duas chamadas: a segunda falha (arquivo inexistente) e a
+                // primeira teria sido descartada pelo break.
+                crate::provider::Completion {
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "c1".into(),
+                            name: "list_files".into(),
+                            arguments: json!({"path": "."}).to_string(),
+                        },
+                        ToolCall {
+                            id: "c2".into(),
+                            name: "read_file".into(),
+                            arguments: json!({"path": "/inexistente/nao-existe"}).to_string(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                resposta("pronto"),
+            ],
+        );
+
+        executar_turno(
+            ambiente.comp.clone(),
+            "liste e leia".into(),
+            false,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let mensagens = ambiente.comp.store.messages("s", 100).unwrap();
+        let ferramentas: Vec<&str> = mensagens
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.tool_name.as_deref().unwrap_or(""))
+            .collect();
+        // As duas respostas de ferramenta estão no histórico, na ordem.
+        assert_eq!(ferramentas, vec!["list_files", "read_file"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn resposta(texto: &str) -> crate::provider::Completion {
