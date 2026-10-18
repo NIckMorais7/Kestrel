@@ -88,8 +88,13 @@ Digite `/` e use Tab/Enter para completar (um comando parcial **não** é
 executado por acidente: Enter completa, o segundo Enter executa).
 
 `/help` lista todos os comandos com os argumentos reais: `/model`, `/chat`,
-`/agente`, `/plan`, `/permissions`, `/thinking`, `/historico`, `/retomar`,
-`/nova`, `/projetos`, `/processos`, `/skills`, `/config`, `/clear`, `/sair`.
+`/agent`, `/plan`, `/permissions`, `/thinking`, `/history`, `/resume`, `/new`,
+`/projects`, `/processes`, `/skills`, `/config`, `/clear`, `/quit`.
+
+Os comandos são em inglês e **todos aceitam apelido em português** (`/modelo`,
+`/conversa`, `/agente`, `/limpar`, `/sair`, `/nova`, `/projetos`, `/analisar`,
+`/processos`, `/retomar`, `/historico`), então quem digita em português não
+perde o hábito.
 
 ## Pip
 

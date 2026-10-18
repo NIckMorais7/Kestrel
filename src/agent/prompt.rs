@@ -243,7 +243,7 @@ mod tests {
         };
         let texto = construir(&ctx);
         assert!(texto.contains("Modo de operação: chat"));
-        assert!(texto.contains("/agente"));
+        assert!(texto.contains("/agent"));
         assert!(texto.contains("não execute comandos"));
     }
 }

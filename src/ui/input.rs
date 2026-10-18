@@ -305,7 +305,7 @@ pub const COMANDOS_SLASH: &[ComandoSlash] = &[
         descricao: "modo conversa: só leitura, nada no projeto é modificado ou executado",
     },
     ComandoSlash {
-        nome: "/agente",
+        nome: "/agent",
         argumentos: "",
         descricao: "modo agente: trabalha no projeto conforme as permissões",
     },
@@ -330,22 +330,22 @@ pub const COMANDOS_SLASH: &[ComandoSlash] = &[
         descricao: "interrompe o turno em execução, preservando alterações",
     },
     ComandoSlash {
-        nome: "/historico",
+        nome: "/history",
         argumentos: "[termo]",
         descricao: "lista sessões salvas ou busca no histórico de mensagens",
     },
     ComandoSlash {
-        nome: "/projetos",
+        nome: "/projects",
         argumentos: "",
         descricao: "lista projetos recentes e permite trocar o diretório de trabalho",
     },
     ComandoSlash {
-        nome: "/analisar",
+        nome: "/analyze",
         argumentos: "",
         descricao: "reanalisa o projeto ativo (linguagens, build, testes)",
     },
     ComandoSlash {
-        nome: "/processos",
+        nome: "/processes",
         argumentos: "",
         descricao: "lista os processos gerenciados e o estado de cada um",
     },
@@ -355,17 +355,17 @@ pub const COMANDOS_SLASH: &[ComandoSlash] = &[
         descricao: "mostra o resumo da configuração e o caminho do arquivo",
     },
     ComandoSlash {
-        nome: "/retomar",
-        argumentos: "<id|ultima>",
+        nome: "/resume",
+        argumentos: "<id|last>",
         descricao: "retoma uma sessão salva de onde parou",
     },
     ComandoSlash {
-        nome: "/nova",
+        nome: "/new",
         argumentos: "",
         descricao: "inicia uma nova sessão sem apagar o histórico",
     },
     ComandoSlash {
-        nome: "/sair",
+        nome: "/quit",
         argumentos: "",
         descricao: "encerra o Kestrel com segurança",
     },
@@ -445,6 +445,52 @@ mod tests {
         assert!(e.sugestoes().is_empty());
         e.definir_texto("/xyz".into());
         assert!(e.sugestoes().is_empty());
+    }
+
+    /// Todos os comandos são em inglês: um comando principal em português
+    /// quebraria a regra (e a tabulação completaria algo que ninguém digita).
+    #[test]
+    fn comandos_sao_todos_em_ingles() {
+        for c in COMANDOS_SLASH {
+            assert!(
+                c.nome.starts_with('/'),
+                "comando sem barra inicial: {}",
+                c.nome
+            );
+            let corpo = &c.nome[1..];
+            assert!(
+                corpo.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+                "comando `{}` não está em inglês minúsculo",
+                c.nome
+            );
+            assert!(!c.descricao.is_empty(), "{} sem descrição", c.nome);
+        }
+        // Os apelidos em português continuam existindo no despacho — a regra é
+        // sobre o nome canônico, não sobre o que ainda pode ser digitado.
+        let nomes: Vec<&str> = COMANDOS_SLASH.iter().map(|c| c.nome).collect();
+        for esperado in [
+            "/help",
+            "/model",
+            "/effort",
+            "/thinking",
+            "/permissions",
+            "/chat",
+            "/agent",
+            "/clear",
+            "/skills",
+            "/plan",
+            "/stop",
+            "/history",
+            "/projects",
+            "/analyze",
+            "/processes",
+            "/config",
+            "/resume",
+            "/new",
+            "/quit",
+        ] {
+            assert!(nomes.contains(&esperado), "faltou {esperado}");
+        }
     }
 
     #[test]

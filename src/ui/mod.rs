@@ -192,7 +192,7 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(" troca o modelo · ", theme::apagado()),
                 Span::styled("/chat", theme::rotulo()),
                 Span::styled(" e ", theme::apagado()),
-                Span::styled("/agente", theme::rotulo()),
+                Span::styled("/agent", theme::rotulo()),
                 Span::styled(" trocam o modo · ", theme::apagado()),
                 Span::styled("/permissions", theme::rotulo()),
                 Span::styled(" ajusta o nível", theme::apagado()),

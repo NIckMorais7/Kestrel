@@ -818,7 +818,7 @@ impl App {
                 }
             }
             "/chat" | "/conversa" => self.trocar_modo(ModoOperacao::Chat),
-            "/agente" | "/agent" => self.trocar_modo(ModoOperacao::Agente),
+            "/agent" | "/agente" => self.trocar_modo(ModoOperacao::Agente),
             "/modo" => match ModoOperacao::parse(&argumento) {
                 Some(modo) => self.trocar_modo(modo),
                 None if argumento.is_empty() => self.avisar(format!(
@@ -830,7 +830,7 @@ impl App {
                     "modo `{argumento}` inválido. Use /chat ou /agente."
                 )),
             },
-            "/skills" => {
+            "/skills" | "/habilidades" => {
                 if self.skills.is_empty() {
                     self.avisar(format!(
                         "nenhuma skill instalada. Diretórios monitorados:\n- {}\n- {}/.kestrel/skills",
@@ -899,17 +899,17 @@ impl App {
                     self.avisar("nenhum turno em execução".into());
                 }
             }
-            "/historico" | "/histórico" => {
+            "/history" | "/historico" | "/histórico" => {
                 self.abrir_historico(&argumento);
             }
-            "/projetos" => {
+            "/projects" | "/projetos" => {
                 self.abrir_projetos();
             }
-            "/analisar" => {
+            "/analyze" | "/analisar" => {
                 let _ = self.cmd_tx.send(UiCommand::AnalisarProjeto);
                 self.avisar("reanalisando o projeto…".into());
             }
-            "/processos" => {
+            "/processes" | "/processos" => {
                 let _ = self.cmd_tx.send(UiCommand::ListarProcessos);
             }
             "/config" | "/configuracao" | "/configuração" => {
@@ -965,7 +965,7 @@ impl App {
                     scroll: 0,
                 });
             }
-            "/retomar" => {
+            "/resume" | "/retomar" => {
                 if argumento.is_empty() {
                     self.abrir_historico("");
                 } else if argumento == "ultima" || argumento == "última" {
@@ -984,10 +984,10 @@ impl App {
                     let _ = self.cmd_tx.send(UiCommand::RetomarSessao(argumento));
                 }
             }
-            "/nova" => {
+            "/new" | "/nova" => {
                 let _ = self.cmd_tx.send(UiCommand::NovaSessao);
             }
-            "/sair" => {
+            "/quit" | "/sair" => {
                 self.iniciar_saida();
             }
             outro => {
@@ -2192,6 +2192,59 @@ mod tests {
         assert!(!app.turno_ativo);
     }
 
+    /// Os apelidos em português dos comandos continuam funcionando: renomear
+    /// para inglês não pode quebrar o hábito de quem digita em português.
+    #[test]
+    fn apelidos_em_portugues_continuam_valendo() {
+        // Nenhum apelido pode ser tratado como comando inexistente.
+        for apelido in [
+            "/modelo",
+            "/conversa",
+            "/agente",
+            "/limpar",
+            "/sair",
+            "/nova",
+            "/projetos",
+            "/analisar",
+            "/processos",
+            "/retomar",
+            "/historico",
+        ] {
+            let (mut app, _rx) = app_de_teste();
+            app.entrada.definir_texto(apelido.into());
+            app.enviar_entrada();
+            let aviso_inexistente = matches!(
+                app.blocos.last(),
+                Some(Bloco::Aviso(t)) if t.contains("não existe")
+            );
+            assert!(!aviso_inexistente, "{apelido} não é reconhecido");
+        }
+
+        // E os de efeito puramente local continuam agindo na hora.
+        let (mut app, _rx) = app_de_teste();
+        let modo_antes = app.modo;
+        app.entrada.definir_texto("/conversa".into());
+        app.enviar_entrada();
+        assert_ne!(app.modo, modo_antes, "/conversa deveria trocar o modo");
+        app.entrada.definir_texto("/agente".into());
+        app.enviar_entrada();
+        assert_eq!(app.modo, modo_antes, "/agente deveria voltar o modo");
+
+        let (mut app, _rx) = app_de_teste();
+        app.empurrar_bloco(super::Bloco::Usuario("algo".into()));
+        app.empurrar_bloco(super::Bloco::Usuario("outro".into()));
+        app.entrada.definir_texto("/limpar".into());
+        app.enviar_entrada();
+        // Sobra apenas o aviso de que a conversa foi limpa.
+        assert_eq!(app.blocos.len(), 1, "/limpar deveria limpar a conversa");
+        assert!(matches!(app.blocos[0], super::Bloco::Aviso(_)));
+
+        let (mut app, _rx) = app_de_teste();
+        app.entrada.definir_texto("/sair".into());
+        app.enviar_entrada();
+        assert!(app.saindo, "/sair deveria iniciar a saída");
+    }
+
     #[test]
     fn resposta_durante_turno_redireciona() {
         let (mut app, mut rx) = app_de_teste();
@@ -2468,7 +2521,7 @@ mod tests {
             outro => panic!("esperava aviso, veio {outro:?}"),
         }
         assert!(rx.try_recv().is_err());
-        app.entrada.definir_texto("/agente".into());
+        app.entrada.definir_texto("/agent".into());
         app.enviar_entrada();
         assert_eq!(app.modo, ModoOperacao::Agente);
         match rx.try_recv().unwrap() {
