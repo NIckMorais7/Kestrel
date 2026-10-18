@@ -73,20 +73,28 @@ central:
 
 | Nível  | O que permite                                                        |
 |--------|----------------------------------------------------------------------|
-| read   | ler, buscar e analisar; nada de escrita ou execução                  |
-| write  | ler e editar arquivos; operações sensíveis pedem confirmação         |
-| semi   | autônomo: build, testes, rodar código do projeto e modificações dentro dele não pedem confirmação; operações sensíveis e destrutivas pedem |
-| full   | o mesmo do semi, mais instalações e rede sem confirmação; **destrutivo continua pedindo** |
+| read   | **ler** qualquer caminho (dentro ou fora do projeto); nenhuma escrita ou execução |
+| write  | ler, criar, editar e excluir — dentro **e fora** do projeto; `rm -rf` em caminho comum; operações sensíveis (instalação, rede, privilégios) pedem confirmação |
+| semi   | tudo do write sem confirmação, mais `rm -rf`, instalações e rede; só o que **perde dado** (git destrutivo) pede confirmação |
+| full   | idem ao semi, mais conteúdo baixado da rede executado direto (pipe para interpretador); **só git destrutivo pede confirmação** |
 
-Rodar código do projeto (`node script.js`, `python app.py`, `bun test`, `go run .`, …) e
-compilar/testar são fluxo de desenvolvimento: em `semi` e `full` passam sem confirmação.
-Modificações dentro do projeto (`cp`, `mv`, `mkdir`, comandos desconhecidos que mexem em
-arquivo) também.
+**Fora do projeto não é proibido**: a regra é pela operação. Ler qualquer caminho
+funciona em todos os níveis; escrever (criar/editar/excluir) funciona de `write` em
+diante e é bloqueado em `read`.
 
-Comandos destrutivos (remoção de raiz, `dd` em disco, `mkfs`, fork bombs,
-`rm -rf`, `git reset --hard`, `curl | bash`, etc.) são bloqueados ou exigem
-confirmação em qualquer nível, e a leitura/escrita fora do projeto respeita os
-diretórios extra autorizados.
+Rodar código do projeto (`node script.js`, `python app.py`, `bun test`, `go run .`, …) é
+fluxo de desenvolvimento e passa sem confirmação em `semi`/`full`.
+
+**O que nunca passa** (bloqueado em qualquer nível): formatar disco (`mkfs`, `dd` em
+dispositivo), fork bomb, desligar o sistema, e escrever ou remover em `/etc`, `/usr`,
+`/sys`, `/proc`, `/dev`, `/boot`, `/bin`, `/sbin`, `/var/lib` ou na raiz `/`.
+
+**Sem limite de iterações**: o agente trabalha até concluir a tarefa, ser interrompido
+por você (`Esc` ou `Ctrl+C`) ou a compactação de contexto não conseguir mais manter a
+conversa. O progresso aparece na interface como `trabalhando… Nª interação`.
+
+O que ainda pede confirmação em `semi`/`full` é só o que **perde dado sem volta**:
+`git reset --hard`, `git push --force`, `git clean -fdx`, `git filter-branch`.
 
 ## Comandos da interface
 
