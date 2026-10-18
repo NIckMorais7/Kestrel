@@ -2323,6 +2323,84 @@ mod tests {
 
     /// Os apelidos em português dos comandos continuam funcionando: renomear
     /// para inglês não pode quebrar o hábito de quem digita em português.
+    /// `/undo` reverte de verdade: cria um arquivo, grava a alteração no banco
+    /// (como as ferramentas fazem) e desfaz — o conteúdo tem de voltar ao
+    /// original, sem depender de git.
+    #[test]
+    fn undo_reverte_o_arquivo_de_verdade() {
+        let dir = std::env::temp_dir().join(format!("kestrel-undo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut app, _rx) = app_de_teste();
+        app.entrada.definir_texto("/undo".into());
+        let alvo = dir.join("nota.txt");
+        let antes = "linha um\nlinha dois\nlinha tres\n";
+        std::fs::write(&alvo, antes).unwrap();
+        // Simula a edição que a ferramenta `edit_file` faria.
+        let depois = "linha um\nlinha DOIS\nlinha tres\n";
+        let d = crate::diff::diff(antes, depois);
+        app.store
+            .record_file_change(
+                &app.sessao_id,
+                &alvo.display().to_string(),
+                "editar",
+                d.stats.additions,
+                d.stats.deletions,
+                Some(&d.text),
+            )
+            .unwrap();
+        std::fs::write(&alvo, depois).unwrap();
+
+        app.enviar_entrada();
+        // O arquivo voltou ao conteúdo anterior.
+        assert_eq!(std::fs::read_to_string(&alvo).unwrap(), antes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Quando o arquivo mudou desde a alteração registrada, o `/undo` avisa em
+    /// vez de escrever um conteúdo errado.
+    #[test]
+    fn undo_avisa_quando_o_arquivo_mudou() {
+        let dir = std::env::temp_dir().join(format!("kestrel-undo2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut app, _rx) = app_de_teste();
+        let alvo = dir.join("nota.txt");
+        let antes = "a\nb\n";
+        std::fs::write(&alvo, antes).unwrap();
+        let depois = "a\nB\n";
+        let d = crate::diff::diff(antes, depois);
+        app.store
+            .record_file_change(
+                &app.sessao_id,
+                &alvo.display().to_string(),
+                "editar",
+                d.stats.additions,
+                d.stats.deletions,
+                Some(&d.text),
+            )
+            .unwrap();
+        // Alguém mudou o arquivo depois: o diff não bate mais.
+        std::fs::write(&alvo, "completamente diferente\n").unwrap();
+
+        app.entrada.definir_texto("/undo".into());
+        app.enviar_entrada();
+        // O conteúdo não foi tocado.
+        assert_eq!(
+            std::fs::read_to_string(&alvo).unwrap(),
+            "completamente diferente\n"
+        );
+        // E o usuário foi avisado.
+        let aviso = app
+            .blocos
+            .last()
+            .and_then(|b| match b {
+                super::Bloco::Aviso(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(aviso.contains("mudou"), "aviso pouco claro: {aviso}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn apelidos_em_portugues_continuam_valendo() {
         // Nenhum apelido pode ser tratado como comando inexistente.
