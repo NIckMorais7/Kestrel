@@ -12,6 +12,7 @@ mod db;
 mod diff;
 mod events;
 mod html;
+mod migrar;
 mod perm;
 mod project;
 mod provider;

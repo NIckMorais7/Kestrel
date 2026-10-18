@@ -278,22 +278,100 @@ pub struct Config {
 }
 
 impl Config {
-    /// Carrega a configuração do disco; ausente ou inválida resulta no padrão.
+    /// Carrega a configuração do disco.
+    ///
+    /// Devolve a configuração e um aviso opcional. Duas situações agora são
+    /// distintas — antes qualquer problema resultava em `Config::default()`
+    /// silenciosamente, apagando modelo e permissão do usuário:
+    ///
+    /// - **arquivo ausente**: padrão, sem aviso (primeira execução);
+    /// - **arquivo corrompido**: padrão + aviso claro, **mas** o arquivo ruim é
+    ///   preservado como `.corrompido-<data>` em vez de ser sobrescrito, para o
+    ///   usuário poder recuperar o que tinha;
+    /// - **valor fora da faixa**: o padrão é usado e o ajuste é listado no aviso.
     pub fn load(paths: &Paths) -> (Self, Option<String>) {
         let file = paths.config_file();
-        match std::fs::read_to_string(&file) {
-            Ok(text) => match toml::from_str::<Config>(&text) {
-                Ok(cfg) => (cfg, None),
-                Err(err) => (
+        let texto = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Config::default(), None),
+            Err(e) => {
+                return (
                     Config::default(),
                     Some(format!(
-                        "configuração inválida em {}: {err}",
+                        "não foi possível ler a configuração em {}: {e}",
                         file.display()
                     )),
-                ),
-            },
-            Err(_) => (Config::default(), None),
+                );
+            }
+        };
+        let inteiro: Config = match toml::from_str::<Config>(&texto) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                // Preserva o original antes de qualquer reescrita.
+                let reserva = file.with_extension(format!(
+                    "corrompido-{}",
+                    crate::util::now_rfc3339().replace(':', "-")
+                ));
+                let _ = std::fs::rename(&file, &reserva);
+                return (
+                    Config::default(),
+                    Some(format!(
+                        "configuração inválida em {}: {err}.\n\
+                         O arquivo foi preservado como {}. \
+                         A configuração foi reiniciada no padrão.",
+                        file.display(),
+                        reserva.display()
+                    )),
+                );
+            }
+        };
+        let avisos = inteiro.validar();
+        if avisos.is_empty() {
+            (inteiro, None)
+        } else {
+            let lista = avisos.join("; ");
+            (inteiro, Some(format!("ajustes na configuração: {lista}")))
         }
+    }
+
+    /// Valores que, embaralhados à mão, fariam o agente falhar de forma
+    /// obscura. Nada aqui muda o comportamento: só avisa.
+    fn validar(&self) -> Vec<String> {
+        let mut avisos = Vec::new();
+        if self.provider.max_tokens == 0 {
+            avisos.push("provider.max_tokens = 0 (o modelo talvez não aceite)".into());
+        }
+        if self.provider.request_timeout_secs == 0 {
+            avisos.push("provider.request_timeout_secs = 0".into());
+        }
+        if !(0.0..=2.0).contains(&self.provider.temperature) {
+            avisos.push(format!(
+                "provider.temperature = {} está fora da faixa usual 0.0–2.0",
+                self.provider.temperature
+            ));
+        }
+        if self.provider.temperature.is_nan() {
+            avisos.push("provider.temperature não é um número válido".into());
+        }
+        if self.agent.max_iterations == 0 {
+            avisos.push("agent.max_iterations = 0 (o turno não faria nada)".into());
+        }
+        if self.agent.max_history_messages == 0 {
+            avisos.push("agent.max_history_messages = 0 (sem histórico)".into());
+        }
+        if !(0.0..=1.0).contains(&self.agent.context_compact_threshold) {
+            avisos.push(format!(
+                "agent.context_compact_threshold = {} deveria estar entre 0.0 e 1.0",
+                self.agent.context_compact_threshold
+            ));
+        }
+        if !matches!(self.web.engine.as_str(), "duckduckgo" | "searx") {
+            avisos.push(format!(
+                "web.engine = `{}` não é conhecido (usando DuckDuckGo)",
+                self.web.engine
+            ));
+        }
+        avisos
     }
 
     pub fn save(&self, paths: &Paths) -> anyhow::Result<()> {
@@ -383,6 +461,72 @@ impl Config {
             .and_then(|m| m.context_window)
             .unwrap_or(self.agent.default_context_window)
     }
+}
+
+/// Config corrompido: o original é preservado e o usuário é avisado, em vez de
+/// a configuração ser silenciosamente descartada.
+#[test]
+fn config_corrompido_preserva_o_original() {
+    let dir = std::env::temp_dir().join(format!("kestrel-cfg-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let arquivo = dir.join("config").join("config.toml");
+    std::fs::create_dir_all(arquivo.parent().unwrap()).unwrap();
+    std::fs::write(&arquivo, "isto = nao e toml valido [[[").unwrap();
+    let paths = Paths::with_root(&dir);
+    let (cfg, aviso) = Config::load(&paths);
+    assert!(aviso.is_some(), "deveria avisar do arquivo corrompido");
+    assert!(
+        aviso.unwrap().contains("preservado"),
+        "o aviso deveria mencionar a preservação"
+    );
+    // O original não é mais o config ativo.
+    assert!(
+        !arquivo.exists(),
+        "o arquivo corrompido deveria ter saído do lugar"
+    );
+    // E existe uma reserva.
+    let reservas: Vec<_> = std::fs::read_dir(dir.join("config"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains("corrompido"))
+        .collect();
+    assert_eq!(
+        reservas.len(),
+        1,
+        "deveria existir uma reserva: {reservas:?}"
+    );
+    let _ = cfg;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Config válido não gera aviso; valor fora da faixa gera aviso sem quebrar.
+#[test]
+fn config_invalida_valores_sem_descartar() {
+    let dir = std::env::temp_dir().join(format!("kestrel-cfg2-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let arquivo = dir.join("config").join("config.toml");
+    std::fs::create_dir_all(arquivo.parent().unwrap()).unwrap();
+    std::fs::write(&arquivo, "[agent]\nmax_iterations = 0\n").unwrap();
+    let paths = Paths::with_root(&dir);
+    let (_cfg, aviso) = Config::load(&paths);
+    let aviso = aviso.expect("max_iterations = 0 deveria gerar aviso");
+    assert!(aviso.contains("max_iterations"), "{aviso}");
+    // O arquivo continua no lugar (nada foi descartado).
+    assert!(arquivo.exists(), "a configuração válida deveria permanecer");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Arquivo ausente é a primeira execução: sem aviso.
+#[test]
+fn config_ausente_nao_gera_aviso() {
+    let dir = std::env::temp_dir().join(format!("kestrel-cfg3-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = Paths::with_root(&dir);
+    let (cfg, aviso) = Config::load(&paths);
+    assert!(aviso.is_none());
+    assert!(!cfg.setup_complete);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(test)]

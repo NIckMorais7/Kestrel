@@ -6,10 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const SCHEMA: &str = r#"
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
+pub const SCHEMA_BASE: &str = r#"
 CREATE TABLE IF NOT EXISTS sessions (
     id            TEXT PRIMARY KEY,
     project_path  TEXT NOT NULL,
@@ -190,7 +187,9 @@ impl Store {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("abrindo banco em {}", path.display()))?;
-        conn.execute_batch(SCHEMA).context("aplicando esquema")?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+            .context("aplicando pragmas do banco")?;
+        crate::migrar::aplicar(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -199,7 +198,7 @@ impl Store {
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
+        crate::migrar::aplicar(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -808,6 +807,59 @@ fn map_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         created_at: r.get(9)?,
         updated_at: r.get(10)?,
     })
+}
+
+/// Um banco antigo (versão 1, sem `objective`) precisa migrar sozinho, sem
+/// quebrar a abertura — antes o `map_session` falhava em runtime com
+/// `no such column`.
+#[test]
+fn migracao_de_banco_antigo_e_automatica() {
+    use rusqlite::Connection;
+    let dir = std::env::temp_dir().join(format!("kestrel-migra-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let caminho = dir.join("kestrel.db");
+    // Cria um banco "versão 1": o esquema base sem a coluna nova.
+    {
+        let conn = Connection::open(&caminho).unwrap();
+        conn.execute_batch(SCHEMA_BASE).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1").unwrap();
+        // Uma sessão gravada no formato antigo.
+        conn.execute(
+            "INSERT INTO sessions (id, project_path, title, model, permission, status, created_at, updated_at)              VALUES ('s1', '/tmp', 'antiga', 'm', 'semi', 'ativa', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+    }
+    // Abrir pelo Store aplica a migração.
+    let store = Store::open(&caminho).unwrap();
+    let linha = store.get_session("s1").unwrap().unwrap();
+    // A coluna nova existe e quem a lê funciona.
+    let _ = linha.objective;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Abrir um banco de versão futura falha com mensagem clara, em vez de
+/// silenciosamente rebaixar o esquema.
+#[test]
+fn banco_de_versao_futura_e_recusado() {
+    use rusqlite::Connection;
+    let dir = std::env::temp_dir().join(format!("kestrel-futuro-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let caminho = dir.join("kestrel.db");
+    {
+        let conn = Connection::open(&caminho).unwrap();
+        conn.execute_batch(SCHEMA_BASE).unwrap();
+        conn.execute_batch("PRAGMA user_version = 99").unwrap();
+    }
+    let erro = match Store::open(&caminho) {
+        Ok(_) => panic!("banco de versão futura deveria ser recusado"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        erro.contains("versão") || erro.contains("versao"),
+        "mensagem pouco clara: {erro}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(test)]
