@@ -1,0 +1,336 @@
+//! Orçamento de contexto e dossiê de continuidade.
+//!
+//! O estado do agente vive no banco de dados (planos, tarefas, alterações,
+//! ferramentas, decisões). O dossiê é montado a partir desses dados reais —
+//! não de um resumo gerado pelo modelo.
+
+use crate::db::Store;
+use crate::provider::{ChatMessage, ToolSpec};
+
+/// Orçamento de contexto para o modelo selecionado.
+#[derive(Clone, Copy, Debug)]
+pub struct OrcamentoContexto {
+    pub janela: u32,
+    pub reservados_resposta: u32,
+}
+
+impl OrcamentoContexto {
+    pub fn novo(janela: u32, reservados_resposta: u32) -> Self {
+        Self {
+            janela,
+            reservados_resposta: reservados_resposta.min(janela / 2),
+        }
+    }
+
+    /// Capacidade utilizável para o prompt (janela menos a reserva de resposta).
+    pub fn capacidade_utilizavel(&self) -> u32 {
+        self.janela.saturating_sub(self.reservados_resposta).max(1)
+    }
+
+    /// Fração já utilizada.
+    pub fn uso(&self, usados: u32) -> f32 {
+        usados as f32 / self.capacidade_utilizavel() as f32
+    }
+
+    /// Indica se é hora de compactar (limiar padrão: 90%).
+    pub fn precisa_compactar(&self, usados: u32, limiar: f32) -> bool {
+        self.uso(usados) >= limiar
+    }
+}
+
+/// Estima o total de tokens do prompt enviado ao modelo.
+pub fn estimar_prompt(sistema: &str, mensagens: &[ChatMessage], ferramentas: &[ToolSpec]) -> u32 {
+    let mut total = crate::util::estimate_tokens(sistema);
+    for m in mensagens {
+        total += crate::util::estimate_tokens(&m.content);
+        for tc in &m.tool_calls {
+            total += crate::util::estimate_tokens(&tc.name)
+                + crate::util::estimate_tokens(&tc.arguments)
+                + 8;
+        }
+        if m.tool_call_id.is_some() {
+            total += 4;
+        }
+    }
+    for f in ferramentas {
+        total += crate::util::estimate_tokens(&f.name)
+            + crate::util::estimate_tokens(&f.description)
+            + crate::util::estimate_tokens(&f.parameters.to_string())
+            + 8;
+    }
+    total
+}
+
+/// Dossiê estruturado de continuidade.
+#[derive(Clone, Debug, Default)]
+pub struct Dossie {
+    pub sessao_anterior: String,
+    pub objetivo: String,
+    pub instrucoes: Vec<String>,
+    pub decisoes: Vec<String>,
+    pub plano: Vec<String>,
+    pub arquivos: Vec<String>,
+    pub comandos: Vec<String>,
+    pub testes: Vec<String>,
+    pub erros: Vec<String>,
+    pub subtarefas_pendentes: Vec<String>,
+    pub subtarefas_concluidas: Vec<String>,
+    pub ponto_interrupcao: String,
+    pub proximas_acoes: String,
+}
+
+impl Dossie {
+    /// Texto enviado como contexto para a nova sessão.
+    pub fn para_texto(&self) -> String {
+        let mut s = String::new();
+        s.push_str("# Dossiê de continuidade\n\n");
+        s.push_str(&format!("Sessão anterior: {}\n", self.sessao_anterior));
+        s.push_str(&format!("Objetivo: {}\n\n", self.objetivo));
+        let secao = |titulo: &str, itens: &[String]| -> String {
+            if itens.is_empty() {
+                return String::new();
+            }
+            format!(
+                "## {titulo}\n{}\n\n",
+                itens
+                    .iter()
+                    .map(|i| format!("- {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        s.push_str(&secao("Instruções originais", &self.instrucoes));
+        s.push_str(&secao("Decisões tomadas", &self.decisoes));
+        s.push_str(&secao("Plano atual", &self.plano));
+        s.push_str(&secao("Arquivos modificados", &self.arquivos));
+        s.push_str(&secao("Comandos executados", &self.comandos));
+        s.push_str(&secao("Testes realizados", &self.testes));
+        s.push_str(&secao("Erros e tentativas de recuperação", &self.erros));
+        s.push_str(&secao("Subtarefas concluídas", &self.subtarefas_concluidas));
+        s.push_str(&secao("Subtarefas pendentes", &self.subtarefas_pendentes));
+        s.push_str(&format!(
+            "## Ponto de interrupção\n{}\n\n",
+            self.ponto_interrupcao
+        ));
+        s.push_str(&format!("## Próximas ações\n{}\n", self.proximas_acoes));
+        s
+    }
+
+    /// Resumo curto para a interface.
+    pub fn resumo(&self) -> String {
+        format!(
+            "{} arquivos alterados, {} comandos, {} subtarefas pendentes",
+            self.arquivos.len(),
+            self.comandos.len(),
+            self.subtarefas_pendentes.len()
+        )
+    }
+}
+
+/// Monta o dossiê a partir do estado persistido.
+pub fn construir_dossie(
+    store: &Store,
+    session_id: &str,
+    projeto_summary: &str,
+    ponto_interrupcao: &str,
+    proximas_acoes: &str,
+) -> anyhow::Result<Dossie> {
+    let mut d = Dossie {
+        sessao_anterior: session_id.to_string(),
+        ponto_interrupcao: ponto_interrupcao.to_string(),
+        proximas_acoes: proximas_acoes.to_string(),
+        ..Default::default()
+    };
+
+    if let Some(sessao) = store.get_session(session_id)? {
+        d.objetivo = sessao.objective.unwrap_or_else(|| sessao.title.clone());
+    }
+
+    // Instruções: mensagens do usuário.
+    for m in store.messages(session_id, 2000)? {
+        if m.role == "user" {
+            d.instrucoes
+                .push(crate::util::truncate(m.content.trim(), 400));
+        }
+    }
+
+    // Decisões.
+    for (_, resumo, _) in store.decisions(session_id, 50)? {
+        d.decisoes.push(resumo);
+    }
+
+    // Plano mais recente.
+    if let Some((objetivo, passos, _)) = store.latest_plan(session_id)? {
+        if d.objetivo.is_empty() {
+            d.objetivo = objetivo;
+        }
+        if let Ok(lista) = serde_json::from_str::<Vec<serde_json::Value>>(&passos) {
+            for p in lista {
+                let titulo = p.get("titulo").and_then(|t| t.as_str()).unwrap_or("");
+                let status = p
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("pendente");
+                d.plano.push(format!("{titulo} [{status}]"));
+            }
+        }
+    }
+
+    // Subtarefas.
+    for t in store.tasks(session_id)? {
+        let descricao = format!("{} [{}]", t.title, t.status);
+        if t.status == "concluido" {
+            d.subtarefas_concluidas.push(descricao);
+        } else {
+            d.subtarefas_pendentes.push(descricao);
+        }
+    }
+
+    // Arquivos alterados.
+    for (path, tipo, adicoes, remocoes) in store.file_changes(session_id)? {
+        d.arquivos
+            .push(format!("{path} ({tipo}, +{adicoes} -{remocoes})"));
+    }
+    d.arquivos
+        .dedup_by(|a, b| a.split_whitespace().next() == b.split_whitespace().next());
+
+    // Comandos e testes.
+    let recentes = store.recent_messages(session_id, 400)?;
+    for m in &recentes {
+        if m.role == "tool" {
+            let nome = m.tool_name.clone().unwrap_or_default();
+            let resumo = crate::util::truncate(m.content.lines().next().unwrap_or(""), 160);
+            if nome == "run_tests" {
+                d.testes.push(resumo);
+            } else if nome == "run_command" {
+                d.comandos.push(resumo);
+            }
+        }
+    }
+    d.comandos.truncate(20);
+    d.testes.truncate(20);
+
+    // Erros: mensagens de ferramenta que indicam falha.
+    for m in &recentes {
+        let texto = m.content.to_lowercase();
+        if m.role == "tool"
+            && (texto.contains("error")
+                || texto.contains("falh")
+                || texto.contains("bloqueado")
+                || texto.contains("negado"))
+        {
+            d.erros.push(crate::util::truncate(m.content.trim(), 200));
+        }
+    }
+    d.erros.truncate(10);
+
+    d.instrucoes.truncate(10);
+    if !projeto_summary.is_empty() {
+        d.decisoes.push(format!(
+            "Contexto do projeto: {}",
+            crate::util::truncate(projeto_summary, 400)
+        ));
+    }
+    Ok(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Store, TaskRow};
+
+    #[test]
+    fn orcamento_respeita_reserva() {
+        let o = OrcamentoContexto::novo(1000, 100);
+        assert_eq!(o.capacidade_utilizavel(), 900);
+        assert!(o.precisa_compactar(810, 0.9));
+        assert!(!o.precisa_compactar(800, 0.9));
+        assert!(o.uso(450) > 0.49 && o.uso(450) < 0.51);
+    }
+
+    #[test]
+    fn reserva_nao_pode_dominar_a_janela() {
+        let o = OrcamentoContexto::novo(1000, 900);
+        assert_eq!(o.capacidade_utilizavel(), 500);
+    }
+
+    #[test]
+    fn estimativa_cresce_com_mensagens() {
+        let sistema = "sistema";
+        let uma = vec![ChatMessage::user("mensagem curta")];
+        let muitas = vec![
+            ChatMessage::user("mensagem curta"),
+            ChatMessage::assistant("resposta"),
+        ];
+        let a = estimar_prompt(sistema, &uma, &[]);
+        let b = estimar_prompt(sistema, &muitas, &[]);
+        assert!(b > a);
+    }
+
+    #[test]
+    fn dossie_monta_estado_persistido() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_session("s1", "/p", "corrigir parser", "m", None, "semi", None)
+            .unwrap();
+        store
+            .append_message(
+                "s1",
+                "user",
+                "corrija o parser de expressões",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .save_plan("s1", "corrigir parser", r#"[{"titulo":"analisar","status":"concluido"},{"titulo":"testar","status":"pendente"}]"#)
+            .unwrap();
+        store
+            .record_file_change("s1", "src/parser.rs", "edicao", 5, 2, None)
+            .unwrap();
+        store
+            .upsert_task(&TaskRow {
+                id: "t1".into(),
+                session_id: "s1".into(),
+                parent_id: None,
+                title: "escrever teste".into(),
+                description: None,
+                status: "pendente".into(),
+                depends_on: vec![],
+                order_idx: 0,
+                result: None,
+            })
+            .unwrap();
+        store
+            .append_message(
+                "s1",
+                "tool",
+                "error[E0308]: mismatched types",
+                None,
+                Some("call_1"),
+                Some("run_command"),
+                None,
+            )
+            .unwrap();
+
+        let d = construir_dossie(
+            &store,
+            "s1",
+            "Rust",
+            "corrigindo o erro E0308",
+            "rodar cargo test",
+        )
+        .unwrap();
+        assert_eq!(d.objetivo, "corrigir parser");
+        assert!(d.instrucoes[0].contains("parser de expressões"));
+        assert_eq!(d.plano.len(), 2);
+        assert!(d.arquivos[0].contains("src/parser.rs"));
+        assert_eq!(d.subtarefas_pendentes.len(), 1);
+        assert!(!d.erros.is_empty());
+        let texto = d.para_texto();
+        assert!(texto.contains("## Ponto de interrupção"));
+        assert!(texto.contains("rodar cargo test"));
+    }
+}
