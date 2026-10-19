@@ -241,6 +241,10 @@ pub enum UiCommand {
     DefinirEsforco(Option<String>),
     /// Liga/desliga a exibição do raciocínio do modelo na conversa.
     DefinirRaciocinio(bool),
+    /// Define a skin visual ativa e mantém a cópia do agente sincronizada.
+    DefinirSkin(String),
+    /// Ativa (ou desativa, com `None`) uma personalidade.
+    DefinirComp(Option<String>),
     NovaSessao,
     RetomarSessao(String),
     /// Troca o diretório de trabalho, reanalisa o projeto e abre nova sessão.

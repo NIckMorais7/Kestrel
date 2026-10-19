@@ -7,6 +7,7 @@
 
 mod agent;
 mod app;
+mod comps;
 mod config;
 mod db;
 mod diff;
@@ -24,11 +25,13 @@ mod util;
 use crate::config::{Config, ModelEntry};
 use crate::db::Store;
 use crate::perm::PermissionLevel;
+use crate::ui::mascot::PipGrafico;
 use crate::util::Paths;
 use clap::Parser;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
+use ratatui_image::picker::{Picker, ProtocolType};
 use std::path::PathBuf;
 
 /// Kestrel — agente autônomo de codificação para o terminal.
@@ -75,7 +78,7 @@ fn main() -> anyhow::Result<()> {
 
     let (mut config, aviso_config) = Config::load(&paths);
     if let Some(aviso) = &aviso_config {
-        eprintln!("kestrel: aviso: {aviso}; usando a configuração padrão");
+        eprintln!("kestrel: aviso: {aviso}");
     }
 
     if let Some(valor) = &cli.permissao {
@@ -96,11 +99,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(modelo) = &cli.modelo {
-        // Escolha explícita do usuário: registra a entrada no catálogo local.
+        // Escolha explícita do usuário: registra a entrada no catálogo local
+        // como manual (senão, uma atualização do catálogo a sobrescreveria).
         config.provider.model = modelo.clone();
-        config.upsert_model(crate::provider::catalog::enrich(ModelEntry::new(
-            modelo.clone(),
-        )));
+        let mut entry = crate::provider::catalog::enrich(ModelEntry::new(modelo.clone()));
+        entry.source = crate::config::ModelSource::Manual;
+        config.upsert_model(entry);
         config.save(&paths)?;
     }
 
@@ -115,18 +119,15 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let store = Store::open(&paths.db_file())?;
+    // A skin é aplicada antes de qualquer desenho. `KESTREL_SKIN` permite
+    // forçar uma skin numa sessão sem alterar a configuração salva. Skins
+    // próprias vivem em `~/.config/kestrel/skins/<nome>.toml`.
+    let skin = std::env::var("KESTREL_SKIN")
+        .ok()
+        .unwrap_or_else(|| config.ui.skin.clone());
+    ui::theme::inicializar(&paths.skins_dir(), &skin);
 
-    // Sem diretório definido na configuração, retoma o último projeto
-    // registrado pela interface (troca de projeto com /projetos).
-    if config.agent.workdir.is_none()
-        && let Ok(Some(dir)) = store.kv_get("ultimo_projeto")
-    {
-        let dir = PathBuf::from(dir);
-        if dir.is_dir() {
-            config.agent.workdir = Some(std::fs::canonicalize(&dir).unwrap_or(dir));
-        }
-    }
+    let store = Store::open(&paths.db_file())?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -140,9 +141,26 @@ fn main() -> anyhow::Result<()> {
                  (TTY); redirecionamento de entrada/saída não é suportado."
             )
         })?;
+        // O Pip é uma imagem de verdade: consulta o terminal depois de entrar
+        // na tela alternativa e antes de começar a ler eventos. Se a consulta
+        // falhar, o próprio ratatui-image cai para halfblocks; não existe mais
+        // a textura 6×4 desenhada à mão.
+        let pip_grafico = if config.ui.show_mascot {
+            // A consulta ao terminal continua (ela acerta a métrica real da
+            // fonte), mas o Pip é desenhado em halfblocks: protocolos gráficos
+            // como Sixel/Kitty podem deixar “rastro”/duplicar o mascote ao
+            // redesenhar o mesmo quadro várias vezes. Halfblocks é célula, então
+            // cada animação limpa e substitui a anterior de forma confiável.
+            let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+            picker.set_protocol_type(ProtocolType::Halfblocks);
+            PipGrafico::novo(&picker).ok()
+        } else {
+            None
+        };
         // A interface trata rolagem do mouse e colagem de texto (bracketed paste).
         let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
-        let resultado = executar(&mut terminal, config, &paths, store, cli.setup).await;
+        let resultado =
+            executar(&mut terminal, config, &paths, store, cli.setup, pip_grafico).await;
         let _ = crossterm::execute!(
             std::io::stdout(),
             DisableBracketedPaste,
@@ -161,13 +179,14 @@ async fn executar(
     paths: &Paths,
     store: Store,
     forcar_setup: bool,
+    pip_grafico: Option<PipGrafico>,
 ) -> anyhow::Result<()> {
     let config = if !config.setup_complete || forcar_setup {
-        let pronto = ui::setup::executar(terminal, config).await?;
+        let pronto = ui::setup::executar(terminal, config, pip_grafico.clone()).await?;
         pronto.save(paths)?;
         pronto
     } else {
         config
     };
-    app::executar(terminal, config, paths.clone(), store).await
+    app::executar(terminal, config, paths.clone(), store, pip_grafico).await
 }

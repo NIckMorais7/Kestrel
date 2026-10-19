@@ -1,6 +1,7 @@
 //! Registro de ferramentas, validação de entradas, controle de permissões e
 //! concorrência sobre arquivos.
 
+pub mod comps;
 pub mod fs;
 pub mod git;
 pub mod plan;
@@ -52,7 +53,7 @@ impl ToolError {
 }
 
 /// Resultado estruturado de uma ferramenta.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ToolOutput {
     /// Texto devolvido ao modelo.
     pub conteudo: String,
@@ -62,6 +63,24 @@ pub struct ToolOutput {
     pub adicoes: usize,
     /// Linhas removidas.
     pub remocoes: usize,
+    /// A operação foi bem-sucedida do ponto de vista do comando?
+    ///
+    /// Um `run_command` que terminou com código ≠ 0 devolve `Ok(output)` (o
+    /// modelo precisa ver a saída e o erro), mas não é sucesso: sem esta flag o
+    /// agente contava a falha como sucesso e não acionava a recuperação.
+    pub sucesso: bool,
+}
+
+impl Default for ToolOutput {
+    fn default() -> Self {
+        Self {
+            conteudo: String::new(),
+            resumo: String::new(),
+            adicoes: 0,
+            remocoes: 0,
+            sucesso: true,
+        }
+    }
 }
 
 impl ToolOutput {
@@ -73,6 +92,7 @@ impl ToolOutput {
             resumo,
             adicoes: 0,
             remocoes: 0,
+            sucesso: true,
         }
     }
 
@@ -162,6 +182,9 @@ pub struct ToolContext {
     pub permitidos: Arc<Mutex<HashSet<String>>>,
     pub skills: Arc<SkillRegistry>,
     pub skills_dir: PathBuf,
+    /// Diretório de Comps (fora do projeto); só a ferramenta `create_comp`
+    /// escreve aqui.
+    pub comps_dir: PathBuf,
     pub projeto: Arc<ProjectInfo>,
     pub web: WebConfig,
     pub http: reqwest::Client,
@@ -185,6 +208,11 @@ impl ToolContext {
     }
 
     /// Solicita confirmação ao usuário e aguarda a resposta.
+    ///
+    /// A chave do "permitir sempre" inclui o detalhe (o comando, a URL, o
+    /// alvo): antes ela era só o título, então liberar uma vez `Confirmar
+    /// comando` liberava **qualquer** comando do mesmo tipo, e a decisão nem
+    /// era consultada nas próximas chamadas.
     pub async fn pedir_confirmacao(
         &self,
         titulo: impl Into<String>,
@@ -192,6 +220,15 @@ impl ToolContext {
     ) -> Result<bool, ToolError> {
         let titulo = titulo.into();
         let detalhe = detalhe.into();
+        let chave = format!("sempre:{titulo}:{detalhe}");
+        if self
+            .permitidos
+            .lock()
+            .expect("lock de permitidos")
+            .contains(&chave)
+        {
+            return Ok(true);
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         let pedido = ConfirmRequest {
             titulo: titulo.clone(),
@@ -209,7 +246,7 @@ impl ToolContext {
                 // "Permitir sempre" precisa ser lembrado: sem gravar a decisão,
                 // cada acesso fora do projeto perguntaria de novo.
                 Ok(Confirmacao::PermitirSempre) => {
-                    self.permitir_sempre(titulo);
+                    self.permitir_sempre(chave);
                     Ok(true)
                 }
                 Ok(Confirmacao::Negar) => Ok(false),
@@ -223,7 +260,7 @@ impl ToolContext {
         self.permitidos
             .lock()
             .expect("lock de permitidos")
-            .insert(format!("sempre:{chave}", chave = chave.into()));
+            .insert(chave.into());
     }
 }
 
@@ -310,6 +347,7 @@ impl ToolRegistry {
             // Skills e planejamento
             Arc::new(skills_tools::ListSkills),
             Arc::new(skills_tools::LoadSkill),
+            Arc::new(comps::CreateComp),
             Arc::new(plan::UpdatePlan),
             Arc::new(plan::TaskStatus),
             // Subagentes
@@ -442,7 +480,9 @@ impl ToolRegistry {
                     return Err(ToolError::Permissao(analise.reason));
                 }
                 Decision::Confirmar => {
-                    let chave = format!("substituivel:{nome}");
+                    // A chave inclui o alvo: "permitir sempre" para um download
+                    // não pode liberar todos os downloads da sessão.
+                    let chave = format!("substituivel:{nome}:{detalhe}");
                     let liberado = ctx.permitidos.lock().expect("lock").contains(&chave);
                     if !liberado {
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -497,21 +537,29 @@ impl ToolRegistry {
         // precisam ser encerrados — senão ficam órfãos, porque o future
         // descartado no estouro do timeout ninguém mais os mata.
         let processos_antes = ctx.processos.ids_ativas();
+        let encerrar_novos = || {
+            let novos: Vec<String> = ctx
+                .processos
+                .ids_ativas()
+                .into_iter()
+                .filter(|id| !processos_antes.contains(id))
+                .collect();
+            ctx.processos.encerrar_varios(&novos);
+        };
         let resultado = tokio::select! {
-            _ = ctx.cancel.cancelled() => Err(ToolError::Cancelado),
+            _ = ctx.cancel.cancelled() => {
+                // Cancelar também não pode deixar órfão o processo que a
+                // ferramenta acabou de criar (antes só o timeout matava).
+                encerrar_novos();
+                Err(ToolError::Cancelado)
+            }
             r = tokio::time::timeout(tool.timeout(), tool.executar(args.clone(), ctx)) => {
                 match r {
                     Ok(Ok(out)) => Ok(out),
                     Ok(Err(e)) => Err(e),
                     Err(_) => {
                         // Rede de segurança: mata só o que esta chamada criou.
-                        let novos: Vec<String> = ctx
-                            .processos
-                            .ids_ativas()
-                            .into_iter()
-                            .filter(|id| !processos_antes.contains(id))
-                            .collect();
-                        ctx.processos.encerrar_varios(&novos);
+                        encerrar_novos();
                         Err(ToolError::Mensagem(format!(
                             "a ferramenta `{nome}` excedeu o tempo limite de {}s",
                             tool.timeout().as_secs()
@@ -525,7 +573,13 @@ impl ToolRegistry {
             Ok(out) => (Ok(out.conteudo.clone()), None),
             Err(e) => (Err(()), Some(e.to_string())),
         };
-        let status = if registro.is_ok() { "sucesso" } else { "falha" };
+        // Sucesso do ponto de vista da ferramenta, não só "não deu Err": um
+        // comando com código de saída ≠ 0 devolve Ok com a saída da falha.
+        let sucesso = match &resultado {
+            Ok(out) => out.sucesso,
+            Err(_) => false,
+        };
+        let status = if sucesso { "sucesso" } else { "falha" };
         let recorte = match &registro {
             Ok(texto) => Some(crate::util::truncate(
                 &crate::util::redact_secrets(texto),
@@ -534,6 +588,9 @@ impl ToolRegistry {
             Err(_) => None,
         };
         let args_gravados = crate::util::redact_secrets(&args.to_string());
+        // O erro também pode ecoar o comando/entrada (e com ele um segredo):
+        // o banco nunca recebe o texto cru.
+        let erro_gravado = erro.as_deref().map(crate::util::redact_secrets);
         ctx.store
             .record_tool_run(
                 &ctx.session_id,
@@ -541,7 +598,7 @@ impl ToolRegistry {
                 &crate::util::truncate(&args_gravados, 4000),
                 recorte.as_deref(),
                 status,
-                erro.as_deref(),
+                erro_gravado.as_deref(),
                 duracao,
             )
             .ok();
@@ -549,52 +606,13 @@ impl ToolRegistry {
     }
 }
 
-/// Classificação de cada ferramenta quanto ao modo chat (somente leitura).
-///
-/// `None` indica que a ferramenta não foi classificada — o teste de completude
-/// em `registro_tem_classificacao_de_modo` impede que isso passe despercebido.
-fn somente_leitura(nome: &str) -> Option<bool> {
-    match nome {
-        // Leitura, análise e consulta: permitidas no modo chat.
-        "list_files"
-        | "read_file"
-        | "inspect_file_metadata"
-        | "search_code"
-        | "analyze_project"
-        | "list_processes"
-        | "process_status"
-        | "read_process_output"
-        | "git_status"
-        | "git_diff"
-        | "git_log"
-        | "web_search"
-        | "fetch_url"
-        | "list_skills"
-        | "load_skill"
-        | "task_status" => Some(true),
-        // Escrita, execução, orquestração e planejamento: só no modo agente.
-        "write_file"
-        | "create_file"
-        | "edit_file"
-        | "delete_file"
-        | "run_command"
-        | "run_tests"
-        | "kill_process"
-        | "write_process_stdin"
-        | "git_stage"
-        | "git_commit"
-        | "git_branch"
-        | "download_file"
-        | "browser_render"
-        | "update_plan"
-        | "spawn_subagent" => Some(false),
-        _ => None,
-    }
-}
-
 /// Ferramenta disponível no modo chat (somente leitura).
+///
+/// Derivado de [`crate::perm::tool_risk`]: manter uma segunda lista aqui era
+/// uma fonte de divergência (a classificação de chat e a de risco podiam
+/// discordar sobre a mesma ferramenta).
 pub fn permitida_no_chat(nome: &str) -> bool {
-    somente_leitura(nome).unwrap_or(false)
+    matches!(crate::perm::tool_risk(nome), crate::perm::ToolRisk::Leitura)
 }
 
 /// Validação estrutural mínima contra o esquema declarado pela ferramenta.
@@ -626,26 +644,85 @@ pub fn validar_args(spec: &ToolSpec, args: &Value) -> Result<(), ToolError> {
             let Some(esquema) = props.get(chave) else {
                 continue; // campos extras são permitidos, mas ignorados pela ferramenta
             };
-            let tipo = esquema
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("any");
-            let ok = match tipo {
-                "string" => valor.is_string(),
-                "integer" => valor.is_i64() || valor.is_u64(),
-                "number" => valor.is_number(),
-                "boolean" => valor.is_boolean(),
-                "array" => valor.is_array(),
-                "object" => valor.is_object(),
-                _ => true,
+            validar_valor(&spec.name, chave, esquema, valor)?;
+        }
+    }
+    Ok(())
+}
+
+/// Valida um valor contra um esquema, descendo em objetos e arrays.
+///
+/// Antes só o primeiro nível era checado: um `env` com `{"NOME": 1}` ou uma
+/// lista de objetos com campos errados passava e falhava dentro da ferramenta
+/// (ou pior, era ignorado em silêncio).
+fn validar_valor(
+    ferramenta: &str,
+    caminho: &str,
+    esquema: &Value,
+    valor: &Value,
+) -> Result<(), ToolError> {
+    let tipo = esquema
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("any");
+    let ok = match tipo {
+        "string" => valor.is_string(),
+        "integer" => valor.is_i64() || valor.is_u64(),
+        "number" => valor.is_number(),
+        "boolean" => valor.is_boolean(),
+        "array" => valor.is_array(),
+        "object" => valor.is_object(),
+        _ => true,
+    };
+    if !ok {
+        return Err(ToolError::Argumentos(format!(
+            "campo `{caminho}` de `{ferramenta}` deveria ser `{tipo}`"
+        )));
+    }
+    match tipo {
+        "object" => {
+            let Some(objeto) = valor.as_object() else {
+                return Ok(());
             };
-            if !ok {
-                return Err(ToolError::Argumentos(format!(
-                    "campo `{chave}` de `{}` deveria ser `{tipo}`",
-                    spec.name
-                )));
+            if let Some(obrigatorios) = esquema.get("required").and_then(|r| r.as_array()) {
+                for campo in obrigatorios.iter().filter_map(|c| c.as_str()) {
+                    if !objeto.contains_key(campo) {
+                        return Err(ToolError::Argumentos(format!(
+                            "campo obrigatório `{caminho}.{campo}` ausente em `{ferramenta}`"
+                        )));
+                    }
+                }
+            }
+            if let Some(props) = esquema.get("properties").and_then(|p| p.as_object()) {
+                for (chave, sub) in objeto {
+                    if let Some(esquema_sub) = props.get(chave) {
+                        validar_valor(ferramenta, &format!("{caminho}.{chave}"), esquema_sub, sub)?;
+                    }
+                }
+            }
+            // Mapas abertos (ex.: `env`) declaram o tipo dos valores em
+            // `additionalProperties`; sem isto um `{"NOME": 1}` passava.
+            if let Some(extra) = esquema
+                .get("additionalProperties")
+                .filter(|v| v.is_object())
+            {
+                let declarados = esquema.get("properties").and_then(|p| p.as_object());
+                for (chave, valor) in objeto {
+                    let conhecido = declarados.map(|p| p.contains_key(chave)).unwrap_or(false);
+                    if !conhecido {
+                        validar_valor(ferramenta, &format!("{caminho}.{chave}"), extra, valor)?;
+                    }
+                }
             }
         }
+        "array" => {
+            if let (Some(itens), Some(lista)) = (esquema.get("items"), valor.as_array()) {
+                for (i, item) in lista.iter().enumerate() {
+                    validar_valor(ferramenta, &format!("{caminho}[{i}]"), itens, item)?;
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -775,19 +852,21 @@ mod tests {
 
     #[test]
     fn registro_tem_classificacao_de_modo() {
-        // Toda ferramenta registrada precisa estar classificada para o modo
-        // chat; esquecer uma significaria bloqueio silencioso (ou liberação).
+        // A classificação de modo é derivada do risco: só leitura entra no
+        // chat; escrita, execução, planejamento e orquestração ficam fora.
         let reg = ToolRegistry::novo();
         for nome in reg.nomes() {
-            assert!(
-                somente_leitura(nome).is_some(),
-                "ferramenta sem classificação de modo: {nome}"
+            assert_eq!(
+                permitida_no_chat(nome),
+                crate::perm::tool_risk(nome) == crate::perm::ToolRisk::Leitura,
+                "classificação de modo divergente para {nome}"
             );
         }
         assert!(permitida_no_chat("read_file"));
         assert!(permitida_no_chat("search_code"));
         assert!(!permitida_no_chat("edit_file"));
         assert!(!permitida_no_chat("run_command"));
+        assert!(!permitida_no_chat("update_plan"));
         assert!(!permitida_no_chat("spawn_subagent"));
         assert!(!permitida_no_chat("ferramenta-inexistente"));
     }
@@ -997,6 +1076,7 @@ mod tests {
             permitidos: Arc::new(Mutex::new(HashSet::new())),
             skills: Arc::new(SkillRegistry::vazio()),
             skills_dir: dir.join("skills"),
+            comps_dir: dir.join("comps"),
             projeto: Arc::new(ProjectInfo::default()),
             web: WebConfig::default(),
             http: reqwest::Client::new(),
@@ -1046,6 +1126,41 @@ mod tests {
         assert!(erro.to_string().contains("obrigatório"));
         let erro = validar_args(&spec, &json!({"path": 1})).unwrap_err();
         assert!(erro.to_string().contains("string"));
+    }
+
+    /// A validação precisa descer em objetos e arrays: `env` com valor
+    /// numérico passava e estourava dentro da ferramenta.
+    #[test]
+    fn valida_args_aninhados() {
+        let spec = ToolSpec {
+            name: "x".into(),
+            description: "".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "itens": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"n": {"type": "integer"}},
+                            "required": ["n"]
+                        }
+                    }
+                }
+            }),
+        };
+        assert!(validar_args(&spec, &json!({"itens": [{"n": 1}]})).is_ok());
+        let erro = validar_args(&spec, &json!({"itens": [{"n": "x"}]})).unwrap_err();
+        assert!(erro.to_string().contains("itens[0].n"), "{erro}");
+        let erro = validar_args(&spec, &json!({"itens": [{}]})).unwrap_err();
+        assert!(erro.to_string().contains("itens[0].n"), "{erro}");
+        assert!(validar_args(&spec, &json!({"env": {"NOME": "valor"}})).is_ok());
+        let erro = validar_args(&spec, &json!({"env": {"NOME": 1}})).unwrap_err();
+        assert!(erro.to_string().contains("env.NOME"), "{erro}");
     }
 
     #[test]

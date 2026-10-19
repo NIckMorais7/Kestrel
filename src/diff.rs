@@ -128,6 +128,14 @@ pub fn stats(old: &str, new: &str) -> DiffStats {
     diff(old, new).stats
 }
 
+/// Marcador gravado no lugar do diff quando ele é grande demais para o
+/// `/undo` confiar no recorte.
+///
+/// Fica aqui (e não em `tools::fs`) porque o reverso precisa recusá-lo: um
+/// patch parcial escreveria o arquivo errado.
+pub const DIFF_TRUNCADO: &str =
+    "[diff truncado: grande demais para desfazer automaticamente com segurança]";
+
 /// Reaplica um diff no sentido inverso, devolvendo o texto anterior.
 ///
 /// O diff do Kestrel é linha a linha (`+` adicionada, `-` removida, ` `
@@ -140,6 +148,11 @@ pub fn stats(old: &str, new: &str) -> DiffStats {
 /// diff; por isso conferimos as linhas de contexto. Se não baterem, devolvemos
 /// `None` e o chamador avisa em vez de escrever porcaria.
 pub fn reverter(diff_texto: &str, atual: &str) -> Option<String> {
+    // Diff truncado não descreve a alteração completa: reverter com ele
+    // escreveria um arquivo parcial. Recusa explícita, nunca patch silencioso.
+    if diff_texto.contains(DIFF_TRUNCADO) {
+        return None;
+    }
     let atuais: Vec<&str> = if atual.is_empty() {
         Vec::new()
     } else {
@@ -198,6 +211,13 @@ fn reverter_devolve_o_texto_anterior() {
     assert_eq!(d.stats.deletions, 1);
     let recuperado = reverter(&d.text, depois).expect("deveria reverter");
     assert_eq!(recuperado, antes);
+}
+
+/// Diff truncado nunca é aplicado: o patch parcial corromperia o arquivo.
+#[test]
+fn reverter_recusa_diff_truncado() {
+    assert!(reverter(DIFF_TRUNCADO, "qualquer\n").is_none());
+    assert!(reverter(&format!("{DIFF_TRUNCADO}\n+linha"), "x\n").is_none());
 }
 
 /// Reverter é reversível: ida e volta dão no mesmo lugar.

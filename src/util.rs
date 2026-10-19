@@ -62,6 +62,16 @@ impl Paths {
         self.config_dir.join("skills")
     }
 
+    /// Personalidades (Comps) criadas pelo usuário.
+    pub fn comps_dir(&self) -> PathBuf {
+        self.config_dir.join("comps")
+    }
+
+    /// Skins personalizadas (`<nome>.toml`); as prontas vivem no código.
+    pub fn skins_dir(&self) -> PathBuf {
+        self.config_dir.join("skins")
+    }
+
     pub fn db_file(&self) -> PathBuf {
         self.data_dir.join("kestrel.db")
     }
@@ -81,6 +91,8 @@ impl Paths {
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;
         std::fs::create_dir_all(self.skills_dir())?;
+        std::fs::create_dir_all(self.comps_dir())?;
+        std::fs::create_dir_all(self.skins_dir())?;
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(self.logs_dir())?;
         std::fs::create_dir_all(self.sessions_dir())?;
@@ -111,23 +123,47 @@ pub fn format_timestamp(ts: &str) -> String {
 }
 
 /// Procura um binário no PATH (ou um caminho absoluto/relativo direto).
+///
+/// O arquivo precisa ser executável: só `is_file()` aceitava qualquer binário
+/// do PATH que por acaso fosse só leitura.
 pub fn which(bin: &str) -> Option<PathBuf> {
+    fn executavel(p: &Path) -> bool {
+        if !p.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            p.metadata()
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
     if bin.contains('/') {
         let p = PathBuf::from(bin);
-        return p.is_file().then_some(p);
+        return executavel(&p).then_some(p);
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(bin))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| executavel(candidate))
 }
 
-/// Trunca um texto em `max` caracteres, acrescentando reticências.
+/// Trunca um texto em `max` caracteres **no total**, reticências incluídas.
 pub fn truncate(text: &str, max: usize) -> String {
-    let mut out: String = text.chars().take(max).collect();
-    if text.chars().count() > max {
-        out.push('…');
+    if max == 0 {
+        return String::new();
     }
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
     out
 }
 
@@ -137,10 +173,24 @@ pub fn largura_texto(texto: &str) -> usize {
 }
 
 /// Remove sequências de escape ANSI de um texto.
+///
+/// Cobre CSI (`\x1b[…m`), OSC (`\x1b]…\x07`, inclui OSC 52 de clipboard),
+/// DCS (`\x1bP…\x1b\\`), escapes de dois bytes, seleção de charset e a
+/// variante de 8 bits do CSI (`\x9b`). Antes só CSI era removido e um título
+/// OSC continuava injetando texto/escape no terminal.
 pub fn strip_ansi(input: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        RE.get_or_init(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("regex ANSI válida"));
+    let re = RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)",
+            r"|\x1bP[^\x1b]*(?:\x1b\\|\x07)",
+            r"|\x1b\[[0-9;?]*[ -/]*[@-~]",
+            r"|\x1b[()][0-9A-Za-z]",
+            r"|\x1b[@-Z\\-_]",
+            r"|\x9b[0-9;?]*[ -/]*[@-~]",
+        ))
+        .expect("regex ANSI válida")
+    });
     re.replace_all(input, "").to_string()
 }
 
@@ -362,8 +412,24 @@ mod tests {
 
     #[test]
     fn trunca_com_reticencias() {
-        assert_eq!(truncate("abcdef", 3), "abc…");
+        assert_eq!(truncate("abcdef", 3), "ab…");
         assert_eq!(truncate("ab", 5), "ab");
+        assert_eq!(truncate("", 0), "");
+        // O total nunca passa de `max`.
+        for max in [1, 2, 5] {
+            assert!(truncate("abcdefghij", max).chars().count() <= max);
+        }
+    }
+
+    #[test]
+    fn remove_escapes_ansi_variados() {
+        assert_eq!(strip_ansi("\x1b[31mvermelho\x1b[0m"), "vermelho");
+        // OSC de título e OSC 52 (clipboard), terminados por BEL ou ST.
+        assert_eq!(strip_ansi("\x1b]0;titulo\x07texto"), "texto");
+        assert_eq!(strip_ansi("\x1b]52;c;cGF5bG9hZA==\x1b\\fim"), "fim");
+        // DCS e CSI de 8 bits também somem.
+        assert_eq!(strip_ansi("\x1bPq#0;2;0;0;0\x1b\\ok"), "ok");
+        assert_eq!(strip_ansi("\u{9b}31mcor\u{9b}0m"), "cor");
     }
 
     #[test]

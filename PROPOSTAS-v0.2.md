@@ -1,35 +1,36 @@
 # Propostas para a próxima versão do Kestrel
 
-Documento de planejamento — **nada aqui foi implementado**. Cada item foi
-verificado contra o código atual (inventário em anexo no final) e traz o motivo
-pelo qual importa. Estimativas em dias de trabalho focado.
+Documento de planejamento — o status foi revisado depois da rodada de
+correções: itens marcados **✅** já estão implementados; os demais continuam
+abertos. Cada item foi verificado contra o código e traz o motivo pelo qual
+importa. Estimativas em dias de trabalho focado.
 
 Prioridade: **P0** = próximo release · **P1** = release seguinte · **P2** = quando
 houver folga.
 
 ---
 
-## A. Dívida conhecida (achados das auditorias, ainda abertos)
+## A. Dívida conhecida (achados das auditorias; status revisado)
 
 Corrigir antes de somar recursos novos: sobre fundação frágil, toda feature nova
 herda o defeito.
 
 | # | Item | Onde | Impacto | Esforço |
 |---|------|------|---------|---------|
-| A1 | `break 'turno` descarta resultados de ferramentas já executadas, deixando `tool_calls` sem resposta no histórico enviado à API | `agent/mod.rs` | Alto — o modelo recebe histórico inválido e pode travar em loop | 0,5d |
-| A2 | Timeout da ferramenta não mata o processo filho (`kill_on_drop(false)`): processo órfão continua rodando | `tools/mod.rs` / `shell.rs` | Alto — `cargo test`/servidor sobrevive ao corte | 0,5d |
-| A3 | Escopo é puramente léxico: symlink dentro do projeto apontando para fora escapa da checagem | `tools/mod.rs` | Alto — furo de segurança direto | 0,5d |
-| A4 | `Config::load` descarta a configuração inteira em qualquer erro de parse e não valida faixas (`temperature`, `max_tokens`, limiares) | `config.rs` | Alto — o usuário perde a config sem entender por quê | 1d |
-| A5 | Banco sem migração de schema (`CREATE TABLE IF NOT EXISTS` sem `user_version`); `save_plan` incrementa versão sem atomicidade | `db.rs` | Alto — base antiga quebra em runtime | 1d |
-| A6 | Escrita atômica perde o modo do arquivo: editar script 0755 remove o bit de execução | `tools/fs.rs` | Médio — silencioso e irritante | 0,25d |
-| A7 | `ler_texto` lê arquivo inteiro sem teto; `localizar_bloco` conta `{}` dentro de strings | `tools/fs.rs` | Médio — estouro de memória e corte no lugar errado | 0,5d |
-| A8 | `browser_render` sem validação de esquema (`file://` legível) e com `--no-sandbox`; `fetch_url` sem proteção SSRF | `tools/web.rs` | Alto — leitura de arquivos locais e acesso à rede interna | 0,5d |
-| A9 | `Interromper` durante confirmação não faz nada; colar texto com modal aberto é descartado em silêncio | `app.rs` | Baixo/Médio | 0,25d |
-| A10 | Histórico multilinha corrompido no disco (entrada com `\n` vira N entradas) | `app.rs` | Baixo | 0,25d |
-| A11 | **Permissão: rodar código do projeto pedia confirmação** (corrigido) | `node script.js`, `python app.py`, `bun test` caiam no passo "comando desconhecido" e pediam confirmação até no nível Full — e `Modificacao` mantinha o `Confirmar` original em todos os níveis. Runtimes entram na lista de build; `Modificacao`/`Build` passam a ser rotina em `semi`/`full` (destrutivo continua confirmando) | P0 | corrigido |
-| A12 | Clarear o indicador: `strip_ansi` não remove sequências OSC (saída de ferramenta com hyperlink vaza escape) | `util.rs` | Baixo | 0,25d |
+| A1 | ✅ `break 'turno` descarta resultados de ferramentas já executadas, deixando `tool_calls` sem resposta no histórico enviado à API | `agent/mod.rs` | Alto — o modelo recebe histórico inválido e pode travar em loop | 0,5d |
+| A2 | ✅ Timeout da ferramenta não mata o processo filho (`kill_on_drop(false)`): processo órfão continua rodando | `tools/mod.rs` / `shell.rs` | Alto — `cargo test`/servidor sobrevive ao corte | 0,5d |
+| A3 | ✅ Escopo é puramente léxico: symlink dentro do projeto apontando para fora escapa da checagem | `tools/mod.rs` | Alto — furo de segurança direto | 0,5d |
+| A4 | ✅ `Config::load` descarta a configuração inteira em qualquer erro de parse e não valida faixas (`temperature`, `max_tokens`, limiares) | `config.rs` | Alto — o usuário perde a config sem entender por quê | 1d |
+| A5 | ✅ Banco sem migração de schema (`CREATE TABLE IF NOT EXISTS` sem `user_version`); `save_plan` incrementa versão sem atomicidade | `db.rs` | Alto — base antiga quebra em runtime | 1d |
+| A6 | ✅ Escrita atômica perde o modo do arquivo: editar script 0755 remove o bit de execução | `tools/fs.rs` | Médio — silencioso e irritante | 0,25d |
+| A7 | ✅ `ler_texto` lê arquivo inteiro sem teto; `localizar_bloco` conta `{}` dentro de strings | `tools/fs.rs` | Médio — estouro de memória e corte no lugar errado | 0,5d |
+| A8 | ✅ `browser_render` sem validação de esquema (`file://` legível) e com `--no-sandbox`; `fetch_url` sem proteção SSRF | `tools/web.rs` | Alto — leitura de arquivos locais e acesso à rede interna | 0,5d |
+| A9 | ⌛ `Interromper` durante confirmação não fazia nada; colar texto com modal aberto era descartado em silêncio (Ctrl+C no modal e colar em seletores já corrigidos; colar em confirmação/texto não tem campo e é ignorado) | `app.rs` | Baixo/Médio | 0,25d |
+| A10 | ✅ Histórico multilinha corrompido no disco (entrada com `\n` vira N entradas) | `app.rs` | Baixo | 0,25d |
+| A11 | ✅ **Permissão: rodar código do projeto pedia confirmação** | `perm.rs` | `node script.js`, `python app.py`, `bun test` caíam no passo "comando desconhecido" e pediam confirmação até no nível Full; runtimes entraram na lista de build e `Modificacao`/`Build` passaram a ser rotina em `semi`/`full` | corrigido |
+| A12 | ✅ Clarear o indicador: `strip_ansi` não remove sequências OSC (saída de ferramenta com hyperlink vaza escape) | `util.rs` | Baixo | 0,25d |
 
-**Subtotal A: ~5,5 dias (A11 corrigido, ver commit).**
+**Subtotal A: ~5,5 dias — A1–A8, A10–A12 implementados; A9 parcial.**
 
 ---
 
@@ -37,11 +38,11 @@ herda o defeito.
 
 | # | Proposta | Motivo (evidência) | Prio | Esforço |
 |---|----------|--------------------|------|---------|
-| B1 | **Testes de streaming SSE de verdade** (servidor httptest local, casos: `[DONE]` no meio, conexão cortada, chunk dividido, tool_call fragmentada, erro no meio do stream) | `chat_com_stream` é o caminho mais crítico do produto e **não tem nennhum teste**; dois bugs sérios já saíram de lá (`[DONE]` não encerrava o laço; `index` sem limite) | P0 | 1,5d |
-| B2 | **Contabilidade de tokens/custo por sessão** (`/custo`): persistir `usage` de cada resposta e somar por sessão/turno | `parse_usage` existe e o resultado é **descartado** — nennhum campo de banco guarda tokens; o usuário não sabe quanto já gastou | P0 | 1d |
+| B1 | ✅ **Testes de streaming SSE de verdade** (servidor local, casos: `[DONE]`, conexão cortada, chunk dividido, tool_call fragmentada, erro no meio do stream) | `chat_com_stream` é o caminho mais crítico do produto e não tinha nenhum teste; dois bugs sérios já saíram de lá (`[DONE]` não encerrava o laço; `index` sem limite) | P0 | 1,5d |
+| B2 | ✅ **Contabilidade de tokens/custo por sessão** (`/cost`): persistir `usage` de cada resposta e somar por sessão/turno | `parse_usage` existia e o resultado era descartado; hoje a tabela `usage` guarda cada resposta e `/cost` mostra o total | P0 | 1d |
 | B3 | **Circuit breaker e fallback de modelos**: após N falhas transitárias do modelo ativo, oferecer/trocar automaticamente para o próximo da lista | Hoje `max_retries` repete o mesmo modelo; com 503 de capacidade (que já aconteceu na NVIDIA) o turno simplesmente falha | P1 | 1,5d |
 | B4 | **Retomada de sessão offline**: exportar/importar sessão em JSON ou Markdown (`/exportar`, `/importar`) | Sessões vivem só no SQLite local; não há como levar uma conversa para outra máquina ou anexá-la a um issue | P1 | 1,5d |
-| B5 | **Telemetria opcional e local**: registro de erros e tempos de turno em arquivo próprio, com `/diagnostico` para anexar em bug report | Não há nennhum registro de falhas fora do `eprintln!`; diagnosticar um problema do usuário é adivinhação | P2 | 1d |
+| B5 | **Telemetria opcional e local**: registro de erros e tempos de turno em arquivo próprio, com `/diagnostico` para anexar em bug report | Não há nenhum registro de falhas fora do `eprintln!`; diagnosticar um problema do usuário é adivinhação | P2 | 1d |
 | B6 | **Logs de depuração por nível** (`KESTREL_LOG=trace`) com `tracing` em vez de `eprintln!` | Hoje o único diagnóstico é impressão solta em stderr, sem nível nem destino configurável | P1 | 1d |
 
 **Subtotal B: ~6,5 dias.**
@@ -52,9 +53,9 @@ herda o defeito.
 
 | # | Proposta | Motivo (evidência) | Prio | Esforço |
 |---|----------|--------------------|------|---------|
-| C1 | **Enxergar imagens**: `ChatMessage` passa a aceitar partes de imagem; `read_file` (ou `inspect_image`) devolve PNG/JPG em base64; respeitar `supports_vision` do catálogo | Mensagens são **só texto** (`content: String`) e nennhuma ferramenta lê imagem — enquanto a NVIDIA tem modelos de visão confirmados (`nemotron-3.5-super-vl`, `llama-3.2-*-vision`). Sem isso o agente é cego para prints, diagramas e erros de layout | P1 | 3d |
+| C1 | **Enxergar imagens**: `ChatMessage` passa a aceitar partes de imagem; `read_file` (ou `inspect_image`) devolve PNG/JPG em base64; respeitar `supports_vision` do catálogo | Mensagens são **só texto** (`content: String`) e nenhuma ferramenta lê imagem — enquanto a NVIDIA tem modelos de visão confirmados (`nemotron-3.5-super-vl`, `llama-3.2-*-vision`). Sem isso o agente é cego para prints, diagramas e erros de layout | P1 | 3d |
 | C2 | **Edição multi-arquivo atômica**: ferramenta `apply_edits` que aplica N edições e reverte tudo se qualquer uma falhar | `edit_file` é um arquivo por chamada; uma refatoração em 6 arquivos fica inconsistente no meio se a 4ª falhar | P1 | 2d |
-| C3 | **Desfazer/reverter** (`/desfazer N`, `git restore` como ferramenta): snapshots antes de cada edição + diff reverso | `file_changes` guarda o diff mas **não existe nennhum caminho de desfazer** no código; o usuário precisa recorrer ao git manualmente | P0 | 2d |
+| C3 | ✅ **Desfazer/reverter** (`/undo`, diff reverso guardado por edição) | `file_changes` guarda o diff e `/undo` o aplica ao contrário; diffs grandes demais são recusados com segurança em vez de aplicar patch parcial | P0 | 2d |
 | C4 | **Modo patch** (`apply_patch` no estilo OpenAI/Codex): formato compacto e confiável para大中型 edições | `edit_file` tem três modos ad-hoc (`trecho`/`linhas`/`bloco`) e o `bloco` já erra por contar `{}` dentro de strings; o formato patch é padrão de mercado e testado | P2 | 3d |
 | C5 | **Ferramentas de qualidade**: `lint`, `format`, `typecheck` que detectam o que existe no projeto e devolvem diagnóstico estruturado | Hoje só `run_command`/`run_tests`; o agente precisa adivinhar o comando e depois parsear texto solto | P2 | 2d |
 | C6 | **MCP (Model Context Protocol)**: cliente MCP para ferramentas externas, com allowlist por servidor | Extensibilidade hoje é só ferramenta compilada + skill em Markdown; MCP é o padrão do ecossistema e multiplica o valor sem inflar o binário | P2 | 5d |
@@ -69,15 +70,15 @@ herda o defeito.
 
 | # | Proposta | Motivo (evidência) | Prio | Esforço |
 |---|----------|--------------------|------|---------|
-| D1 | **Revisor de mudanças na sessão** (`/diff`): lista das edições do turno/sessão com diff real e navegação | O agente edita arquivos e o usuário só vê o resumo numérico ("+12 -3"); não há como revisar o que foi feito sem sair do Kestrel | P0 | 2d |
+| D1 | ✅ **Revisor de mudanças na sessão** (`/diff`): lista das edições do turno/sessão com diff real e navegação | O agente edita arquivos e o usuário via só o resumo numérico ("+12 -3"); agora `/diff` mostra o diff de cada alteração | P0 | 2d |
 | D2 | **Seleção e cópia**: seleção por mouse + `Ctrl+Shift+C`, e `/copiar` para o último bloco | Não há absolutamente nada de clipboard ou seleção no código; copiar uma saída hoje depende do terminal | P1 | 1,5d |
 | D3 | **Inspeção de contexto** (`/contexto`): tokens por seção (sistema, projeto, skills, plano, histórico) e o que será enviado | A compactação é automática e opaca; quando o agente "esquece" algo, o usuário não tem como ver por quê | P1 | 1,5d |
 | D4 | **Editor de plano na interface**: editar passos/subtarefas sem falar com o modelo | `update_plan` é ferramenta do modelo; o usuário não pode ajustar o plano sem reenviar uma instrução | P2 | 2d |
 | D5 | **Atalhos configuráveis** (`keybindings` no config.toml) | Todas as teclas estão fixas no código (`F2` = thinking, `Shift+Tab` = permissão, …) | P2 | 1d |
 | D6 | **Modo watch**: observar arquivos e re-rodar build/teste a cada salvamento | Nenhum watcher de arquivos existe; o laço de build→corrigir é sempre manual | P2 | 2d |
 | D7 | **Acessibilidade**: tema de alto contraste, respeito a `NO_COLOR`/`TERM=dumb`, e modo "sem mascote" já existe — revisar contraste de todos os pares de cor | O fundo foi clareado agora (24,27,34) e os contrastes não foram medidos; não há alternativa para daltonismo | P2 | 1,5d |
-| D8 | **`/person` — Comps (personalidades)**: criar, editar, alternar e remover comportamentos do agente, cada um com seu bloco de instruções no prompt; um Comp ativo por sessão, gravado em `comps/<nome>.toml` | Hoje a personalidade é fixa em `prompt.rs`: não há como trocar o estilo (amigável, técnico, conciso, mentor) sem editar código e recompilar — e o usuário quer **criar** personalidades pelo próprio Kestrel | P1 | 2,5d |
-| D9 | **Reformulação visual** (anexo B): paleta monocromática + 1 acento, 3 faixas de layout, glifos consistentes, 3 skins prontos e `/skin` | A interface atual mistura 3 famílias de cor, põe borda em tudo e empilha metadados sem hierarquia — o usuário a considera feia; o design foi pesquisado contra Hermes, Claude Code e o sistema de design da Anthropic | P1 | 8d |
+| D8 | ✅ **`/person` — Comps (personalidades)**: criar, editar, alternar e remover comportamentos do agente, cada um com seu bloco de instruções no prompt; um Comp ativo por sessão, gravado em `comps/<nome>.toml` | Hoje a personalidade é fixa em `prompt.rs`: não há como trocar o estilo (amigável, técnico, conciso, mentor) sem editar código e recompilar — e o usuário quer **criar** personalidades pelo próprio Kestrel | P1 | 2,5d |
+| D9 | ✅ **Reformulação visual** (anexo B): paleta monocromática + 1 acento, 3 faixas de layout, glifos consistentes, 3 skins prontas e `/skin` | A interface atual mistura 3 famílias de cor, põe borda em tudo e empilha metadados sem hierarquia — o usuário a considera feia; o design foi pesquisado contra Hermes, Claude Code e o sistema de design da Anthropic | P1 | 8d |
 
 **Subtotal D: ~22 dias.**
 
@@ -104,11 +105,17 @@ A1–A5 (dívida crítica), B1 (testes de streaming), B2 (custo), C3 (desfazer),
 D1 (`/diff`). Resultado: o agente para de falhar de formas silenciosas e o
 usuário passa a ver o que ele fez e o quanto custou.
 
-**v0.2.5 — "agradável"** (~10,5 dias) — *a pedido do usuário*
-D8 (`/person`) e D9 (reformulação visual + skins), que compartilham a mesma
-origem (`theme.rs` ganha as chaves de cor; o prompt ganha o bloco do Comp).
-Resultado: a interface deixa de parecer um debug tool e o agente passa a ter
-personalidades escolhíveis.
+**v0.2.5 — "agradável"** (~10,5 dias) — *a pedido do usuário* e **implementado
+já na v0.2.0**: D8 (`/person`) e D9 (reformulação visual + skins), que
+compartilham a mesma origem (`theme.rs` ganha as chaves de cor; o prompt ganha
+o bloco do Comp). Resultado: a interface deixa de parecer um debug tool e o
+agente passa a ter personalidades escolhíveis.
+
+**v0.4.0 — "acabamento"** — *implementado*: resumo de turno discreto (só
+duração, tokens/s, modelo e modo), rodapé sem skills/“enter envia”, skin `mono`
+(preto/branco) como padrão, Pip sempre em halfblocks e mais baixo, pipeline com
+recuperação até 15 tentativas, animações curtas em glifos e recomendação de
+fonte **Geist Mono**.
 
 **v0.3.0 — "capaz"** (~20 dias)
 A6–A11, C1 (imagens), C2 (edições atômicas), C7 (memória de projeto), D2 (copiar),
@@ -152,7 +159,7 @@ Bloco novo, **depois** das Regras de trabalho e **antes** de Ambiente:
 ```
 
 A ordem não é estética: o bloco de Regras termina com uma linha dizendo que
-instruções de nennhum Comp substituem as regras de segurança (permissão, modo,
+instruções de nenhum Comp substituem as regras de segurança (permissão, modo,
 nunca inventar resultados, nunca pedir segredos). Sem isso, um Comp colado da
 internet poderia, em tese, instruir o agente a ignorar o nível de permissão.
 
@@ -177,7 +184,7 @@ afirmar, e diga qual fonte usou.
 |---|---|---|
 | O que um Comp controla | **só comportamento** — nada de config | Nenhum campo de modelo, esforço ou permissão no arquivo; um Comp nunca mexe em configuração |
 | Como criar | **dois caminhos**: `/person new <nome>` (editor dentro do Kestrel) **e** por pedido em linguagem natural, com o agente criando | Exige ferramenta dedicada e validada, não `write_file` genérico |
-| Presets de fábrica | **começar vazio** | A lista nasce vazia; `/person` sem Comps mostra "nennhum Comp criado" |
+| Presets de fábrica | **começar vazio** | A lista nasce vazia; `/person` sem Comps mostra "nenhum Comp criado" |
 | Implementação | **só design agora** | Nada de código nesta sessão |
 
 ### Criação pelo agente: ferramenta dedicada, não `write_file`
@@ -190,7 +197,7 @@ caminho de escrita é uma ferramenta própria, com validação:
   confirmação);
 - `descricao` até 120 caracteres; `instrucoes` até 4000 (o teto também protege
   o orçamento de contexto);
-- grava exclusivamente em `comps/<slug>.toml`, em nennhum outro lugar;
+- grava exclusivamente em `comps/<slug>.toml`, em nenhum outro lugar;
 - **remover** Comp fica só na interface (`/person remove`) — o agente não remove
   personalidades, para não perder uma por engano;
 - a confirmação reutiliza o canal existente (`PedirConfirmacao`), então o texto
@@ -222,12 +229,17 @@ o tamanho, e um Comp gigante e vago é o pior dos dois mundos: caro e ineficaz.
 1. **Três famílias de cor competindo** — azul (`#96b4e6` rótulos, `#78b4ff` borda ativa), âmbar (`#ffc46e` títulos) e cinzas frios. Nenhuma conversa com as outras. O guia é claro: 4–5 cores, no máximo.
 2. **Borda em tudo** — conversa, campo de mensagem, modais, seletor, todos com caixa arredondada. O guia: borda agrupa; espaço vazio separa. Com borda em tudo, nada se destaca.
 3. **A linha de status é uma gaveta** — estado + "Ctrl+C interrompe" + "enter envia · /help" + "skills 0" + Pip, tudo numa linha, sem hierarquia entre eles.
-4. **Densidade plana, sem escala de espaço** — nennhum padding interno consistente; leitura cansativa justamente pelo que o usuário notou ("alto contraste").
-5. **Um único visual, nennhum tema** — as cores estão fixas em `theme.rs`; não existe tema claro, nem alternativa minimal.
+4. **Densidade plana, sem escala de espaço** — nenhum padding interno consistente; leitura cansativa justamente pelo que o usuário notou ("alto contraste").
+5. **Um único visual, nenhum tema** — as cores estão fixas em `theme.rs`; não existe tema claro, nem alternativa minimal.
 
 ### Proposta: 3 camadas
 
 #### 1. Paleta: preto + ciano contido (direção escolhida pelo usuário)
+
+> **Atualização da v0.4.0:** na implementação final a skin padrão passou a ser
+> `mono` — **preto/branco**, no estilo Claude Code. A antiga `kestrel` virou a
+> skin cinza, e a antiga `mono` (cinza) virou `kestrel`. `daylight` segue como
+> tema claro; o ciano só sobrevive em skin própria.
 
 Minimalismo, fundo **quase preto** (não preto puro, para não cansar) e **ciano
 que não grita**: o acento aparece só onde há intenção — glifo do prompt, borda
@@ -275,8 +287,8 @@ Três prontos, na direção escolhida:
 
 | skin | caráter |
 |---|---|
-| `kestrel` | preto + ciano contido (padrão) |
-| `mono` | só cinzas — para gravar tela ou terminal mínimo |
+| `mono` | preto/branco — padrão na v0.4.0 |
+| `kestrel` | cinza escuro — para gravar tela ou terminal mínimo |
 | `daylight` | claro, para terminal claro |
 
 Separado de `/person`, exatamente como o Hermes separa **skin** de **personality**:
@@ -306,28 +318,32 @@ Roda **junto** com o `/person` (2,5d) na v0.2.0: os dois compartilham a mesma or
 
 ## Anexo — inventário verificado (base das propostas)
 
-**31 ferramentas:** `list_files`, `read_file`, `inspect_file_metadata`,
+**32 ferramentas:** `list_files`, `read_file`, `inspect_file_metadata`,
 `write_file`, `create_file`, `edit_file` (modos `trecho`/`linhas`/`bloco`),
 `delete_file`, `search_code`, `analyze_project`, `run_command`, `run_tests`,
 `list_processes`, `process_status`, `read_process_output`, `kill_process`,
 `write_process_stdin`, `git_status`, `git_diff`, `git_log`, `git_stage`,
 `git_commit`, `git_branch`, `web_search`, `fetch_url`, `download_file`,
 `browser_render`, `list_skills`, `load_skill`, `update_plan`, `task_status`,
-`spawn_subagent`.
+`spawn_subagent`, `create_comp` (escreve só em `~/.config/kestrel/comps/`).
 
-**19 comandos:** `/help`, `/model`, `/effort`, `/thinking`, `/permissions`,
-`/chat`, `/agente`, `/plan`, `/clear`, `/skills`, `/stop`, `/historico`,
-`/projetos`, `/analisar`, `/processos`, `/config`, `/retomar`, `/nova`, `/sair`.
+**24 comandos:** `/help`, `/model`, `/effort`, `/person`, `/skin`,
+`/undo`, `/diff`, `/cost`,
+`/thinking`, `/permissions`, `/chat`, `/agent`, `/clear`, `/skills`, `/plan`,
+`/stop`, `/history`, `/projects`, `/analyze`, `/processes`, `/config`,
+`/resume`, `/new`, `/quit`. Todos têm apelido em português (ex.: `/modelo`,
+`/historico`, `/projetos`, `/retomar`, `/sair`).
 
 **Configuração:** `provider` (id, base_url, api_key_env, model, reasoning_effort,
 max_tokens, temperature, timeouts, retries, stream, models), `agent` (permission,
-modo, max_iterations, limiares de contexto, workdir/pin, external_dirs, histórico,
-recuperação), `ui` (mascote, histórico, confirmação, raciocínio, idioma), `web`.
+modo, limiares de contexto, workdir/pin, external_dirs, histórico, recuperação),
+`ui` (mascote, histórico, confirmação, raciocínio, idioma, **skin**, **Comp
+ativo**), `web`.
 
 **Banco:** sessions, messages, tool_runs, plans, tasks, file_changes, decisions,
-audit, context_state, kv.
+audit, context_state, usage, kv (11 tabelas; `usage` entrou na migração 3).
 
-**Testes (187):** tools 43, ui 31, agent 24, perm 21, provider 16, app 16, util 6,
-diff 6, html 5, db 5, skills 4, config 4, project 3, cli 3.
-Lacunas: **streaming SSE sem nennhum teste**, db 5 (para 10 tabelas), custo/tokens
-sem cobertura, setup quase sem cobertura.
+**Testes (266):** 263 testes unitários (tools, ui, agent, perm, provider, app,
+util, diff, html, db, skills, config, project, cli) + 3 de integração em
+`tests/cli.rs`. O streaming SSE agora tem servidor local e cobre `[DONE]`,
+conexão cortada, chunk dividido, tool_call fragmentada e erro no meio do stream.

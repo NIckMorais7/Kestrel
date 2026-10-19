@@ -5,6 +5,7 @@
 //! subtarefas persistidos. Nada é simulado.
 
 use crate::agent::{AgenteHandle, iniciar};
+use crate::comps;
 use crate::config::{Config, ModelSource, ModoOperacao};
 use crate::db::Store;
 use crate::events::{
@@ -15,7 +16,7 @@ use crate::project::{self, ProjectInfo};
 use crate::skills::SkillRegistry;
 use crate::ui::input::{COMANDOS_SLASH, Editor};
 use crate::ui::markdown;
-use crate::ui::mascot::{self, AnimacaoPip, EstadoMascote};
+use crate::ui::mascot::{self, AnimacaoPip, EstadoMascote, PipGrafico};
 use crate::ui::{self, theme};
 use crate::util::Paths;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
@@ -122,7 +123,13 @@ impl Bloco {
                 linhas
             }
             Bloco::Assistente(texto) => {
-                let mut linhas = vec![Line::default()];
+                let mut linhas = vec![
+                    Line::default(),
+                    Line::from(vec![
+                        Span::styled("◆ ", theme::titulo()),
+                        Span::styled("Kestrel", theme::rotulo()),
+                    ]),
+                ];
                 linhas.extend(markdown::renderizar(texto));
                 linhas
             }
@@ -136,11 +143,11 @@ impl Bloco {
                 remocoes,
             } => {
                 let (marcador, estilo_marcador) = if *rodando {
-                    ("→", theme::em_execucao())
+                    ("┊", theme::em_execucao())
                 } else if *sucesso {
-                    ("✓", theme::sucesso())
+                    ("┊", theme::sucesso())
                 } else {
-                    ("✗", theme::falha())
+                    ("┊", theme::falha())
                 };
                 let mut spans = vec![
                     Span::styled(format!("{marcador} "), estilo_marcador),
@@ -158,7 +165,7 @@ impl Bloco {
                     && !resumo.trim().is_empty()
                 {
                     linhas.push(Line::from(vec![
-                        Span::styled("  ", theme::apagado()),
+                        Span::styled("  ⎿  ", theme::apagado()),
                         Span::styled(resumo.clone(), theme::apagado()),
                     ]));
                 }
@@ -168,7 +175,7 @@ impl Bloco {
                 .iter()
                 .map(|l| {
                     Line::from(vec![
-                        Span::styled("  │ ", theme::apagado()),
+                        Span::styled("  ┊ ", theme::acento_fraco()),
                         Span::styled(l.clone(), theme::raciocinio()),
                     ])
                 })
@@ -201,7 +208,12 @@ impl Bloco {
                 prefixar_linhas(texto, "• ", theme::info(), "  ", theme::apagado())
             }
             Bloco::Turno(texto) => {
-                prefixar_linhas(texto, "◇ ", theme::sucesso(), "  ", theme::apagado())
+                // Rodapé de turno: uma linha curta e apagada, sem caixa nem
+                // repetição do que o agente já disse.
+                vec![Line::from(vec![
+                    Span::styled("└ ", theme::acento_fraco()),
+                    Span::styled(texto.clone(), theme::apagado()),
+                ])]
             }
             Bloco::Dossie {
                 resumo,
@@ -418,6 +430,19 @@ pub enum Modal {
         linhas: Vec<Line<'static>>,
         scroll: u16,
     },
+    /// Editor de instruções de um Comp.
+    CompEditor {
+        nome: String,
+        novo: bool,
+        descricao: String,
+        editor: Editor,
+        erro: Option<String>,
+        scroll: u16,
+    },
+    /// Confirmação de remoção de Comp (separada das confirmações de ferramenta).
+    ConfirmarComp {
+        nome: String,
+    },
 }
 
 /// Estado completo da interface.
@@ -458,8 +483,11 @@ pub struct App {
     pub tick: u64,
     /// Modo de operação atual (chat/agente), refletido no cabeçalho.
     pub modo: ModoOperacao,
-    /// Quadro atual da animação do Pip (respiração e piscada).
+    /// Quadro atual da animação do Pip (caminhada, respiração e piscada).
     pub pip: AnimacaoPip,
+    /// PNG do Pip já codificado no protocolo gráfico do terminal. `None`
+    /// quando o mascote está desligado ou o terminal não pôde ser consultado.
+    pub pip_grafico: Option<PipGrafico>,
     pip_piscada_ate: u64,
     pip_proxima_piscada: u64,
     pip_sorteio: u64,
@@ -480,8 +508,11 @@ impl App {
     ) -> Self {
         let mut entrada = Editor::novo(config.ui.max_input_history);
         if let Ok(texto) = std::fs::read_to_string(paths.history_file()) {
-            let linhas: Vec<String> = texto.lines().map(|l| l.to_string()).collect();
-            entrada.carregar_historico(linhas);
+            // Formato atual: array JSON, que preserva entradas multilinha.
+            // Arquivos antigos (um item por linha) continuam sendo lidos.
+            let itens: Vec<String> = serde_json::from_str(&texto)
+                .unwrap_or_else(|_| texto.lines().map(|l| l.to_string()).collect());
+            entrada.carregar_historico(itens);
         }
         let mostrar_raciocinio = config.ui.show_reasoning;
         let modelo = config.provider.model.clone();
@@ -523,6 +554,7 @@ impl App {
             tick: 0,
             modo,
             pip: AnimacaoPip::default(),
+            pip_grafico: None,
             pip_piscada_ate: 0,
             pip_proxima_piscada: 20,
             pip_sorteio: 0x9E37_79B9_7F4A_7C15,
@@ -810,6 +842,44 @@ impl App {
                      na conversa — apenas o estado ao lado do Pip."
                 ));
             }
+            "/person" | "/pessoa" | "/comp" => self.executar_person(&argumento),
+            "/skin" | "/tema" => {
+                // Recarrega do disco: skins próprias criadas depois da sessão
+                // entrarem aparecem sem reiniciar o Kestrel.
+                theme::recarregar(&self.paths.skins_dir());
+                if argumento.is_empty() {
+                    self.avisar(format!(
+                        "skin atual: {}. Disponíveis: {}.\nUse `/skin <nome>` para trocar na hora; \
+                         a escolha fica salva e vale nas próximas sessões.",
+                        theme::skin_atual(),
+                        theme::skins().join(", ")
+                    ));
+                } else {
+                    match theme::aplicar_skin(&argumento) {
+                        Ok(()) => {
+                            self.config.ui.skin = theme::skin_atual().to_string();
+                            if let Err(e) = self.config.save(&self.paths) {
+                                self.avisar(format!(
+                                    "skin aplicada, mas não foi possível salvar: {e}"
+                                ));
+                            }
+                            // Mantém a cópia do agente alinhada para que um
+                            // /model posterior não regrave a skin antiga.
+                            let _ = self
+                                .cmd_tx
+                                .send(UiCommand::DefinirSkin(theme::skin_atual().to_string()));
+                            // Markdown e outros widgets guardam estilos já
+                            // resolvidos; reconstruir aplica a nova paleta.
+                            self.construir_tudo();
+                            self.avisar(format!(
+                                "skin `{}` aplicada. Use /skin sem argumento para ver as opções.",
+                                theme::skin_atual()
+                            ));
+                        }
+                        Err(e) => self.avisar(e),
+                    }
+                }
+            }
             "/permissions" | "/permissoes" => {
                 if argumento.is_empty() {
                     self.modal = Some(Modal::Permissoes(seletor_permissoes(self.nivel)));
@@ -1008,6 +1078,300 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ Comps
+
+    fn executar_person(&mut self, argumento: &str) {
+        let mut partes = argumento.splitn(2, char::is_whitespace);
+        let acao = partes.next().unwrap_or("").trim().to_lowercase();
+        let nome = partes.next().unwrap_or("").trim().to_string();
+        match acao.as_str() {
+            "" | "list" | "listar" => self.listar_comps(),
+            "new" | "novo" | "criar" => {
+                if nome.is_empty() {
+                    self.avisar(
+                        "uso: `/person new <nome>` — abre o editor de instruções do novo Comp."
+                            .into(),
+                    );
+                } else if comps::slug_de(&nome).is_empty() {
+                    self.avisar(
+                        "o nome precisa ter ao menos uma letra ou número; use letras sem acento, \
+                         números, espaço, `-` ou `_`."
+                            .into(),
+                    );
+                } else {
+                    self.abrir_comp_editor(&nome, true);
+                }
+            }
+            "edit" | "editar" => {
+                let alvo = if nome.is_empty() {
+                    self.config.ui.active_comp.clone().unwrap_or_default()
+                } else {
+                    nome
+                };
+                if alvo.is_empty() {
+                    self.avisar("uso: `/person edit <nome>` ou ative um Comp primeiro.".into());
+                } else {
+                    self.abrir_comp_editor(&alvo, false);
+                }
+            }
+            "use" | "usar" | "ativar" => {
+                if nome.is_empty() {
+                    self.avisar(
+                        "uso: `/person use <nome>` para ativar ou `/person off` para desativar."
+                            .into(),
+                    );
+                } else {
+                    self.ativar_comp(&nome);
+                }
+            }
+            "off" | "desativar" | "none" => self.desativar_comp(),
+            "see" | "ver" | "show" => {
+                let alvo = if nome.is_empty() {
+                    self.config.ui.active_comp.clone().unwrap_or_default()
+                } else {
+                    nome
+                };
+                if alvo.is_empty() {
+                    self.avisar("uso: `/person see <nome>` ou ative um Comp primeiro.".into());
+                } else {
+                    self.ver_comp(&alvo);
+                }
+            }
+            "remove" | "remover" | "rm" => {
+                let alvo = if nome.is_empty() {
+                    self.config.ui.active_comp.clone().unwrap_or_default()
+                } else {
+                    nome
+                };
+                if alvo.is_empty() {
+                    self.avisar("uso: `/person remove <nome>`.".into());
+                } else if let Some((comp, _)) = comps::encontrar(&self.paths.comps_dir(), &alvo) {
+                    self.modal = Some(Modal::ConfirmarComp { nome: comp.nome });
+                } else {
+                    self.avisar(format!(
+                        "Comp `{alvo}` não encontrado em {}.",
+                        self.paths.comps_dir().display()
+                    ));
+                }
+            }
+            outro => self.avisar(format!(
+                "ação `{outro}` desconhecida. Use `/person`, `/person new <nome>`, \
+                 `/person use <nome>`, `/person edit <nome>`, `/person see <nome>` ou \
+                 `/person remove <nome>`."
+            )),
+        }
+    }
+
+    fn listar_comps(&mut self) {
+        let dir = self.paths.comps_dir();
+        let lista = comps::listar(&dir);
+        if lista.is_empty() {
+            self.avisar(format!(
+                "nenhum Comp criado em {}.\n\
+                 Crie um com `/person new <nome>` (editor dentro do Kestrel) ou peça ao agente \
+                 em linguagem natural.",
+                dir.display()
+            ));
+            return;
+        }
+        let ativo = self.config.ui.active_comp.as_deref();
+        let mut linhas = vec![format!("{} Comp(s) em {}:", lista.len(), dir.display())];
+        for comp in &lista {
+            let marcador = if ativo.is_some_and(|a| comps::slug_de(a) == comp.slug()) {
+                "●"
+            } else {
+                "○"
+            };
+            linhas.push(format!(
+                "{marcador} {} — {} (~{} tokens)",
+                comp.nome,
+                if comp.descricao.is_empty() {
+                    "(sem descrição)"
+                } else {
+                    &comp.descricao
+                },
+                comp.tokens()
+            ));
+        }
+        linhas.push(
+            "Use `/person use <nome>`, `/person see <nome>`, `/person edit <nome>` ou \
+             `/person remove <nome>`."
+                .into(),
+        );
+        self.avisar(linhas.join("\n"));
+    }
+
+    fn abrir_comp_editor(&mut self, nome: &str, novo: bool) {
+        let dir = self.paths.comps_dir();
+        let (nome_exibicao, descricao, instrucoes) = if novo {
+            if comps::encontrar(&dir, nome).is_some() {
+                self.avisar(format!(
+                    "o Comp `{nome}` já existe. Use `/person edit {nome}` para alterar."
+                ));
+                return;
+            }
+            (nome.trim().to_string(), String::new(), String::new())
+        } else {
+            let Some((comp, _)) = comps::encontrar(&dir, nome) else {
+                self.avisar(format!(
+                    "Comp `{nome}` não encontrado em {}.",
+                    dir.display()
+                ));
+                return;
+            };
+            (comp.nome, comp.descricao, comp.instrucoes)
+        };
+        let mut editor = Editor::novo(50);
+        editor.definir_texto(instrucoes);
+        self.modal = Some(Modal::CompEditor {
+            nome: nome_exibicao,
+            novo,
+            descricao,
+            editor,
+            erro: None,
+            scroll: 0,
+        });
+    }
+
+    fn ativar_comp(&mut self, nome: &str) {
+        let Some((comp, _)) = comps::encontrar(&self.paths.comps_dir(), nome) else {
+            self.avisar(format!(
+                "Comp `{nome}` não encontrado. Use /person para listar os disponíveis."
+            ));
+            return;
+        };
+        self.config.ui.active_comp = Some(comp.nome.clone());
+        if let Err(e) = self.config.save(&self.paths) {
+            self.avisar(format!("Comp ativado, mas não foi possível salvar: {e}"));
+        }
+        let _ = self
+            .cmd_tx
+            .send(UiCommand::DefinirComp(Some(comp.nome.clone())));
+        self.avisar(format!(
+            "Comp ativo: {} (~{} tokens no system prompt). Vale a partir do próximo turno.",
+            comp.nome,
+            comp.tokens()
+        ));
+    }
+
+    fn desativar_comp(&mut self) {
+        if self.config.ui.active_comp.take().is_none() {
+            self.avisar("nenhum Comp está ativo.".into());
+            return;
+        }
+        if let Err(e) = self.config.save(&self.paths) {
+            self.avisar(format!("Comp desativado, mas não foi possível salvar: {e}"));
+        }
+        let _ = self.cmd_tx.send(UiCommand::DefinirComp(None));
+        self.avisar("Comp desativado; o Kestrel volta ao tom padrão.".into());
+    }
+
+    fn ver_comp(&mut self, nome: &str) {
+        let Some((comp, _)) = comps::encontrar(&self.paths.comps_dir(), nome) else {
+            self.avisar(format!("Comp `{nome}` não encontrado."));
+            return;
+        };
+        let mut linhas = vec![
+            Line::from(vec![
+                Span::styled("Comp — ", theme::apagado()),
+                Span::styled(comp.nome.clone(), theme::titulo()),
+            ]),
+            Line::from(Span::styled(
+                format!("descrição: {}", comp.descricao),
+                theme::apagado(),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "custo aproximado: {} tokens · arquivo: {}",
+                    comp.tokens(),
+                    comp.caminho(&self.paths.comps_dir()).display()
+                ),
+                theme::apagado(),
+            )),
+            Line::default(),
+            Line::from(Span::styled("instruções:", theme::rotulo())),
+        ];
+        linhas.extend(
+            comp.instrucoes
+                .lines()
+                .map(|linha| Line::from(Span::styled(linha.to_string(), theme::texto()))),
+        );
+        self.modal = Some(Modal::Texto {
+            titulo: format!("Comp — {}", comp.nome),
+            linhas,
+            scroll: 0,
+        });
+    }
+
+    fn salvar_comp_modal(&mut self) {
+        let Some(Modal::CompEditor {
+            nome,
+            novo,
+            descricao,
+            editor,
+            erro: _,
+            scroll,
+        }) = self.modal.take()
+        else {
+            return;
+        };
+        let instrucoes = editor.texto().to_string();
+        let comp = if descricao.trim().is_empty() {
+            comps::Comp::novo(&nome, instrucoes)
+        } else {
+            comps::Comp::com_descricao(&nome, descricao.clone(), instrucoes)
+        };
+        match comp.and_then(|comp| comp.salvar(&self.paths.comps_dir(), !novo).map(|_| comp)) {
+            Ok(comp) => self.avisar(format!(
+                "Comp `{}` salvo (~{} tokens). Use `/person use {}` para ativá-lo.",
+                comp.nome,
+                comp.tokens(),
+                comp.nome
+            )),
+            Err(e) => {
+                self.modal = Some(Modal::CompEditor {
+                    nome,
+                    novo,
+                    descricao,
+                    editor,
+                    erro: Some(e),
+                    scroll,
+                });
+            }
+        }
+    }
+
+    fn remover_comp_confirmado(&mut self) {
+        let Some(Modal::ConfirmarComp { nome }) = self.modal.take() else {
+            return;
+        };
+        match comps::remover(&self.paths.comps_dir(), &nome) {
+            Ok(caminho) => {
+                let era_ativo = self
+                    .config
+                    .ui
+                    .active_comp
+                    .as_deref()
+                    .is_some_and(|ativo| comps::slug_de(ativo) == comps::slug_de(&nome));
+                if era_ativo {
+                    self.config.ui.active_comp = None;
+                    let _ = self.config.save(&self.paths);
+                    let _ = self.cmd_tx.send(UiCommand::DefinirComp(None));
+                }
+                self.avisar(format!(
+                    "Comp `{nome}` removido ({}){}.",
+                    caminho.display(),
+                    if era_ativo {
+                        "; era o ativo, então o tom padrão foi restaurado"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            Err(e) => self.avisar(e),
+        }
+    }
+
     /// Troca o modo de operação e informa o usuário (o agente persiste).
     fn trocar_modo(&mut self, modo: ModoOperacao) {
         if self.modo == modo {
@@ -1079,10 +1443,14 @@ impl App {
                 ));
             }
             None => {
-                self.avisar(format!(
-                    "Não foi possível desfazer {}: o arquivo mudou desde a alteração                      registrada (o diff não bate mais com o conteúdo).",
-                    alt.path
-                ));
+                let motivo = if alt.diff.contains(crate::diff::DIFF_TRUNCADO) {
+                    "o diff registrado foi truncado por ser grande demais; \
+                     desfazer automaticamente aplicaria um patch parcial e corromperia o arquivo. \
+                     Use o controle de versão para reverter."
+                } else {
+                    "o arquivo mudou desde a alteração registrada (o diff não bate mais com o conteúdo)."
+                };
+                self.avisar(format!("Não foi possível desfazer {}: {motivo}", alt.path));
             }
         }
     }
@@ -1803,10 +2171,35 @@ impl App {
                 }
             }
             crossterm::event::Event::Mouse(mouse) => self.tratar_mouse(mouse),
-            crossterm::event::Event::Paste(texto) if self.modal.is_none() => {
-                self.entrada.inserir_texto(&texto);
-                self.sugestao_sel = 0;
-            }
+            crossterm::event::Event::Paste(texto) => match &mut self.modal {
+                None => {
+                    self.entrada.inserir_texto(&texto);
+                    self.sugestao_sel = 0;
+                }
+                // Em seletores, colar alimenta o filtro em vez de ser
+                // descartado em silêncio.
+                Some(
+                    Modal::Permissoes(seletor)
+                    | Modal::Modelos(seletor)
+                    | Modal::Esforco(seletor)
+                    | Modal::Sessoes(seletor)
+                    | Modal::Projetos(seletor)
+                    | Modal::Processos(seletor),
+                ) => {
+                    let limpo: String = texto.chars().filter(|c| !c.is_control()).collect();
+                    if !limpo.is_empty() {
+                        seletor.filtro.push_str(&limpo);
+                        seletor.sel = 0;
+                        seletor.ajustar_selecao();
+                    }
+                }
+                Some(Modal::CompEditor { editor, erro, .. }) => {
+                    editor.inserir_texto(&texto);
+                    *erro = None;
+                }
+                // Confirmação e texto não têm campo de entrada.
+                Some(_) => {}
+            },
             _ => {}
         }
     }
@@ -1846,11 +2239,41 @@ impl App {
     }
 
     fn tratar_tecla(&mut self, tecla: KeyEvent) {
+        let controle = tecla.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+C é global: vale no rascunho, com modal aberto e durante o
+        // turno. Antes ele morria no tratamento de modal (não interrompia nem
+        // encerrava) e não negava a confirmação pendente.
+        if tecla.code == KeyCode::Char('c') && controle {
+            if self.modal.is_some() {
+                if matches!(self.modal, Some(Modal::Confirmacao(_))) {
+                    self.responder_confirmacao(Confirmacao::Negar);
+                } else {
+                    self.modal = None;
+                }
+                if self.turno_ativo {
+                    let _ = self.cmd_tx.send(UiCommand::Interromper);
+                    self.empurrar_bloco(Bloco::Aviso(
+                        "interrupção solicitada (Ctrl+C novamente encerra o Kestrel)".into(),
+                    ));
+                } else {
+                    self.avisar("modal fechado; Ctrl+C de novo encerra o Kestrel.".into());
+                }
+                return;
+            }
+            if self.turno_ativo {
+                let _ = self.cmd_tx.send(UiCommand::Interromper);
+                self.empurrar_bloco(Bloco::Aviso(
+                    "interrupção solicitada (Ctrl+C novamente encerra o Kestrel)".into(),
+                ));
+            } else {
+                self.iniciar_saida();
+            }
+            return;
+        }
         if self.modal.is_some() {
             self.tratar_tecla_modal(tecla);
             return;
         }
-        let controle = tecla.modifiers.contains(KeyModifiers::CONTROL);
         let alt = tecla.modifiers.contains(KeyModifiers::ALT);
         let shift = tecla.modifiers.contains(KeyModifiers::SHIFT);
         match tecla.code {
@@ -1963,14 +2386,19 @@ impl App {
     }
 
     fn tratar_tecla_modal(&mut self, tecla: KeyEvent) {
+        let controle = tecla.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = tecla.modifiers.contains(KeyModifiers::ALT);
         enum Reacao {
             Nada,
             Fechar,
             Confirmar(Confirmacao),
             Escolher(ItemSeletor),
+            SalvarComp,
+            RemoverComp,
         }
         let reacao = match self.modal.as_mut() {
             None => Reacao::Nada,
+            Some(Modal::Confirmacao(_)) if controle || alt => Reacao::Nada,
             Some(Modal::Confirmacao(_)) => match tecla.code {
                 KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Enter => {
                     Reacao::Confirmar(Confirmacao::Permitir)
@@ -2008,7 +2436,7 @@ impl App {
                             reacao = Reacao::Escolher(item.clone());
                         }
                     }
-                    KeyCode::Char(c) => {
+                    KeyCode::Char(c) if !controle && !alt => {
                         seletor.filtro.push(c);
                         seletor.sel = 0;
                     }
@@ -2017,9 +2445,85 @@ impl App {
                 seletor.ajustar_selecao();
                 reacao
             }
+            Some(Modal::CompEditor {
+                editor,
+                erro,
+                scroll,
+                ..
+            }) => {
+                if controle {
+                    match tecla.code {
+                        KeyCode::Char('s') | KeyCode::Char('S') => Reacao::SalvarComp,
+                        _ => Reacao::Nada,
+                    }
+                } else {
+                    match tecla.code {
+                        KeyCode::Esc => Reacao::Fechar,
+                        KeyCode::Enter => {
+                            editor.nova_linha();
+                            *erro = None;
+                            Reacao::Nada
+                        }
+                        KeyCode::Backspace => {
+                            editor.backspace();
+                            *erro = None;
+                            Reacao::Nada
+                        }
+                        KeyCode::Delete => {
+                            editor.apagar();
+                            *erro = None;
+                            Reacao::Nada
+                        }
+                        KeyCode::Left => {
+                            editor.esquerda();
+                            Reacao::Nada
+                        }
+                        KeyCode::Right => {
+                            editor.direita();
+                            Reacao::Nada
+                        }
+                        KeyCode::Home => {
+                            editor.home();
+                            Reacao::Nada
+                        }
+                        KeyCode::End => {
+                            editor.fim();
+                            Reacao::Nada
+                        }
+                        KeyCode::Up => {
+                            editor.cima();
+                            Reacao::Nada
+                        }
+                        KeyCode::Down => {
+                            editor.baixo();
+                            Reacao::Nada
+                        }
+                        KeyCode::PageUp => {
+                            *scroll = scroll.saturating_sub(10);
+                            Reacao::Nada
+                        }
+                        KeyCode::PageDown => {
+                            *scroll = scroll.saturating_add(10);
+                            Reacao::Nada
+                        }
+                        KeyCode::Char(c) if !alt => {
+                            editor.inserir_char(c);
+                            *erro = None;
+                            Reacao::Nada
+                        }
+                        _ => Reacao::Nada,
+                    }
+                }
+            }
+            Some(Modal::ConfirmarComp { .. }) => match tecla.code {
+                KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Enter => Reacao::RemoverComp,
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Reacao::Fechar,
+                _ => Reacao::Nada,
+            },
             Some(Modal::Texto { scroll, .. }) | Some(Modal::Ajuda { scroll, .. }) => {
                 match tecla.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => Reacao::Fechar,
+                    KeyCode::Esc | KeyCode::Enter => Reacao::Fechar,
+                    KeyCode::Char('q') if !controle && !alt => Reacao::Fechar,
                     KeyCode::Up => {
                         *scroll = scroll.saturating_sub(1);
                         Reacao::Nada
@@ -2044,6 +2548,8 @@ impl App {
             Reacao::Nada => {}
             Reacao::Fechar => self.modal = None,
             Reacao::Confirmar(resposta) => self.responder_confirmacao(resposta),
+            Reacao::SalvarComp => self.salvar_comp_modal(),
+            Reacao::RemoverComp => self.remover_comp_confirmado(),
             Reacao::Escolher(item) => {
                 // Fecha antes de agir: escolher um modelo com raciocínio abre o
                 // seletor de esforço, que não pode ser fechado por engano.
@@ -2075,17 +2581,21 @@ impl App {
             mudou = true;
         }
 
-        // Animação do Pip: respiração e piscada, quadro a quadro.
+        // Animação do Pip: caminhada, respiração e piscada, quadro a quadro.
         let anterior = self.pip;
-        if self.tick >= self.pip_proxima_piscada {
-            self.pip.piscando = true;
-            self.pip_piscada_ate = self.tick;
+        let mut novo = mascot::quadro_de(self.tick);
+        // A piscada só acontece no repouso; se o horário chegar durante a
+        // caminhada, ela espera o próximo tique parado.
+        if novo.dx == 0 && self.tick >= self.pip_proxima_piscada {
+            novo.piscando = true;
+            // Dois quadros fechados: uma piscada de 120 ms é quase invisível.
+            self.pip_piscada_ate = self.tick + 2;
             let intervalo = self.intervalo_de_piscada();
             self.pip_proxima_piscada = self.tick + intervalo;
         } else if self.pip.piscando && self.tick > self.pip_piscada_ate {
-            self.pip.piscando = false;
+            novo.piscando = false;
         }
-        self.pip.deslocamento = mascot::deslocamento_de(self.tick);
+        self.pip = novo;
         if self.pip != anterior {
             mudou = true;
         }
@@ -2110,7 +2620,11 @@ impl App {
         if linhas.is_empty() {
             return;
         }
-        let _ = std::fs::write(self.paths.history_file(), linhas.join("\n"));
+        // JSON, não uma entrada por linha: mensagens multilinha eram
+        // fragmentadas ao reabrir o Kestrel.
+        if let Ok(texto) = serde_json::to_string(&linhas) {
+            let _ = std::fs::write(self.paths.history_file(), texto);
+        }
     }
 }
 
@@ -2160,9 +2674,21 @@ fn texto_de_ajuda() -> Vec<Line<'static>> {
     }
     texto.push_str(
         "\n## Modos\n\n\
-         - **agente** (padrão): investiga, planeja, edita arquivos e executa comandos conforme o nível de permissão.\n\
+         - **build** (padrão): investiga, planeja, edita arquivos e executa comandos conforme o nível de permissão.\n\
          - **chat**: somente conversa e leitura; ferramentas que escrevem, executam ou planejam ficam indisponíveis.\n\
-         - Troque com `/chat` e `/agente`; o modo atual aparece no topo da interface e é registrado na auditoria.\n\n\
+         - Troque com `/chat` e `/agent`; o modo atual aparece no topo da interface e é registrado na auditoria.\n\n\
+         ## Rodapé do turno\n\n\
+         - Ao fim de cada turno aparece só uma linha discreta: duração, tokens por segundo, modelo e modo.\n\
+         - O rodapé inferior não mostra skills nem “enter envia”; use `/skills` para ver as skills.\n\n\
+         ## Comps e skins\n\n\
+         - **Comps** são personalidades: um bloco de instruções que muda o tom e o estilo da resposta. \
+`/person` lista, `/person new <nome>` cria com o editor dentro do Kestrel, `/person use <nome>` ativa, \
+`/person edit` reabre, `/person see` mostra as instruções e o custo em tokens e `/person remove` apaga. \
+Um Comp por sessão; as instruções ficam em `~/.config/kestrel/comps/<nome>.toml`.\n\
+         - **Skins** são o visual, independentes do Comp. `/skin` lista e `/skin <nome>` troca na hora. \
+Prontas: `mono` (padrão), `kestrel`, `daylight`; skins próprias em `~/.config/kestrel/skins/<nome>.toml` \
+(chaves de cor `#rrggbb`) entram na lista. `KESTREL_SKIN=<nome>` força uma skin só nesta sessão.\n\
+         - No editor de Comp: Enter quebra linha, Ctrl+S salva e Esc cancela.\n\n\
          ## Teclado\n\n\
          - Enter envia; Alt+Enter (ou Shift+Enter) quebra linha\n\
          - Up/Down navega no histórico (ou nas sugestões de comando); Tab ou Enter completam um comando parcial\n\
@@ -2188,6 +2714,7 @@ pub async fn executar(
     config: Config,
     paths: Paths,
     store: Store,
+    pip_grafico: Option<PipGrafico>,
 ) -> anyhow::Result<()> {
     let handle: AgenteHandle = iniciar(config.clone(), paths.clone(), store.clone())?;
     let AgenteHandle {
@@ -2197,10 +2724,11 @@ pub async fn executar(
     let projeto = Arc::new(project::analyze(&config.workdir()));
     let skills = Arc::new(SkillRegistry::discover(&paths, &config.workdir()));
     let mut app = App::novo(config, paths, store, cmd_tx, projeto, skills);
+    app.pip_grafico = pip_grafico;
     let mut eventos_terminal = ui::canal_terminal();
     // Cadência adaptativa: ágil durante um turno (spinner), espaçada quando
     // ocioso (respiração/piscada). O desenho é pulado quando nada mudou.
-    let mut intervalo = Duration::from_millis(120);
+    let mut intervalo = Duration::from_millis(80);
     let mut tique = Box::pin(tokio::time::sleep(intervalo));
     let mut tiques_encerrando = 0u32;
     let mut redesenhar = true;
@@ -2232,13 +2760,13 @@ pub async fn executar(
         }
         // Rede de segurança: se o agente não confirmar o encerramento em ~10s,
         // a interface sai mesmo assim (o estado já foi persistido a cada passo).
-        if app.saindo && tiques_encerrando > 40 {
+        if app.saindo && tiques_encerrando > 80 {
             break;
         }
         let novo = if app.turno_ativo {
-            Duration::from_millis(120)
+            Duration::from_millis(80)
         } else {
-            Duration::from_millis(250)
+            Duration::from_millis(160)
         };
         if novo != intervalo {
             intervalo = novo;
@@ -2450,6 +2978,70 @@ mod tests {
         app.entrada.definir_texto("/sair".into());
         app.enviar_entrada();
         assert!(app.saindo, "/sair deveria iniciar a saída");
+    }
+
+    /// `/person` precisa sustentar o ciclo completo do Anexo A: criar com o
+    /// editor interno, ativar, gravar em disco e remover com confirmação —
+    /// sem recompilar e sem escrever nada dentro do projeto.
+    #[test]
+    fn person_cria_ativa_e_remove_comp() {
+        let dir = std::env::temp_dir().join(format!("kestrel-person-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut app, mut rx) = app_de_teste();
+        app.paths = crate::util::Paths::with_root(&dir);
+
+        app.executar_comando("/person new Lazy");
+        assert!(
+            matches!(&app.modal, Some(Modal::CompEditor { nome, novo, .. }) if nome == "Lazy" && *novo)
+        );
+        if let Some(Modal::CompEditor { editor, .. }) = &mut app.modal {
+            editor.definir_texto("Seja breve, direto e sem floreios.".into());
+        }
+        app.salvar_comp_modal();
+        let arquivo = app.paths.comps_dir().join("lazy.toml");
+        assert!(arquivo.exists(), "o Comp deveria ter sido gravado");
+        assert!(app.modal.is_none(), "o editor deveria fechar ao salvar");
+
+        app.executar_comando("/person use Lazy");
+        assert_eq!(app.config.ui.active_comp.as_deref(), Some("Lazy"));
+        match rx.try_recv().unwrap() {
+            UiCommand::DefinirComp(ativo) => assert_eq!(ativo.as_deref(), Some("Lazy")),
+            outro => panic!("comando inesperado: {outro:?}"),
+        }
+
+        app.executar_comando("/person remove Lazy");
+        assert!(matches!(&app.modal, Some(Modal::ConfirmarComp { nome }) if nome == "Lazy"));
+        app.remover_comp_confirmado();
+        assert!(!arquivo.exists(), "o Comp deveria ter sido removido");
+        assert_eq!(app.config.ui.active_comp, None);
+        while let Ok(comando) = rx.try_recv() {
+            if matches!(comando, UiCommand::DefinirComp(algum) if algum.is_none()) {
+                return;
+            }
+        }
+        panic!("a remoção deveria desativar o Comp ativo");
+    }
+
+    /// `/skin` troca a paleta na hora e mantém a cópia do agente alinhada —
+    /// senão um `/model` posterior regravaria a skin antiga.
+    #[test]
+    fn skin_aplica_muda_a_configuracao_e_avisa_o_agente() {
+        let (mut app, mut rx) = app_de_teste();
+        app.executar_comando("/skin daylight");
+        assert_eq!(app.config.ui.skin, "daylight");
+        assert_eq!(crate::ui::theme::skin_atual(), "daylight");
+        match rx.try_recv().unwrap() {
+            UiCommand::DefinirSkin(skin) => assert_eq!(skin, "daylight"),
+            outro => panic!("comando inesperado: {outro:?}"),
+        }
+        app.executar_comando("/skin inexistente");
+        assert_eq!(
+            app.config.ui.skin, "daylight",
+            "skin inválida não deveria colar"
+        );
+        // Restaura o padrão para o restante dos testes de interface.
+        app.executar_comando("/skin kestrel");
+        assert_eq!(crate::ui::theme::skin_atual(), "kestrel");
     }
 
     #[test]
@@ -2845,7 +3437,7 @@ mod tests {
         let (mut app3, _rx3) = app_de_teste();
         for _ in 0..32 {
             app3.tiquetaquear();
-            match app3.pip.deslocamento {
+            match app3.pip.dy {
                 0 => viu_zero = true,
                 _ => viu_um = true,
             }

@@ -9,6 +9,7 @@ pub mod openai;
 
 use crate::config::ModelEntry;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +41,35 @@ pub struct ToolCall {
     pub name: String,
     /// Argumentos como JSON em texto (validados antes da execução).
     pub arguments: String,
+}
+
+impl ToolCall {
+    /// Devolve uma cópia com `arguments` sempre como um **objeto JSON válido**.
+    ///
+    /// A NVIDIA (e alguns modelos compatíveis) devolvem `arguments` quebrados,
+    /// vazios ou até como objeto em vez de texto. Reenviar isso no histórico
+    /// faz o provedor responder `HTTP 400 ... must be a valid json`. Aqui a
+    /// chamada original continua disponível para validação/execução; esta cópia
+    /// é só o que vai para o provedor.
+    pub fn com_argumentos_validos(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            arguments: argumentos_objeto(&self.arguments),
+        }
+    }
+}
+
+/// Normaliza argumentos de tool-call para um objeto JSON válido em texto.
+///
+/// Preserva a mensagem original quando o modelo acertou o formato; em qualquer
+/// outro caso devolve `{}` — que a API aceita — e o resultado da ferramenta
+/// explica o que estava errado.
+pub fn argumentos_objeto(texto: &str) -> String {
+    match serde_json::from_str::<Value>(texto) {
+        Ok(Value::Object(objeto)) => Value::Object(objeto).to_string(),
+        _ => "{}".to_string(),
+    }
 }
 
 /// Mensagem no formato do protocolo.
@@ -265,6 +295,29 @@ mod tests {
         assert_eq!(v["role"], "tool");
         assert_eq!(v["tool_call_id"], "call_9");
         assert_eq!(v["name"], "run_command");
+    }
+
+    #[test]
+    fn argumentos_invalidos_viram_objeto_valido_para_o_historico() {
+        let chamada = ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: "{\"path\": \"src/main.rs\"".into(),
+        };
+        let segura = chamada.com_argumentos_validos();
+        assert_eq!(segura.arguments, "{}");
+        // A chamada original continua disponível para diagnóstico/validação.
+        assert_eq!(chamada.arguments, "{\"path\": \"src/main.rs\"");
+        // Um objeto válido é preservado (sem reescrever a ordem/campos).
+        let ok = ToolCall {
+            id: "call_2".into(),
+            name: "read_file".into(),
+            arguments: "{\"path\":\"README.md\"}".into(),
+        };
+        assert_eq!(
+            ok.com_argumentos_validos().arguments,
+            "{\"path\":\"README.md\"}"
+        );
     }
 
     #[test]

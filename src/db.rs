@@ -197,6 +197,10 @@ impl Store {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("abrindo banco em {}", path.display()))?;
+        // Com WAL, duas instâncias (ou a interface e um subagente) podem
+        // disputar o lock; sem espera o segundo recebe SQLITE_BUSY na hora.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("configurando espera de lock do banco")?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
             .context("aplicando pragmas do banco")?;
         crate::migrar::aplicar(&conn)?;
@@ -420,33 +424,6 @@ impl Store {
         })
     }
 
-    pub fn messages(&self, session_id: &str, limit: usize) -> Result<Vec<MessageRow>> {
-        self.with(|c| {
-            let mut stmt = c.prepare(
-                "SELECT id, session_id, role, content, tool_calls, tool_call_id, tool_name, reasoning, created_at
-                 FROM messages WHERE session_id = ?1 ORDER BY id ASC LIMIT ?2",
-            )?;
-            let iter = stmt.query_map(params![session_id, limit as i64], |r| {
-                Ok(MessageRow {
-                    id: r.get(0)?,
-                    session_id: r.get(1)?,
-                    role: r.get(2)?,
-                    content: r.get(3)?,
-                    tool_calls: r.get(4)?,
-                    tool_call_id: r.get(5)?,
-                    tool_name: r.get(6)?,
-                    reasoning: r.get(7)?,
-                    created_at: r.get(8)?,
-                })
-            })?;
-            let mut rows = Vec::new();
-            for r in iter {
-                rows.push(r?);
-            }
-            Ok(rows)
-        })
-    }
-
     /// Últimas `limit` mensagens (ordem cronológica).
     pub fn recent_messages(&self, session_id: &str, limit: usize) -> Result<Vec<MessageRow>> {
         self.with(|c| {
@@ -478,12 +455,18 @@ impl Store {
     }
 
     pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let like = format!("%{}%", query.to_lowercase());
+        // `%`/`_` são curingas do LIKE: sem escapar, buscar `%` devolvia tudo.
+        let termo = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like = format!("%{termo}%");
         self.with(|c| {
             let mut stmt = c.prepare(
                 "SELECT m.session_id, s.title, m.role, m.content, m.created_at
                  FROM messages m JOIN sessions s ON s.id = m.session_id
-                 WHERE lower(m.content) LIKE ?1
+                 WHERE lower(m.content) LIKE ?1 ESCAPE '\\'
                  ORDER BY m.id DESC LIMIT ?2",
             )?;
             let iter = stmt.query_map(params![like, limit as i64], |r| {
@@ -541,17 +524,19 @@ impl Store {
     pub fn save_plan(&self, session_id: &str, objective: &str, steps: &str) -> Result<i64> {
         let now = crate::util::now_rfc3339();
         self.with(|c| {
-            let version: i64 = c
-                .query_row(
-                    "SELECT COALESCE(MAX(version), 0) + 1 FROM plans WHERE session_id = ?1",
-                    params![session_id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(1);
-            c.execute(
+            // Ler o máximo e inserir na mesma transação: antes, dois planos
+            // simultâneos podiam receber a mesma `version`.
+            let tx = c.unchecked_transaction()?;
+            let version: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM plans WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )?;
+            tx.execute(
                 "INSERT INTO plans (session_id, objective, version, steps, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![session_id, objective, version, steps, now],
             )?;
+            tx.commit()?;
             Ok(version)
         })
     }
@@ -821,15 +806,6 @@ impl Store {
         })
     }
 
-    pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
-        self.with(|c| {
-            let v = c
-                .query_row("SELECT v FROM kv WHERE k = ?1", params![key], |r| r.get(0))
-                .optional()?;
-            Ok(v)
-        })
-    }
-
     /// Estatísticas gerais para o relatório de conclusão.
     pub fn session_stats(&self, session_id: &str) -> Result<SessionStats> {
         self.with(|c| {
@@ -853,14 +829,12 @@ impl Store {
                 params![session_id],
                 |r| r.get(0),
             )?;
-            let (p_tok, c_tok, r_tok): (i64, i64, i64) = c
-                .query_row(
-                    "SELECT COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), \
-                     COALESCE(SUM(reasoning_tokens),0) FROM usage WHERE session_id = ?1",
-                    params![session_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .unwrap_or((0, 0, 0));
+            let (p_tok, c_tok, r_tok): (i64, i64, i64) = c.query_row(
+                "SELECT COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), \
+                 COALESCE(SUM(reasoning_tokens),0) FROM usage WHERE session_id = ?1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
             Ok(SessionStats {
                 tool_runs: tools as usize,
                 tool_failures: failed as usize,
@@ -951,6 +925,29 @@ fn migracao_de_banco_antigo_e_automatica() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Banco na versão 2 (anterior à tabela `usage`) ganha a tabela ao abrir.
+#[test]
+fn migracao_2_para_3_cria_usage() {
+    use rusqlite::Connection;
+    let dir = std::env::temp_dir().join(format!("kestrel-usage-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let caminho = dir.join("kestrel.db");
+    {
+        let conn = Connection::open(&caminho).unwrap();
+        conn.execute_batch(SCHEMA_BASE).unwrap();
+        // Simula o banco antigo: a tabela ainda não existia.
+        conn.execute_batch("DROP TABLE usage; PRAGMA user_version = 2;")
+            .unwrap();
+    }
+    let store = Store::open(&caminho).unwrap();
+    store.record_usage("s1", 123, 45, 6).unwrap();
+    let stats = store.session_stats("s1").unwrap();
+    assert_eq!(stats.prompt_tokens, 123);
+    assert_eq!(stats.completion_tokens, 45);
+    assert_eq!(stats.reasoning_tokens, 6);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Abrir um banco de versão futura falha com mensagem clara, em vez de
 /// silenciosamente rebaixar o esquema.
 #[test]
@@ -1028,7 +1025,7 @@ mod tests {
             Some("pensando"),
         )
         .unwrap();
-        let msgs = s.messages("s1", 10).unwrap();
+        let msgs = s.recent_messages("s1", 10).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].reasoning.as_deref(), Some("pensando"));
@@ -1098,10 +1095,8 @@ mod tests {
     }
 
     #[test]
-    fn kv_e_contexto() {
+    fn contexto_persistido() {
         let s = store();
-        s.kv_set("ultimo_projeto", "/x").unwrap();
-        assert_eq!(s.kv_get("ultimo_projeto").unwrap().as_deref(), Some("/x"));
         s.create_session("s1", "/p", "t", "m", None, "semi", None)
             .unwrap();
         s.set_context_state("s1", 100, 1000, Some("dossie"))

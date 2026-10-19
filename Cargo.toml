@@ -1,6 +1,6 @@
 [package]
 name = "kestrel"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2024"
 description = "Kestrel — agente autônomo de codificação para o terminal"
 license = "MIT"
@@ -19,9 +19,11 @@ crossterm = "0.29"
 dirs = "7"
 futures-util = "0.3"
 ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 pulldown-cmark = "0.13"
 ratatui = "0.30"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",

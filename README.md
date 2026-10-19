@@ -14,6 +14,27 @@ fez — sempre dentro do nível de permissão escolhido.
   provedor padrão (NVIDIA): `NVIDIA_API_KEY`.
 - `git` para as ferramentas de repositório (opcionais em outros fluxos).
 
+### Fonte (recomendada: Geist Mono)
+
+O Kestrel é uma aplicação de terminal: a fonte é escolhida pelo **emulador de
+terminal**, não pelo app. A Inter não tem variante monoespelhada oficial e
+quebra o alinhamento da interface; por isso a recomendação é a **Geist Mono**,
+livre e visualmente próxima:
+
+```bash
+scripts/instalar_fonte_geist_mono.sh
+```
+
+Depois aponte o terminal para ela. No `foot`, por exemplo:
+
+```ini
+# ~/.config/foot/foot.ini
+font=Geist Mono:size=9
+```
+
+O Kestrel usa a métrica real da fonte para posicionar o Pip em 6×2; depois de
+trocar a fonte, reabra o terminal para a nova métrica valer.
+
 ## Instalação
 
 ```bash
@@ -58,12 +79,12 @@ use `/projetos` dentro da interface (a escolha fica salva na configuração).
 
 ## Modos
 
-- **agente** (padrão): investiga, planeja, edita arquivos e executa comandos
+- **build** (padrão): investiga, planeja, edita arquivos e executa comandos
   conforme o nível de permissão.
 - **chat**: somente conversa e leitura; ferramentas que escrevem, executam ou
   planejam ficam indisponíveis e o modelo é instruído a não alterar nada.
 
-Troque com `/chat` e `/agente`. O modo atual aparece no cabeçalho, é persistido
+Troque com `/chat` e `/agent`. O modo atual aparece no cabeçalho, é persistido
 na configuração e registrado na auditoria.
 
 ## Permissões
@@ -74,8 +95,8 @@ central:
 | Nível  | O que permite                                                        |
 |--------|----------------------------------------------------------------------|
 | read   | **ler** qualquer caminho (dentro ou fora do projeto); nenhuma escrita ou execução |
-| write  | ler, criar, editar e excluir — dentro **e fora** do projeto; `rm -rf` em caminho comum; operações sensíveis (instalação, rede, privilégios) pedem confirmação |
-| semi   | tudo do write sem confirmação, mais `rm -rf`, instalações e rede; só o que **perde dado** (git destrutivo) pede confirmação |
+| write  | ler, criar, editar, excluir e `rm -rf` em alvo comum (ex.: `target/`, `node_modules/`), dentro **e fora** do projeto; operações sensíveis (instalação, rede, privilégios) pedem confirmação |
+| semi   | tudo do write **sem confirmação** (inclusive instalação e rede); só o que **perde dado** (git destrutivo) pede confirmação |
 | full   | idem ao semi, mais conteúdo baixado da rede executado direto (pipe para interpretador); **só git destrutivo pede confirmação** |
 
 **Fora do projeto não é proibido**: a regra é pela operação. Ler qualquer caminho
@@ -86,8 +107,13 @@ Rodar código do projeto (`node script.js`, `python app.py`, `bun test`, `go run
 fluxo de desenvolvimento e passa sem confirmação em `semi`/`full`.
 
 **O que nunca passa** (bloqueado em qualquer nível): formatar disco (`mkfs`, `dd` em
-dispositivo), fork bomb, desligar o sistema, e escrever ou remover em `/etc`, `/usr`,
-`/sys`, `/proc`, `/dev`, `/boot`, `/bin`, `/sbin`, `/var/lib` ou na raiz `/`.
+dispositivo), fork bomb, desligar o sistema, escrever ou remover em `/etc`, `/usr`,
+`/sys`, `/proc`, `/dev`, `/boot`, `/bin`, `/sbin`, `/var/lib` ou na raiz `/`, e apagar
+a home (`~`/`$HOME`), `/home` ou um ancestral do projeto.
+
+**`rm -rf` comum continua liberado a partir do nível `write`** — decisão explícita do
+projeto: remover `target/`, `node_modules/` ou uma pasta de build é rotina, não
+catástrofe. O bloqueio incondicional vale apenas para os alvos vitais acima.
 
 **Sem limite de iterações**: o agente trabalha até concluir a tarefa, ser interrompido
 por você (`Esc` ou `Ctrl+C`) ou a compactação de contexto não conseguir mais manter a
@@ -101,9 +127,61 @@ O que ainda pede confirmação em `semi`/`full` é só o que **perde dado sem vo
 Digite `/` e use Tab/Enter para completar (um comando parcial **não** é
 executado por acidente: Enter completa, o segundo Enter executa).
 
-`/help` lista todos os comandos com os argumentos reais: `/model`, `/chat`,
-`/agent`, `/plan`, `/permissions`, `/thinking`, `/history`, `/resume`, `/new`,
-`/projects`, `/processes`, `/skills`, `/config`, `/clear`, `/quit`.
+`/help` lista todos os comandos com os argumentos reais: `/model`, `/effort`,
+`/person`, `/skin`, `/chat`, `/agent`, `/plan`, `/permissions`, `/thinking`,
+`/undo`, `/diff`, `/cost`, `/stop`, `/history`, `/resume`, `/new`, `/projects`,
+`/processes`, `/analyze`, `/skills`, `/config`, `/clear`, `/quit`.
+
+## Comps e skins
+
+São duas camadas separadas: **Comps** mudam como o agente fala; **skins** mudam
+como a interface desenha.
+
+### Comps (`/person`)
+
+Um Comp é um nome e um bloco de instruções de comportamento (tom, estilo,
+prioridades). Ele nunca carrega permissão, modelo ou configuração — essas
+continuam sendo decisões suas e das regras de segurança. Um Comp fica ativo por
+sessão e entra no system prompt a partir do próximo turno.
+
+```text
+/person                    lista os Comps, qual está ativo e o custo em tokens
+/person new Lazy           abre o editor dentro do Kestrel
+/person use Lazy           ativa
+/person see Lazy           mostra as instruções e o custo estimado
+/person edit Lazy          reabre o editor com o conteúdo salvo
+/person remove Lazy        remove, com confirmação
+/person off                volta ao tom padrão
+```
+
+Os arquivos ficam fora do projeto, em `~/.config/kestrel/comps/<nome>.toml`. O
+nome vira o slug do arquivo (`Lazy` → `lazy`). Limites: 32 caracteres no nome,
+120 na descrição, 4000 nas instruções — um Comp curto e específico funciona
+melhor e custa menos contexto. No editor: Enter quebra linha, Ctrl+S salva e Esc
+cancela.
+
+O agente também pode criar Comps por pedido em linguagem natural, mas pela
+ferramenta dedicada `create_comp` — nunca pelo `write_file` genérico, e nunca
+removendo um Comp: remoção é sempre sua, pelo `/person remove`.
+
+### Skins (`/skin`)
+
+```text
+/skin                      mostra a skin atual e lista as disponíveis
+/skin mono                 troca na hora (a escolha fica salva)
+/skin daylight             tema claro
+KESTREL_SKIN=mono kestrel  força uma skin só nesta sessão
+```
+
+Prontas: `mono` (padrão: **preto/branco**, no estilo Claude Code), `kestrel`
+(cinza escuro) e `daylight` (claro). O `/skin` relê o diretório a cada uso,
+então skins criadas durante a sessão passam a valer na hora. Skins próprias ficam em
+`~/.config/kestrel/skins/<nome>.toml` e usam chaves de cor em `#rrggbb`
+(`fundo`, `superficie`, `texto`, `apagado`, `acento`, `acento_fraco`, `borda`,
+`borda_ativa`, `usuario`, `raciocinio`, `sucesso`, `falha`, `aviso`, `info`,
+`execucao`, `codigo_fundo`, `selecao_fundo`, `selecao_texto`). Campos ausentes
+herdam a skin `kestrel`, e o nome da skin é o nome do arquivo. Uma skin própria
+inválida é ignorada (não impede a interface de abrir).
 
 Os comandos são em inglês e **todos aceitam apelido em português** (`/modelo`,
 `/conversa`, `/agente`, `/limpar`, `/sair`, `/nova`, `/projetos`, `/analisar`,
@@ -112,52 +190,46 @@ perde o hábito.
 
 ## Pip
 
-O mascote é a imagem original do Pip (`assets/pip.png`, cópia fiel de
-`/home/nick/Assets/Pip/pip.png`, conferida por sha256), reamostrada pelo script
-`scripts/gerar_textura_pip.py` para a textura em `src/ui/pip_textura.rs`.
-Nenhum pixel é redesenhado à mão.
+O mascote é a **imagem original do Pip** (`assets/pip.png`, cópia fiel de
+`/home/nick/Assets/Pip/pip.png`, conferida por sha256). Não existe textura
+intermediária nem script de geração: o PNG é embutido no binário e renderizado
+pelo `ratatui-image`.
 
-A renderização usa meias-células (`▀`) com cor verdadeira, o que preserva a
-proporção do desenho em terminais comuns. A arte é geométrica: a massa branca
-do gato com a tinta (contorno e olhos) vazada em transparência — no terminal os
-furos deixam aparecer o fundo escuro do aplicativo, ou seja, a própria tinta do
-desenho.
+O espaço reservado é fixo: **6 colunas × 2 linhas**. O PNG é recortado na caixa
+opaca, redimensionado para a resolução de pixels dessa área e só então movido
+dentro dela. Assim o Pip **nunca passa de duas linhas** e não cobre a conversa.
 
-Há **uma única resolução**, escolhida a dedo: 3×2 texels = 3 colunas × **1
-linha**, a metade do tamanho anterior (que já era reflexo de uma redução ainda
-maior). A progressão inteira do mascote:
+A renderização usa o protocolo gráfico do terminal quando existe (Sixel, Kitty
+ou iTerm2) e cai para meias-células (`▀`/`▄`) do próprio `ratatui-image` quando
+não existe. A arte continua geométrica: a massa branca do gato com a tinta
+(contorno e olhos) vazada em transparência — no terminal os furos deixam
+aparecer o fundo do aplicativo, ou seja, a própria tinta do desenho.
 
-| versão | tamanho | onde aparecia |
-|--------|---------|----------------|
-| original | 28×34 texels = 17 linhas | companheiro fixo da conversa (coluna direita) |
-| 2ª | 20×24 texels = 12 linhas | assistente de configuração |
-| 3ª | 20×13 texels = 7 linhas | assistente de configuração |
-| 4ª | 6×4 texels = 2 linhas | indicador de trabalho |
-| **atual** | **3×2 texels = 1 linha** | indicador de trabalho e assistente |
+O ciclo tem 128 tiques e é determinístico: repouso respirando (e piscando),
+caminhada leve para a esquerda e volta, caminhada leve para a direita e volta,
+repouso de novo. Com a cadência de 120 ms durante o turno ativo, isso dá cerca
+de 15 segundos de ciclo.
 
-Hoje ele cabe em uma linha em qualquer lugar da interface:
+Onde ele aparece:
 
-- **junto ao campo de mensagem**, como indicador de trabalho: enquanto o modelo
-  pensa, executa ferramentas ou redige a resposta, o Pip respira e pisca no
-  lugar da antiga animação de pontos; quando o turno termina, ele sai de cena;
-- **no assistente de configuração**, com o estado (`contemplando`,
-  `raciocinando`, `ocioso`, …) logo abaixo.
+- **no rodapé da interface**, como indicador de trabalho: enquanto o modelo
+  pensa, executa ferramentas ou redige a resposta, o Pip respira, caminha e
+  pisca no lugar da antiga animação de pontos; quando o turno termina, ele sai
+  de cena;
+- **no assistente de configuração**, do mesmo tamanho, com o estado
+  (`contemplando`, `raciocinando`, `ocioso`, …) logo abaixo.
 
-O desenho é mínimo por decisão: nada de mascote grande ocupando a conversa.
 Limitações documentadas:
 
-- não há suporte a protocolos gráficos (sixel/kitty/iterm); nesses terminais o
-  Pip aparece como blocos coloridos, equivalentes aos demais;
+- terminais sem protocolo gráfico mostram o Pip em meias-células coloridas;
 - terminais sem cor verdadeira aproximam as cores;
 - com altura de terminal abaixo de 14 linhas o indicador dá lugar ao status
   compacto, para não espremer a conversa;
-- a animação tem somente respiração (deslocamento vertical de meio caractere,
-  sem mudar a altura ocupada) e piscada (os furos dos olhos fecham com a cor do
-  pelo, derivada dos olhos da própria imagem), desligada com
-  `ui.show_mascot = false`;
-- o fundo do aplicativo é um azul-acinzentado escuro (RGB 24,27,34), não
-  preto — preto absoluto parecia OLED e cansava a vista em sessões longas; e
-  todos os blocos usam cantos arredondados.
+- a animação é sempre contida dentro da mesma caixa de 6×2 e pode ser desligada
+  com `ui.show_mascot = false`;
+- o fundo do aplicativo é **preto** e o acento é branco, no estilo Claude Code
+  (a skin `daylight` mantém um tema claro separado); a conversa não usa caixa, e
+  apenas o campo de mensagem e os modais têm cantos arredondados.
 
 ## Raciocínio do modelo (`/thinking`)
 
@@ -177,8 +249,8 @@ pode rolar (PageUp/PageDown ou roda do mouse) e ler o histórico com calma. Para
 voltar ao estado mais recente:
 
 - role até o fim (com a roda ou PageDown) — isso já religa o acompanhamento;
-- ou clique no atalho `↓ voltar para o último`, que aparece no canto superior
-  direito do campo de mensagem enquanto você estiver fora do fim.
+- ou clique no atalho `↓ voltar para o último`, que aparece no canto direito do
+  rodapé enquanto você estiver fora do fim.
 
 ## Diretório inicial
 
@@ -190,6 +262,8 @@ desligue a fixação em `/config` ou apague os dois campos do `config.toml`.
 ## Dados e privacidade
 
 - Configuração: `~/.config/kestrel/config.toml`
+- Comps: `~/.config/kestrel/comps/<nome>.toml`
+- Skins próprias: `~/.config/kestrel/skins/<nome>.toml`
 - Banco (sessões, mensagens, auditoria, planos): `~/.local/share/kestrel/kestrel.db`
 - Histórico de entrada: `~/.local/share/kestrel/historico_entrada.txt`
 - Chaves de API são lidas apenas de variáveis de ambiente (`NVIDIA_API_KEY` por
@@ -205,11 +279,5 @@ cargo test
 cargo build --release
 ```
 
-A regeneração da textura do Pip é opcional (só quando `assets/pip.png` mudar):
-
-```bash
-python3 scripts/gerar_textura_pip.py    # requer Pillow e numpy; aplica rustfmt sozinho
-```
-
-Se `rustfmt` não estiver no `PATH`, rode `cargo fmt` depois de regenerar,
-para o arquivo seguir o mesmo estilo do restante do código.
+O PNG do Pip é embutido no binário em tempo de compilação. Se `assets/pip.png`
+mudar, basta recompilar — não há textura gerada nem passo extra.

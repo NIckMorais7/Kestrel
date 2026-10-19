@@ -19,6 +19,15 @@ use tokio_util::sync::CancellationToken;
 /// resposta malformada (ou hostil) e não deve virar alocação sem limite.
 const MAX_CHAMADAS_PARCIALS: usize = 64;
 
+/// Teto para o `Retry-After` do provedor. Um valor absurdo (horas/dias) não
+/// pode deixar o agente dormindo: acima disso, vale este limite.
+const RETRY_AFTER_MAX_SECS: u64 = 60;
+
+/// Espera pedida pelo provedor, limitada ao teto.
+fn espera_retry_after(segundos: u64) -> Duration {
+    Duration::from_secs(segundos.min(RETRY_AFTER_MAX_SECS))
+}
+
 /// Cliente compatível com OpenAI.
 pub struct OpenAiCompatProvider {
     base_url: String,
@@ -40,9 +49,15 @@ impl OpenAiCompatProvider {
         reasoning_effort: Option<String>,
     ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs.max(10)))
+            // `timeout` é o prazo total da requisição — numa resposta em
+            // streaming ele cortaria uma geração longa mesmo recebendo dados.
+            // `read_timeout` mede a pausa entre leituras, que é o que importa.
+            .read_timeout(Duration::from_secs(timeout_secs.max(10)))
             .connect_timeout(Duration::from_secs(20))
-            .user_agent("Kestrel/0.1 (agente de codificação)")
+            .user_agent(format!(
+                "Kestrel/{} (agente de codificação)",
+                env!("CARGO_PKG_VERSION")
+            ))
             .build()?;
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -147,7 +162,7 @@ impl OpenAiCompatProvider {
                     if erro.transitorio() && tentativa < self.max_retries {
                         tentativa += 1;
                         let espera = retry_after
-                            .map(Duration::from_secs)
+                            .map(espera_retry_after)
                             .unwrap_or_else(|| backoff(tentativa));
                         tracing_sleep(espera, cancel).await?;
                         continue;
@@ -237,13 +252,18 @@ impl OpenAiCompatProvider {
     ) -> Result<Completion, ProviderError> {
         let mut body = self.corpo(req);
         body["stream"] = json!(true);
+        // Pede o bloco de `usage` no fim do stream (extensão padrão da API
+        // OpenAI). Sem ele, provedores compatíveis não informam tokens e
+        // `/cost`/estatísticas ficam zerados.
+        body["stream_options"] = json!({"include_usage": true});
         let resp = self.enviar_com_retentativas(&body, cancel).await?;
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
         let mut completion = Completion {
-            finish_reason: "stop".into(),
+            finish_reason: String::new(),
             ..Default::default()
         };
+        let mut viu_done = false;
         let mut parciais: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
 
         'leitura: loop {
@@ -269,6 +289,7 @@ impl OpenAiCompatProvider {
                     // Fim do stream: o `[DONE]` encerra a leitura. Sem sair
                     // também do laço externo, a conexão keep-alive do provedor
                     // deixaria o turno pendurado até o timeout.
+                    viu_done = true;
                     break 'leitura;
                 }
                 let valor: Value = match serde_json::from_str(dados) {
@@ -317,7 +338,7 @@ impl OpenAiCompatProvider {
                         let index = c.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                         // Um `index` absurdo (resposta malformada ou hostil) não
                         // pode virar alocação sem limite.
-                        if index > MAX_CHAMADAS_PARCIALS as u64 {
+                        if index >= MAX_CHAMADAS_PARCIALS as u64 {
                             continue;
                         }
                         let index = index as usize;
@@ -331,11 +352,31 @@ impl OpenAiCompatProvider {
                             slot.0 = id.to_string();
                         }
                         if let Some(func) = c.get("function") {
-                            if let Some(nome) = func.get("name").and_then(|n| n.as_str()) {
-                                slot.1.push_str(nome);
+                            // Alguns provedores repetem o nome em cada delta:
+                            // concatenar produzia `read_fileread_file`. O
+                            // primeiro valor é o nome real; fragmentar nome não
+                            // é um caso previsto pelo protocolo.
+                            if let Some(nome) = func.get("name").and_then(|n| n.as_str())
+                                && slot.1.is_empty()
+                            {
+                                slot.1 = nome.to_string();
                             }
-                            if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                                slot.2.push_str(args);
+                            // A NVIDIA às vezes devolve `arguments` como objeto
+                            // em vez de texto. Converter aqui preserva os
+                            // argumentos em vez de substituí-los por `{}`.
+                            if let Some(args) = func.get("arguments") {
+                                match args {
+                                    Value::String(fatia) if !fatia.is_empty() => {
+                                        slot.2.push_str(fatia);
+                                    }
+                                    Value::Object(_) | Value::Array(_) => {
+                                        let texto = serde_json::to_string(args).unwrap_or_default();
+                                        if slot.2.trim().is_empty() {
+                                            slot.2 = texto;
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                         if let Some(s) = &sink {
@@ -370,6 +411,21 @@ impl OpenAiCompatProvider {
                 },
             });
         }
+        // Um stream que fecha sem `[DONE]` **nem** `finish_reason` foi cortado
+        // no meio (queda de rede/proxy): devolver como sucesso entregava uma
+        // resposta pela metade ao usuário.
+        if completion.finish_reason.is_empty() {
+            if !viu_done {
+                return Err(ProviderError::RespostaInvalida(
+                    "o stream terminou sem `[DONE]` nem `finish_reason`: resposta truncada".into(),
+                ));
+            }
+            completion.finish_reason = if completion.tool_calls.is_empty() {
+                "stop".into()
+            } else {
+                "tool_calls".into()
+            };
+        }
         Ok(completion)
     }
 }
@@ -383,10 +439,11 @@ fn mensagem_json(m: &ChatMessage) -> Value {
             .tool_calls
             .iter()
             .map(|tc| {
+                let segura = tc.com_argumentos_validos();
                 json!({
-                    "id": tc.id,
+                    "id": segura.id,
                     "type": "function",
-                    "function": { "name": tc.name, "arguments": tc.arguments }
+                    "function": { "name": segura.name, "arguments": segura.arguments }
                 })
             })
             .collect();
@@ -401,6 +458,21 @@ fn mensagem_json(m: &ChatMessage) -> Value {
     Value::Object(obj)
 }
 
+fn argumentos_de_chamada(func: &Value) -> String {
+    match func.get("arguments") {
+        // Texto é o formato canônico. Preserva até quando está quebrado: a
+        // validação do agente detecta o problema e devolve um erro útil.
+        Some(Value::String(texto)) if !texto.trim().is_empty() => texto.to_string(),
+        // Compatibilidade com provedores que devolvem objeto/array em vez de
+        // texto (bug conhecido da NVIDIA). O array continua sendo rejeitado
+        // mais tarde, mas agora com o conteúdo real, não com `{}`.
+        Some(objeto @ Value::Object(_)) | Some(objeto @ Value::Array(_)) => {
+            serde_json::to_string(objeto).unwrap_or_else(|_| "{}".to_string())
+        }
+        _ => "{}".to_string(),
+    }
+}
+
 fn parse_tool_call(valor: &Value) -> Option<ToolCall> {
     let func = valor.get("function")?;
     Some(ToolCall {
@@ -410,11 +482,7 @@ fn parse_tool_call(valor: &Value) -> Option<ToolCall> {
             .unwrap_or("call_0")
             .to_string(),
         name: func.get("name").and_then(|n| n.as_str())?.to_string(),
-        arguments: func
-            .get("arguments")
-            .and_then(|a| a.as_str())
-            .unwrap_or("{}")
-            .to_string(),
+        arguments: argumentos_de_chamada(func),
     })
 }
 
@@ -661,6 +729,40 @@ mod tests {
             .expect("cliente de teste")
     }
 
+    #[test]
+    fn tool_calls_invalidas_nao_voltam_como_json_quebrado() {
+        let mensagem = ChatMessage::assistant_with_calls(
+            "vou tentar",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{\"path\": \"README.md\"".into(),
+            }],
+        );
+        let valor = mensagem_json(&mensagem);
+        let args = valor["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments em texto");
+        // É exatamente este campo que, quando quebrado, provoca
+        // `HTTP 400 ... must be a valid json` no próximo turno.
+        let _: Value = serde_json::from_str(args).expect("arguments válidos");
+        assert_eq!(args, "{}");
+    }
+
+    #[test]
+    fn parse_tool_call_aceita_arguments_objeto_da_nvidia() {
+        let valor = json!({
+            "id": "call_1",
+            "function": {
+                "name": "read_file",
+                "arguments": {"path": "README.md"}
+            }
+        });
+        let chamada = parse_tool_call(&valor).expect("tool call");
+        assert_eq!(chamada.name, "read_file");
+        assert_eq!(chamada.arguments, "{\"path\":\"README.md\"}");
+    }
+
     #[tokio::test]
     async fn stream_termina_no_done_sem_pendurar() {
         let corpo = concat!(
@@ -881,6 +983,79 @@ mod tests {
         let e = classificar_status(500, "erro interno do servidor", None);
         assert!(e.to_string().contains("erro interno"));
         assert!(e.transitorio());
+    }
+
+    #[tokio::test]
+    async fn stream_sem_done_nem_finish_reason_e_truncado() {
+        // Conexão caiu no meio: sem final explícito, não é uma resposta
+        // completa (antes passava como sucesso com o texto parcial).
+        let corpo = "data: {\"choices\":[{\"delta\":{\"content\":\"parcial\"}}]}\n\n";
+        let (base, _reqs) = servir_sse(corpo.to_string(), 64, 0).await;
+        let p = cliente(&base);
+        let erro = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect_err("stream truncado deveria falhar");
+        assert!(erro.to_string().contains("truncada"), "{erro}");
+    }
+
+    #[tokio::test]
+    async fn stream_sem_done_com_finish_reason_e_aceito() {
+        // Alguns compatíveis omitem `[DONE]`, mas enviam `finish_reason` na
+        // última escolha: isso é final explícito e deve ser aceito.
+        let corpo =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let (base, _reqs) = servir_sse(corpo.to_string(), 64, 0).await;
+        let p = cliente(&base);
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect("finish_reason basta como final do stream");
+        assert_eq!(saida.text, "ok");
+        assert_eq!(saida.finish_reason, "stop");
+    }
+
+    #[tokio::test]
+    async fn nome_de_tool_repetido_nao_duplica() {
+        // Alguns provedores repetem o nome em cada delta; concatenar produzia
+        // `read_fileread_file`.
+        let corpo = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base, _reqs) = servir_sse(corpo.to_string(), 17, 0).await;
+        let p = cliente(&base);
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("leia")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect("stream deveria funcionar");
+        assert_eq!(saida.tool_calls.len(), 1);
+        assert_eq!(saida.tool_calls[0].name, "read_file");
+        assert_eq!(saida.finish_reason, "tool_calls");
+    }
+
+    #[test]
+    fn retry_after_gigante_e_limitado() {
+        // Um servidor pode pedir horas de espera; o teto evita dormir para
+        // sempre (e o usuário não fica sem feedback).
+        assert_eq!(espera_retry_after(5), Duration::from_secs(5));
+        assert_eq!(
+            espera_retry_after(86_400),
+            Duration::from_secs(RETRY_AFTER_MAX_SECS)
+        );
     }
 
     #[test]

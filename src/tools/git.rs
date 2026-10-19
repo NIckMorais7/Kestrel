@@ -12,17 +12,18 @@ use std::path::PathBuf;
 
 /// Executa um comando git no diretório do projeto.
 async fn git(ctx: &ToolContext, args: &[&str]) -> Result<(bool, String), ToolError> {
-    let saida = tokio::process::Command::new("git")
-        .args(args)
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args)
         .current_dir(&ctx.workdir)
-        .output()
-        .await
-        .map_err(|e| {
-            ToolError::msg(format!(
-                "não foi possível executar `git {}`: {e}. O git está instalado?",
-                args.join(" ")
-            ))
-        })?;
+        // Se o future for descartado (timeout/cancelamento do registro), o
+        // processo git não pode continuar rodando órfão.
+        .kill_on_drop(true);
+    let saida = cmd.output().await.map_err(|e| {
+        ToolError::msg(format!(
+            "não foi possível executar `git {}`: {e}. O git está instalado?",
+            args.join(" ")
+        ))
+    })?;
     let mut texto = String::from_utf8_lossy(&saida.stdout).to_string();
     let erros = String::from_utf8_lossy(&saida.stderr);
     if !erros.trim().is_empty() {
@@ -40,6 +41,28 @@ fn eh_repositorio_hint(erro: &str) -> String {
     } else {
         String::new()
     }
+}
+
+/// Valida o alvo do diff: um dos modos conhecidos ou uma revisão.
+///
+/// Sem isto, `alvo: "--output=/caminho"` virava argumento do git e gravava um
+/// arquivo arbitrário (inclusive fora do projeto), driblando todo o controle
+/// de caminhos da ferramenta.
+fn validar_revisao(alvo: &str) -> Result<(), ToolError> {
+    let valido = !alvo.is_empty()
+        && !alvo.starts_with('-')
+        && !alvo.contains(char::is_whitespace)
+        && !alvo.contains('=')
+        && alvo.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '/' | '~' | '^' | '@' | '{' | '}' | '-')
+        });
+    if !valido {
+        return Err(ToolError::Argumentos(format!(
+            "alvo de diff inválido: `{alvo}`. Use working, staged, ultimo_commit ou uma revisão (ex.: HEAD~2)."
+        )));
+    }
+    Ok(())
 }
 
 pub struct GitStatus;
@@ -185,7 +208,10 @@ impl Tool for GitDiff {
                 "--patch".into(),
                 "HEAD".into(),
             ],
-            revisao => vec!["diff".into(), revisao.into()],
+            revisao => {
+                validar_revisao(revisao)?;
+                vec!["diff".into(), revisao.into()]
+            }
         };
         base.push("--".into());
         if let Some(c) = &caminho {
@@ -629,6 +655,7 @@ pub(crate) mod tests {
             permitidos: Arc::new(Mutex::new(std::collections::HashSet::new())),
             skills: Arc::new(SkillRegistry::vazio()),
             skills_dir: dir.join("skills"),
+            comps_dir: dir.join("comps"),
             projeto: Arc::new(ProjectInfo::default()),
             web: WebConfig::default(),
             http: reqwest::Client::new(),
@@ -691,6 +718,43 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(lista.conteudo.contains("feature/kestrel"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `alvo` é argumento do git: `--output=…` gravava arquivo arbitrário.
+    #[tokio::test]
+    async fn diff_recusa_alvo_que_parece_flag() {
+        let dir = repo_temporario().await;
+        let ctx = contexto(&dir);
+        let destino = dir.join("escrito-pelo-git.txt");
+        let alvo = format!("--output={}", destino.display());
+        let erro = GitDiff
+            .executar(json!({"alvo": alvo}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(erro.to_string().contains("alvo de diff inválido"), "{erro}");
+        assert!(!destino.exists(), "o git não pode ter gravado o arquivo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn diff_aceita_revisao_simples() {
+        let dir = repo_temporario().await;
+        std::fs::write(dir.join("a.txt"), "1").unwrap();
+        let ctx = contexto(&dir);
+        GitStage
+            .executar(json!({"caminhos": ["a.txt"]}), &ctx)
+            .await
+            .unwrap();
+        GitCommit
+            .executar(json!({"mensagem": "a"}), &ctx)
+            .await
+            .unwrap();
+        let saida = GitDiff
+            .executar(json!({"alvo": "HEAD~1..HEAD"}), &ctx)
+            .await
+            .unwrap();
+        assert!(saida.conteudo.contains("a.txt"), "{}", saida.conteudo);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

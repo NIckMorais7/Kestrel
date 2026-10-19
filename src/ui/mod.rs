@@ -6,17 +6,16 @@
 pub mod input;
 pub mod markdown;
 pub mod mascot;
-pub mod pip_textura;
 pub mod setup;
 pub mod theme;
 
 use crate::app::{App, Modal, Seletor};
 use crate::events::EstadoProcesso;
-use crate::ui::mascot::{EstadoMascote, TamanhoMascote};
+use crate::ui::mascot::EstadoMascote;
 use crossterm::event as ct;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use std::sync::Mutex;
@@ -72,117 +71,93 @@ pub fn desenhar(f: &mut Frame, app: &mut App) {
     // o indicador cresce acima do campo de mensagem (duas linhas) e volta ao
     // normal quando o turno termina. Em terminais baixos ele dá lugar ao
     // status compacto.
-    let mostrar_pip = app.turno_ativo && app.config.ui.show_mascot && area.height >= 14;
-    let altura_status = if mostrar_pip {
-        mascot::linhas_ocupadas(TamanhoMascote::Mini)
-    } else {
-        1
-    };
-    let [cabecalho, corpo, barra, status, area_entrada] = Layout::vertical([
-        Constraint::Length(1),
+    let mostrar_pip = app.turno_ativo
+        && app.config.ui.show_mascot
+        && app.pip_grafico.is_some()
+        && area.height >= 14;
+    let altura_status = if mostrar_pip { mascot::LINHAS + 1 } else { 1 };
+    // Em telas com folga, o campo de mensagem desce uma linha: a conversa
+    // respira melhor e o Pip não encosta na caixa de entrada.
+    let respiro = if area.height >= 16 { 2 } else { 1 };
+    // Três faixas, como o Claude Code/Hermes: cabeçalho, conversa e rodapé.
+    // O campo de mensagem fica logo acima do rodapé; o respiro separa a
+    // conversa da caixa de entrada sem desenhar mais uma borda.
+    let [cabecalho, corpo, _respiro, area_entrada, status] = Layout::vertical([
+        Constraint::Length(2),
         Constraint::Min(5),
-        Constraint::Length(1),
-        Constraint::Length(altura_status),
+        Constraint::Length(respiro),
         Constraint::Length(altura_entrada),
+        Constraint::Length(altura_status),
     ])
     .areas(area);
 
     desenhar_cabecalho(f, app, cabecalho);
     desenhar_conversa(f, app, corpo);
-    desenhar_barra_estado(f, app, barra);
-    desenhar_status(f, app, status, mostrar_pip);
     desenhar_entrada(f, app, area_entrada);
     desenhar_sugestoes(f, app, area_entrada);
+    desenhar_status(f, app, status, mostrar_pip);
     desenhar_modal(f, app, area);
 }
 
-/// Linha superior: só o projeto (e o branch), sem o rótulo "Kestrel".
+/// Cabeçalho em duas linhas, sem caixa e sem provedor:
 ///
-/// Modelo, modo, permissão e contexto foram para a barra acima do campo de
-/// mensagem (`desenhar_barra_estado`), onde ficam perto de onde o usuário
-/// digita — o topo fica limpo para a conversa.
+/// ```text
+///  ◆ Kestrel v0.4.0   modelo/teste · high
+///  ~/Projetos/Kestrel (master) · build · Semi
+/// ```
 fn desenhar_cabecalho(f: &mut Frame, app: &App, area: Rect) {
-    let projeto = crate::util::caminho_curto(&app.config.workdir(), 48);
-    let mut spans = vec![Span::styled(format!(" {projeto}"), theme::apagado())];
-    if let Some(branch) = &app.projeto.git_branch {
-        spans.push(Span::styled(format!(" ({branch})"), theme::apagado()));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-/// Barra com modelo, provedor, modo, permissão e contexto, logo acima do campo
-/// de mensagem.
-fn desenhar_barra_estado(f: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![Span::styled(
-        crate::util::truncate(&app.modelo, 44),
-        theme::texto(),
-    )];
+    let mut titulo = vec![
+        Span::styled(" ◆ ", theme::titulo()),
+        Span::styled("Kestrel", theme::titulo()),
+        Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), theme::apagado()),
+        Span::styled("   ", theme::apagado()),
+        Span::styled(crate::util::truncate(&app.modelo, 42), theme::texto()),
+    ];
     if let Some(esforco) = &app.esforco {
-        spans.push(Span::styled(format!(" · {esforco}"), theme::apagado()));
+        titulo.push(Span::styled(format!(" · {esforco}"), theme::apagado()));
     }
-    spans.push(Span::styled(
-        format!(" · {}", app.config.provider.id),
-        theme::apagado(),
-    ));
-    spans.push(Span::styled("  │  modo ", theme::borda()));
-    spans.push(Span::styled(
+    // Provedor não fica no cabeçalho: `nvidia` é detalhe de configuração e
+    // poluía o topo. Ele continua disponível em `/config` e `/model`.
+
+    let projeto = crate::util::caminho_curto(&app.config.workdir(), 52);
+    let mut contexto = vec![Span::styled(format!(" {projeto}"), theme::apagado())];
+    if let Some(branch) = &app.projeto.git_branch {
+        contexto.push(Span::styled(format!(" ({branch})"), theme::apagado()));
+    }
+    contexto.push(Span::styled(" · modo ", theme::apagado()));
+    contexto.push(Span::styled(
         app.modo.label().to_string(),
         if app.modo == crate::config::ModoOperacao::Chat {
-            theme::rotulo()
+            theme::apagado()
         } else {
-            Style::default()
-                .fg(Color::Rgb(140, 220, 170))
-                .add_modifier(Modifier::BOLD)
+            theme::acento()
         },
     ));
-    spans.push(Span::styled("  │  permissão ", theme::borda()));
-    spans.push(Span::styled(
+    contexto.push(Span::styled(" · permissão ", theme::apagado()));
+    contexto.push(Span::styled(
         app.nivel.label().to_string(),
-        Style::default()
-            .fg(theme::cor_nivel(app.nivel))
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::cor_nivel(app.nivel)),
     ));
-    // Custo real da sessão, quando já houve alguma resposta do provedor.
-    if app.token_total.0 + app.token_total.1 > 0 {
-        let total = app.token_total.0 + app.token_total.1;
-        spans.push(Span::styled("  │  ", theme::borda()));
-        spans.push(Span::styled(
-            format!("{} tok", crate::util::formatar_num(total)),
-            theme::apagado(),
-        ));
+    if let Some(comp) = &app.config.ui.active_comp {
+        contexto.push(Span::styled(" · comp ", theme::apagado()));
+        contexto.push(Span::styled(comp.clone(), theme::titulo()));
     }
-    // O raciocínio só é mencionado quando está visível.
-    if app.mostrar_raciocinio {
-        spans.push(Span::styled("  │  thinking ", theme::borda()));
-        spans.push(Span::styled("on", theme::rotulo()));
-    }
-    // Contexto só aparece quando de fato importa (perto do limite).
-    if app.contexto.1 > 0 {
-        let fracao = app.contexto.0 as f32 / app.contexto.1.max(1) as f32;
-        if fracao >= 0.7 {
-            spans.push(Span::styled("  │  contexto ", theme::borda()));
-            spans.push(Span::styled(
-                format!("{:.0}%", fracao * 100.0),
-                Style::default().fg(theme::cor_contexto(fracao)),
-            ));
-        }
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    f.render_widget(
+        Paragraph::new(Text::from(vec![Line::from(titulo), Line::from(contexto)])),
+        area,
+    );
 }
 
 fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
-    let titulo = if app.sessao_titulo.is_empty() {
-        " conversa ".to_string()
-    } else {
-        format!(
-            " conversa — {} ",
-            crate::util::truncate(&app.sessao_titulo, 50)
-        )
+    // A conversa não tem caixa: espaço vazio separa melhor que mais uma borda.
+    // O padding de 2 células alinha o texto com o cabeçalho e o rodapé.
+    let interno = Rect {
+        x: area.x + 2,
+        y: area.y,
+        width: area.width.saturating_sub(4).max(1),
+        height: area.height,
     };
-    let bloco = theme::bloco()
-        .border_style(theme::borda())
-        .title(Span::styled(titulo, theme::rotulo()));
-    let interno = bloco.inner(area);
     let largura = interno.width.max(1) as usize;
 
     // Estado vazio: uma recepção curta em vez de uma tela sem nada.
@@ -190,28 +165,32 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
         let linhas: Vec<Line<'static>> = vec![
             Line::default(),
             Line::from(vec![
-                Span::styled("  Bem-vindo ao Kestrel. ", theme::titulo()),
-                Span::styled("Descreva a tarefa em linguagem natural.", theme::texto()),
+                Span::styled("◆ ", theme::titulo()),
+                Span::styled("Kestrel", theme::titulo()),
+                Span::styled("  agente de codificação para o terminal", theme::apagado()),
             ]),
             Line::default(),
+            Line::from(Span::styled(
+                "Bem-vindo ao Kestrel. Descreva a tarefa em linguagem natural.",
+                theme::texto(),
+            )),
+            Line::default(),
             Line::from(vec![
-                Span::styled("  /help", theme::rotulo()),
-                Span::styled(" lista os comandos · ", theme::apagado()),
-                Span::styled("/model", theme::rotulo()),
-                Span::styled(" troca o modelo · ", theme::apagado()),
-                Span::styled("/chat", theme::rotulo()),
-                Span::styled(" e ", theme::apagado()),
+                Span::styled("/help", theme::rotulo()),
+                Span::styled("  comandos", theme::apagado()),
+                Span::styled("     /model", theme::rotulo()),
+                Span::styled("  troca o modelo", theme::apagado()),
+            ]),
+            Line::from(vec![
                 Span::styled("/agent", theme::rotulo()),
-                Span::styled(" trocam o modo · ", theme::apagado()),
-                Span::styled("/permissions", theme::rotulo()),
-                Span::styled(" ajusta o nível", theme::apagado()),
+                Span::styled("  modo build", theme::apagado()),
+                Span::styled("   /plan", theme::rotulo()),
+                Span::styled("  plano da sessão", theme::apagado()),
             ]),
         ];
         f.render_widget(
-            Paragraph::new(Text::from(linhas))
-                .block(bloco)
-                .wrap(Wrap { trim: false }),
-            area,
+            Paragraph::new(Text::from(linhas)).wrap(Wrap { trim: false }),
+            interno,
         );
         return;
     }
@@ -230,15 +209,14 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
     let scroll = app.scroll;
 
     let paragrafo = Paragraph::new(app.linhas.as_slice())
-        .block(bloco)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
-    f.render_widget(paragrafo, area);
+    f.render_widget(paragrafo, interno);
 
     // Indicador de rolagem quando o usuário saiu do fim.
     if !app.seguir_fim && max_scroll > 0 {
         let indicador = format!(" ↑ {scroll}/{max_scroll} ");
-        let largura_ind = indicador.chars().count() as u16;
+        let largura_ind = unicode_width::UnicodeWidthStr::width(indicador.as_str()) as u16;
         if area.width > largura_ind + 2 {
             let destino = Rect {
                 x: area.x + area.width - largura_ind - 1,
@@ -255,66 +233,78 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect, mostrar_pip: bool) {
-    // Enquanto o modelo trabalha, o Pip animado fica à esquerda do texto de
-    // estado, na própria linha (ele tem uma linha de altura). Sem o `>= 1`,
-    // com o Pip de 1 linha a guarda `area.height > 1` Nunca o desenhava e o
-    // indicador voltava a ser o antigo "●".
+    // Rodapé no estilo Claude Code: estado à esquerda, atalhos à direita.
+    // O Pip é uma imagem real de 6×2; o escape do protocolo gráfico fica na
+    // primeira célula da área, então a imagem é o **último** widget desenhado.
     let desenhando_pip =
-        mostrar_pip && area.height >= 1 && area.width > mascot::colunas(TamanhoMascote::Mini) + 20;
+        mostrar_pip && area.height >= mascot::LINHAS && area.width > mascot::COLUNAS + 24;
     let linha_texto = area.y + area.height.saturating_sub(1);
-    if desenhando_pip {
-        let linhas_pip = mascot::linhas(TamanhoMascote::Mini, app.pip);
-        let largura_pip = mascot::colunas(TamanhoMascote::Mini);
-        let destino = Rect {
-            x: area.x + 1,
-            y: linha_texto.saturating_sub(linhas_pip.len().saturating_sub(1) as u16),
-            width: largura_pip.min(area.width.saturating_sub(2)),
-            height: (linhas_pip.len() as u16).min(area.height),
-        };
-        f.render_widget(Paragraph::new(Text::from(linhas_pip)), destino);
-    }
-    let mut spans = Vec::new();
     let deslocamento_texto = if desenhando_pip {
-        mascot::colunas(TamanhoMascote::Mini) + 3
+        mascot::COLUNAS + 3
     } else {
-        0
+        1
     };
+
+    let estilo_estado = match app.estado {
+        EstadoMascote::Erro => theme::falha(),
+        EstadoMascote::Concluindo => theme::sucesso(),
+        EstadoMascote::Ocioso => theme::apagado(),
+        _ => theme::em_execucao(),
+    };
+    let mut spans = Vec::new();
     if !desenhando_pip {
-        let estilo_icone = match app.estado {
-            EstadoMascote::Erro => theme::falha(),
-            EstadoMascote::Concluindo => theme::sucesso(),
-            EstadoMascote::Ocioso => theme::apagado(),
-            _ => theme::em_execucao(),
-        };
-        spans.push(Span::styled(" ● ".to_string(), estilo_icone));
-    }
-    spans.push(Span::styled(
-        app.estado_texto.clone(),
-        if desenhando_pip {
-            theme::em_execucao()
+        // O marcador pulsa enquanto há trabalho; parado, fica no acento fixo.
+        let estilo_marcador = if app.turno_ativo {
+            theme::pulso(app.tick, true)
         } else {
-            theme::texto()
-        },
-    ));
-    if app.turno_ativo {
+            estilo_estado
+        };
+        spans.push(Span::styled("● ".to_string(), estilo_marcador));
+    }
+    spans.push(Span::styled(app.estado_texto.clone(), estilo_estado));
+    if app.token_total.0 + app.token_total.1 > 0 {
+        let total = app.token_total.0 + app.token_total.1;
         spans.push(Span::styled(
-            "   Ctrl+C ou Esc interrompe",
+            format!(" · {} tok", crate::util::formatar_num(total)),
             theme::apagado(),
         ));
-    } else if !app.saindo {
-        // Enquanto encerra, o próprio estado já diz o que está acontecendo.
-        spans.push(Span::styled("   enter envia · /help", theme::apagado()));
+    }
+    if app.contexto.1 > 0 {
+        let fracao = app.contexto.0 as f32 / app.contexto.1.max(1) as f32;
+        if fracao >= 0.7 {
+            spans.push(Span::styled(" · contexto ", theme::apagado()));
+            spans.push(Span::styled(
+                format!("{:.0}%", fracao * 100.0),
+                Style::default().fg(theme::cor_contexto(fracao)),
+            ));
+        }
+    }
+    if app.mostrar_raciocinio {
+        spans.push(Span::styled(" · thinking ", theme::apagado()));
+        spans.push(Span::styled("on", theme::acento()));
+    }
+    let ativos = app
+        .processos
+        .iter()
+        .filter(|p| p.estado == EstadoProcesso::Executando)
+        .count();
+    // Skills saíram do rodapé: para conferir skills existe `/skills`. Só um
+    // aviso de processo ativo continua, porque indica trabalho real em curso.
+    if ativos > 0 {
+        spans.push(Span::styled(
+            format!(" · processos {ativos}"),
+            theme::apagado(),
+        ));
     }
 
-    // Canto superior direito do campo de mensagem: quando o usuário se afasta
-    // do fim, o espaço que antes mostrava a contagem de skills vira o atalho
-    // clicável para voltar ao estado mais recente.
+    // Atalhos à direita. Quando o usuário saiu do fim, o único atalho é o
+    // clique para voltar — o mesmo comportamento de antes.
     let indicadores: String;
     let estilo_indicadores: Style;
     let mut area_botao: Option<Rect> = None;
     if !app.seguir_fim {
         indicadores = " ↓ voltar para o último ".to_string();
-        estilo_indicadores = theme::rotulo();
+        estilo_indicadores = theme::titulo();
         let largura = crate::util::largura_texto(&indicadores) as u16;
         area_botao = Some(Rect {
             x: area.x + area.width.saturating_sub(largura + 1),
@@ -322,18 +312,12 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect, mostrar_pip: bool) 
             width: largura + 1,
             height: 1,
         });
+    } else if app.turno_ativo {
+        indicadores = " Ctrl+C interrompe ".to_string();
+        estilo_indicadores = theme::apagado();
     } else {
-        let skills = app.skills.all().len();
-        let ativos = app
-            .processos
-            .iter()
-            .filter(|p| p.estado == EstadoProcesso::Executando)
-            .count();
-        let mut texto = format!("skills {skills} ");
-        if ativos > 0 {
-            texto = format!("skills {skills} · processos {ativos} ");
-        }
-        indicadores = texto;
+        // Sem “enter envia”: o campo já é evidente. O canto fica vazio.
+        indicadores = String::new();
         estilo_indicadores = theme::apagado();
     }
     let largura_indicadores = crate::util::largura_texto(&indicadores) as u16;
@@ -342,15 +326,14 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect, mostrar_pip: bool) 
         .map(|s| crate::util::largura_texto(&s.content) as u16)
         .sum::<u16>()
         + deslocamento_texto;
-    let linha = Line::from(spans);
     let destino_texto = Rect {
         x: area.x + deslocamento_texto,
         y: linha_texto,
         width: area.width.saturating_sub(deslocamento_texto),
         height: 1,
     };
-    f.render_widget(Paragraph::new(linha), destino_texto);
-    if largura_esquerda + largura_indicadores + 2 < area.width {
+    f.render_widget(Paragraph::new(Line::from(spans)), destino_texto);
+    if !indicadores.is_empty() && largura_esquerda + largura_indicadores + 2 < area.width {
         let destino = Rect {
             x: area.x + area.width - largura_indicadores - 1,
             y: linha_texto,
@@ -362,30 +345,55 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect, mostrar_pip: bool) 
             destino,
         );
     }
+
+    // Por último: a imagem do Pip. O texto começa em `COLUNAS + 3`, então não
+    // há sobreposição com a área da imagem.
+    if desenhando_pip && let Some(pip) = &app.pip_grafico {
+        let destino = Rect {
+            x: area.x + 1,
+            y: area.y + area.height.saturating_sub(mascot::LINHAS),
+            width: mascot::COLUNAS.min(area.width.saturating_sub(2)),
+            height: mascot::LINHAS.min(area.height),
+        };
+        pip.desenhar(f, destino, app.pip);
+    }
     // A interface usa a mesma área para decidir o clique.
     app.area_voltar = area_botao;
 }
 
 fn desenhar_entrada(f: &mut Frame, app: &mut App, area: Rect) {
-    // Sem título "mensagem" e sem dica de redirecionamento: o campo é
-    // evidente por si e a dica só ocupava uma linha da conversa.
-    let bloco = theme::bloco().border_style(theme::borda_ativa());
+    // Campo de mensagem no estilo Claude Code: caixa arredondada, superfície
+    // levemente elevada e o glifo `❯` no acento. O texto começa duas células
+    // depois da borda: uma para o glifo e uma de padding.
+    let bloco = theme::bloco()
+        .border_style(theme::borda_ativa())
+        .style(theme::superficie());
     let interno = bloco.inner(area);
+    f.render_widget(bloco, area);
+    if interno.width < 3 || interno.height == 0 {
+        return;
+    }
 
+    let texto_area = Rect {
+        x: interno.x + 2,
+        y: interno.y,
+        width: interno.width.saturating_sub(2),
+        height: interno.height,
+    };
     let (linha_cursor, coluna_cursor) = app.entrada.posicao_cursor();
     let linhas_texto: Vec<&str> = app.entrada.texto().split('\n').collect();
     let (scroll_v, scroll_h) = calcular_rolagem(
         &linhas_texto,
         linha_cursor,
         coluna_cursor,
-        interno.width as usize,
-        interno.height as usize,
+        texto_area.width as usize,
+        texto_area.height as usize,
     );
 
     let mut linhas_render: Vec<Line<'static>> = Vec::new();
     if app.entrada.vazio() {
         linhas_render.push(Line::from(Span::styled(
-            "ex.: adicione testes para o módulo de configuração e rode cargo test",
+            "descreva a tarefa em linguagem natural…",
             theme::apagado(),
         )));
     } else {
@@ -393,25 +401,37 @@ fn desenhar_entrada(f: &mut Frame, app: &mut App, area: Rect) {
             let recorte: String = linha
                 .chars()
                 .skip(scroll_h)
-                .take(interno.width as usize)
+                .take(texto_area.width as usize)
                 .collect();
             linhas_render.push(Line::from(Span::styled(recorte, theme::texto())));
         }
     }
     f.render_widget(
-        Paragraph::new(Text::from(linhas_render))
-            .block(bloco)
-            .scroll((scroll_v, 0)),
-        area,
+        Paragraph::new(Text::from(linhas_render)).scroll((scroll_v, 0)),
+        texto_area,
+    );
+    let estilo_prompt = if app.turno_ativo {
+        theme::pulso(app.tick, true).add_modifier(Modifier::BOLD)
+    } else {
+        theme::acento().add_modifier(Modifier::BOLD)
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled("❯", estilo_prompt)),
+        Rect {
+            x: interno.x,
+            y: interno.y,
+            width: 1,
+            height: 1,
+        },
     );
 
     // Posiciona o cursor real do terminal.
-    let x = interno.x
-        + (coluna_cursor.saturating_sub(scroll_h)).min(interno.width.saturating_sub(1) as usize)
+    let x = texto_area.x
+        + (coluna_cursor.saturating_sub(scroll_h)).min(texto_area.width.saturating_sub(1) as usize)
             as u16;
-    let y = interno.y
+    let y = texto_area.y
         + (linha_cursor.saturating_sub(scroll_v as usize))
-            .min(interno.height.saturating_sub(1) as usize) as u16;
+            .min(texto_area.height.saturating_sub(1) as usize) as u16;
     f.set_cursor_position((x, y));
 }
 
@@ -468,8 +488,8 @@ fn desenhar_sugestoes(f: &mut Frame, app: &App, area_entrada: Rect) {
         let selecionado = i == app.sugestao_sel.min(total - 1);
         let estilo = if selecionado {
             Style::default()
-                .fg(Color::Rgb(20, 22, 28))
-                .bg(theme::borda_ativa().fg.unwrap_or(Color::Rgb(120, 180, 255)))
+                .fg(theme::selecao_texto())
+                .bg(theme::selecao_fundo())
         } else {
             theme::texto()
         };
@@ -478,7 +498,7 @@ fn desenhar_sugestoes(f: &mut Frame, app: &App, area_entrada: Rect) {
         } else {
             format!(" {}", comando.argumentos)
         };
-        let marcador = if selecionado { "▶" } else { " " };
+        let marcador = if selecionado { "❯" } else { " " };
         linhas.push(Line::from(vec![
             Span::styled(
                 format!("{marcador} {}{} ", comando.nome, argumentos),
@@ -507,7 +527,7 @@ fn desenhar_sugestoes(f: &mut Frame, app: &App, area_entrada: Rect) {
     };
     let bloco = theme::bloco()
         .border_style(theme::borda_ativa())
-        .style(theme::fundo())
+        .style(theme::superficie())
         .title(Span::styled(" comandos ", theme::rotulo()))
         .title_bottom(Span::styled(
             format!(" {posicao}↑↓ escolhe · tab/enter completa "),
@@ -531,7 +551,7 @@ fn desenhar_modal(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_widget(Clear, area_modal);
             let bloco = theme::bloco()
                 .border_style(theme::modal_borda())
-                .style(theme::fundo())
+                .style(theme::superficie())
                 .title(Span::styled(" confirmação necessária ", theme::titulo()));
             let interno = bloco.inner(area_modal);
             f.render_widget(bloco, area_modal);
@@ -574,7 +594,28 @@ fn desenhar_modal(f: &mut Frame, app: &mut App, area: Rect) {
         | Modal::Sessoes(seletor)
         | Modal::Projetos(seletor)
         | Modal::Processos(seletor) => {
-            desenhar_seletor(f, seletor, area_modal);
+            desenhar_seletor(f, seletor, area_modal, app.tick);
+        }
+        Modal::CompEditor {
+            nome,
+            novo,
+            editor,
+            erro,
+            scroll,
+            ..
+        } => {
+            desenhar_comp_editor(
+                f,
+                nome,
+                *novo,
+                editor,
+                erro.as_deref(),
+                *scroll,
+                retangulo_central(area, 90, 80),
+            );
+        }
+        Modal::ConfirmarComp { nome } => {
+            desenhar_confirmar_comp(f, nome, retangulo_central(area, 54, 32));
         }
         Modal::Texto {
             titulo,
@@ -589,7 +630,143 @@ fn desenhar_modal(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn desenhar_seletor(f: &mut Frame, seletor: &Seletor, area: Rect) {
+/// Editor de instruções de um Comp, dentro do próprio Kestrel.
+fn desenhar_comp_editor(
+    f: &mut Frame,
+    nome: &str,
+    novo: bool,
+    editor: &crate::ui::input::Editor,
+    erro: Option<&str>,
+    scroll: u16,
+    area: Rect,
+) {
+    f.render_widget(Clear, area);
+    let titulo = if novo {
+        format!(" novo Comp — {nome} ")
+    } else {
+        format!(" Comp — {nome} ")
+    };
+    let bloco = theme::bloco()
+        .border_style(theme::modal_borda())
+        .style(theme::superficie())
+        .title(Span::styled(titulo, theme::titulo()))
+        .title_bottom(Span::styled(
+            " Ctrl+S salva · Esc cancela · Enter quebra linha ",
+            theme::apagado(),
+        ));
+    let interno = bloco.inner(area);
+    f.render_widget(bloco, area);
+    if interno.height == 0 {
+        return;
+    }
+
+    let altura_erro = if erro.is_some() { 2 } else { 0 };
+    let altura_texto = interno.height.saturating_sub(altura_erro).max(1);
+    let largura = interno.width.max(1) as usize;
+    let (linha_cursor, coluna_cursor) = editor.posicao_cursor();
+
+    // Mantém o cursor visível mesmo quando o texto passa da altura do modal.
+    let rolagem = if linha_cursor < scroll as usize {
+        linha_cursor as u16
+    } else if linha_cursor >= scroll as usize + altura_texto as usize {
+        (linha_cursor + 1 - altura_texto as usize) as u16
+    } else {
+        scroll
+    };
+    let mut linhas = Vec::new();
+    if editor.vazio() {
+        linhas.push(Line::from(Span::styled(
+            "descreva como o agente deve falar e se comportar…",
+            theme::apagado(),
+        )));
+    } else {
+        for linha in editor.texto().split('\n') {
+            let recorte: String = linha.chars().take(largura.saturating_sub(1)).collect();
+            linhas.push(Line::from(Span::styled(recorte, theme::texto())));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(linhas)).scroll((rolagem, 0)),
+        Rect {
+            x: interno.x,
+            y: interno.y,
+            width: interno.width,
+            height: altura_texto,
+        },
+    );
+
+    if let Some(mensagem) = erro {
+        let y = interno.y + interno.height.saturating_sub(2);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("erro: {}", crate::util::truncate(mensagem, largura)),
+                theme::falha(),
+            )),
+            Rect {
+                x: interno.x,
+                y,
+                width: interno.width,
+                height: 1,
+            },
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "corrija o texto e tente Ctrl+S de novo",
+                theme::apagado(),
+            )),
+            Rect {
+                x: interno.x,
+                y: y + 1,
+                width: interno.width,
+                height: 1,
+            },
+        );
+    }
+
+    let x = interno.x + (coluna_cursor).min(largura.saturating_sub(1)) as u16;
+    let y = interno.y
+        + (linha_cursor.saturating_sub(rolagem as usize))
+            .min(altura_texto.saturating_sub(1) as usize) as u16;
+    f.set_cursor_position((x, y));
+}
+
+/// Confirmação de remoção de Comp: separada do fluxo de ferramentas porque a
+/// decisão é do usuário na interface, não uma permissão de execução.
+fn desenhar_confirmar_comp(f: &mut Frame, nome: &str, area: Rect) {
+    f.render_widget(Clear, area);
+    let bloco = theme::bloco()
+        .border_style(theme::modal_borda())
+        .style(theme::superficie())
+        .title(Span::styled(" remover Comp ", theme::titulo()));
+    let interno = bloco.inner(area);
+    f.render_widget(bloco, area);
+    let linhas = vec![
+        Line::default(),
+        Line::from(vec![
+            Span::styled("Remover o Comp ", theme::texto()),
+            Span::styled(nome.to_string(), theme::titulo()),
+            Span::styled("?", theme::texto()),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "O arquivo será apagado. Se este for o Comp ativo, o tom padrão volta.",
+            theme::apagado(),
+        )),
+        Line::default(),
+        Line::from(vec![
+            Span::styled(" S ", theme::botao_negar()),
+            Span::styled(" remover   ", theme::texto()),
+            Span::styled(" N ", theme::botao_permitir()),
+            Span::styled(" cancelar", theme::texto()),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(Text::from(linhas)).wrap(Wrap { trim: false }),
+        interno,
+    );
+}
+
+fn desenhar_seletor(f: &mut Frame, seletor: &Seletor, area: Rect, tique: u64) {
     f.render_widget(Clear, area);
     let filtrados = seletor.filtrados();
     let total = filtrados.len();
@@ -605,7 +782,7 @@ fn desenhar_seletor(f: &mut Frame, seletor: &Seletor, area: Rect) {
     };
     let bloco = theme::bloco()
         .border_style(theme::modal_borda())
-        .style(theme::fundo())
+        .style(theme::superficie())
         .title(Span::styled(
             format!(" {} ", seletor.titulo),
             theme::titulo(),
@@ -644,13 +821,17 @@ fn desenhar_seletor(f: &mut Frame, seletor: &Seletor, area: Rect) {
     for (indice, (_, item)) in filtrados.iter().enumerate() {
         let selecionado = indice == seletor.sel;
         let inicio = linhas.len();
-        let marcador = if selecionado { "▶ " } else { "  " };
         let estilo_titulo = if selecionado {
-            Style::default()
-                .fg(Color::Rgb(255, 220, 160))
-                .add_modifier(Modifier::BOLD)
+            theme::pulso(tique, true).add_modifier(Modifier::BOLD)
         } else {
             theme::texto()
+        };
+        // O glifo pula levemente entre dois estados (sem mover texto) para o
+        // item selecionado ser perceptível sem piscar a linha inteira.
+        let marcador = if selecionado {
+            if (tique / 2) % 4 < 2 { "▶ " } else { "▮ " }
+        } else {
+            "  "
         };
         linhas.push(Line::from(Span::styled(
             format!("{marcador}{}", item.titulo),
@@ -686,7 +867,7 @@ fn desenhar_seletor(f: &mut Frame, seletor: &Seletor, area: Rect) {
     f.render_widget(
         Paragraph::new(Text::from(linhas))
             .scroll((janela as u16, 0))
-            .style(theme::fundo()),
+            .style(theme::superficie()),
         interno,
     );
 }
@@ -695,7 +876,7 @@ fn desenhar_texto(f: &mut Frame, titulo: &str, linhas: &[Line<'static>], scroll:
     f.render_widget(Clear, area);
     let bloco = theme::bloco()
         .border_style(theme::modal_borda())
-        .style(theme::fundo())
+        .style(theme::superficie())
         .title(Span::styled(format!(" {titulo} "), theme::titulo()))
         .title_bottom(Span::styled(" esc fecha · ↑↓ rola ", theme::apagado()));
     let interno = bloco.inner(area);
@@ -858,7 +1039,9 @@ mod tests {
         let mut app = app_de_teste();
         let tela = desenhar_em(&mut app, 120, 30);
         assert!(tela.contains("modelo/teste"));
-        assert!(tela.contains("nvidia"));
+        // O provedor não é informação de cabeçalho: saiu do topo a pedido do
+        // usuário e continua disponível em /config.
+        assert!(!tela.contains("nvidia"));
         assert!(tela.contains("agente"));
         assert!(tela.contains("Semi"));
         // Contexto distante do limite não ocupa o cabeçalho.
@@ -875,8 +1058,8 @@ mod tests {
     fn indicadores_inferiores_usam_dados_reais() {
         let mut app = app_de_teste();
         let tela = desenhar_em(&mut app, 120, 30);
-        assert!(tela.contains("skills 0"));
-        assert!(!tela.contains("processos"));
+        assert!(!tela.contains("skills"));
+        assert!(!tela.contains("enter envia"));
         app.processos.push(ProcessoView {
             id: "p1".into(),
             comando: "cargo test".into(),
@@ -887,7 +1070,8 @@ mod tests {
             linhas: 0,
         });
         let tela = desenhar_em(&mut app, 120, 30);
-        assert!(tela.contains("skills 0 · processos 1"));
+        assert!(tela.contains("processos 1"));
+        assert!(!tela.contains("skills"));
     }
 
     #[test]
@@ -926,11 +1110,16 @@ mod tests {
         assert!(parado.contains('●'));
         // Trabalhando: o Pip aparece junto ao campo de mensagem, no lugar dos
         // antigos pontinhos (nenhum glifo de braille no rodapé).
+        app.pip_grafico = Some(
+            crate::ui::mascot::PipGrafico::novo(&ratatui_image::picker::Picker::halfblocks())
+                .expect("Pip de teste"),
+        );
         app.tratar_evento(crate::events::AgentEvent::TurnoIniciado);
         let trabalhando = desenhar_em(&mut app, 120, 36);
-        // O Pip tem 3 colunas x 1 linha: tres meias-células desenhadas.
+        // O Pip é uma imagem de 6×2; no protocolo de halfblocks ela vira
+        // várias meias-células.
         assert!(
-            trabalhando.matches('▀').count() + trabalhando.matches('▄').count() >= 3,
+            trabalhando.matches('▀').count() + trabalhando.matches('▄').count() >= 6,
             "o Pip deveria estar desenhado enquanto o modelo trabalha"
         );
         for glifo in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
@@ -942,18 +1131,18 @@ mod tests {
         // A conversa continua completa e o texto de estado fica ao lado do Pip.
         assert!(trabalhando.contains("Bem-vindo ao Kestrel"));
         assert!(trabalhando.contains("pensando"));
-        // O Pip fica acima do campo de mensagem (não no canto do chat).
+        // O Pip fica no rodapé, abaixo do campo de mensagem.
         let linha_pip = trabalhando
             .lines()
             .position(|l| l.contains('▀') || l.contains('▄'))
             .unwrap();
         // O campo de mensagem não tem mais título: a linha dele é a do
-        // exemplo/placeholder que ocupa quando está vazio.
+        // placeholder que ocupa quando está vazio.
         let linha_mensagem = trabalhando
             .lines()
-            .position(|l| l.contains("adicione testes para o módulo"))
+            .position(|l| l.contains("descreva a tarefa"))
             .unwrap();
-        assert!(linha_pip < linha_mensagem);
+        assert!(linha_pip > linha_mensagem);
         // Terminal baixo usa o status compacto (sem Pip) e não quebra.
         let baixo = desenhar_em(&mut app, 120, 13);
         assert!(!baixo.contains('▀') && !baixo.contains('▄'));
@@ -966,14 +1155,20 @@ mod tests {
             delta: "linha da conversa".into(),
         });
         app.tratar_evento(crate::events::AgentEvent::TurnoIniciado);
+        app.pip_grafico = Some(
+            crate::ui::mascot::PipGrafico::novo(&ratatui_image::picker::Picker::halfblocks())
+                .expect("Pip de teste"),
+        );
         let parado = desenhar_em(&mut app, 120, 36);
         app.pip = crate::ui::mascot::AnimacaoPip {
-            deslocamento: 1,
+            dx: 1,
+            dy: 0,
             piscando: true,
         };
         let animado = desenhar_em(&mut app, 120, 36);
-        // O quadro muda (animação real) e o texto da conversa permanece.
-        assert_ne!(parado, animado);
+        // O desenho não quebra a conversa. A mudança real de quadro é testada
+        // em `mascot`/`app`; no TestBackend o protocolo de halfblocks expõe os
+        // mesmos glifos e varia apenas nas cores, que não entram no snapshot.
         assert!(animado.contains("linha da conversa"));
         assert!(parado.contains("linha da conversa"));
         // Mesmo quadro desenhado duas vezes é idêntico (sem tremor).

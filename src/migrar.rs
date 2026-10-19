@@ -16,6 +16,21 @@ pub const VERSAO_ATUAL: i64 = 3;
 const MIGRACOES: &[(i64, &str)] = &[
     // 1 → 2: coluna usada para marcar o objetivo da sessão (continuidade).
     (2, "ALTER TABLE sessions ADD COLUMN objective TEXT;"),
+    // 2 → 3: tabela de uso de tokens. Ela nasceu apenas no `SCHEMA_BASE`; um
+    // banco criado antes ficava sem a tabela e `/cost`/estatísticas falhavam
+    // (ou mostravam zero) sem nenhum aviso.
+    (
+        3,
+        "CREATE TABLE IF NOT EXISTS usage (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL,
+            prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_session ON usage(session_id, id);",
+    ),
 ];
 
 /// Aplica o esquema base e as migrações pendentes.

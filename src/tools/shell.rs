@@ -72,6 +72,14 @@ impl Default for ProcessManager {
     }
 }
 
+impl Drop for ProcessManager {
+    fn drop(&mut self) {
+        // Processos em segundo plano (servidores, watchers) não podem
+        // sobreviver ao Kestrel: sem isso o `child` ficava órfão ao sair.
+        self.encerrar_todos();
+    }
+}
+
 impl ProcessManager {
     pub fn new() -> Self {
         Self {
@@ -677,11 +685,20 @@ trait ToolOutputSucesso {
 
 impl ToolOutputSucesso for ToolOutput {
     fn com_sucesso(mut self, sucesso: bool) -> Self {
+        self.sucesso = sucesso;
         if !sucesso {
             self.resumo = format!("falhou: {}", self.resumo);
         }
         self
     }
+}
+
+/// Cita um argumento como um único valor na linha de comando do shell.
+///
+/// O filtro de testes era interpolado cru (`cargo test {filtro}`): filtros com
+/// espaço quebravam o comando e metacaracteres (`;`, `$(…)`) viravam código.
+fn citar_argumento(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 pub struct RunTests;
@@ -735,10 +752,16 @@ impl Tool for RunTests {
                     )
                 })?;
                 match arg_str_opt(&args, "filtro") {
-                    Some(filtro) if base.starts_with("cargo test") => format!("{base} {filtro}"),
-                    Some(filtro) if base.starts_with("go test") => format!("{base} -run {filtro}"),
-                    Some(filtro) if base.starts_with("pytest") => format!("{base} -k {filtro}"),
-                    Some(filtro) => format!("{base} {filtro}"),
+                    Some(filtro) if base.starts_with("cargo test") => {
+                        format!("{base} {}", citar_argumento(&filtro))
+                    }
+                    Some(filtro) if base.starts_with("go test") => {
+                        format!("{base} -run {}", citar_argumento(&filtro))
+                    }
+                    Some(filtro) if base.starts_with("pytest") => {
+                        format!("{base} -k {}", citar_argumento(&filtro))
+                    }
+                    Some(filtro) => format!("{base} {}", citar_argumento(&filtro)),
                     None => base,
                 }
             }
@@ -1237,5 +1260,24 @@ mod tests {
                 .contains("compilação")
         );
         assert!(dicas_de_falha("tudo ok", EstadoProcesso::Concluido).is_empty());
+    }
+
+    /// O filtro de testes entra na linha de comando: precisa ser um único
+    /// argumento e não pode injetar comandos.
+    #[test]
+    fn filtra_testes_com_seguranca() {
+        assert_eq!(citar_argumento("meu_teste"), "'meu_teste'");
+        assert_eq!(citar_argumento("a b"), "'a b'");
+        // Aspas dentro do filtro são fechadas/reabertas: o `;` fica literal.
+        assert_eq!(citar_argumento("x'; rm -rf ~"), "'x'\\''; rm -rf ~'");
+    }
+
+    /// Sucesso semântico: comando com código ≠ 0 não é sucesso, mesmo tendo
+    /// devolvido saída (o agente usava `Ok` como sucesso e ignorava a falha).
+    #[test]
+    fn comando_com_codigo_nao_zero_nao_e_sucesso() {
+        assert!(!ToolOutput::texto("saida").com_sucesso(false).sucesso);
+        assert!(ToolOutput::texto("saida").com_sucesso(true).sucesso);
+        assert!(ToolOutput::default().sucesso);
     }
 }

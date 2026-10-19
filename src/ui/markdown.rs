@@ -9,6 +9,7 @@ use crate::ui::theme;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, Default)]
 struct EstiloInline {
@@ -393,7 +394,9 @@ impl Renderizador {
         let mut larguras = vec![0usize; colunas];
         for linha in &tabela.linhas {
             for (i, celula) in linha.iter().enumerate() {
-                larguras[i] = larguras[i].max(celula.chars().count());
+                // Largura de terminal, não número de `char`s: CJK/emoji ocupam
+                // duas colunas e desalinhavam a tabela inteira.
+                larguras[i] = larguras[i].max(celula.width());
             }
         }
         let mut primeira = true;
@@ -402,7 +405,7 @@ impl Renderizador {
             for (i, largura) in larguras.iter().enumerate() {
                 let celula = linha.get(i).map(String::as_str).unwrap_or("");
                 let mut conteudo = celula.to_string();
-                let extra = largura.saturating_sub(conteudo.chars().count());
+                let extra = largura.saturating_sub(conteudo.width());
                 conteudo.push_str(&" ".repeat(extra));
                 let estilo = if primeira {
                     theme::rotulo().add_modifier(Modifier::BOLD)
@@ -417,7 +420,8 @@ impl Renderizador {
             self.linhas.push(Line::from(spans));
             self.ultima_vazia = false;
             if primeira {
-                let total: usize = larguras.iter().map(|l| l + 2).sum::<usize>() + larguras.len();
+                let total: usize = larguras.iter().map(|l| l + 2).sum::<usize>()
+                    + larguras.len().saturating_sub(1);
                 let linha = "─".repeat(total.min(120));
                 self.linhas
                     .push(Line::from(Span::styled(linha, theme::borda())));

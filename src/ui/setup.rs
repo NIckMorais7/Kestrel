@@ -9,12 +9,12 @@ use crate::config::{Capability, Config, ModelEntry};
 use crate::perm::PermissionLevel;
 use crate::provider::catalog;
 use crate::ui::input::Editor;
-use crate::ui::mascot::{self, EstadoMascote};
+use crate::ui::mascot::{self, EstadoMascote, PipGrafico};
 use crate::ui::{self, theme};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use std::time::Duration;
@@ -86,10 +86,11 @@ pub struct Assistente {
     erro: Option<String>,
     tick: u64,
     concluido: bool,
+    pip_grafico: Option<PipGrafico>,
 }
 
 impl Assistente {
-    pub fn novo(config: Config) -> Self {
+    pub fn novo(config: Config, pip_grafico: Option<PipGrafico>) -> Self {
         let mut editor = Editor::novo(20);
         if let Some(dir) = &config.agent.workdir {
             editor.definir_texto(dir.display().to_string());
@@ -105,6 +106,7 @@ impl Assistente {
             erro: None,
             tick: 0,
             concluido: false,
+            pip_grafico,
         }
     }
 
@@ -404,26 +406,30 @@ impl Assistente {
         .areas(area);
 
         let passo = format!("passo {} de 7", self.etapa.numero());
-        let titulo = format!(" Kestrel — configuração inicial · {} ", self.etapa.titulo());
         f.render_widget(
-            Paragraph::new(vec![Line::from(vec![
-                Span::styled(
-                    " Kestrel ",
-                    Style::default()
-                        .fg(Color::Rgb(30, 32, 40))
-                        .bg(Color::Rgb(255, 196, 110))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  {titulo}"), theme::titulo()),
-                Span::styled(format!("  {passo}"), theme::apagado()),
-            ])]),
+            Paragraph::new(Text::from(vec![
+                Line::from(vec![
+                    Span::styled(" ◆ ", theme::titulo()),
+                    Span::styled("Kestrel", theme::titulo()),
+                    Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), theme::apagado()),
+                    Span::styled("  configuração inicial", theme::apagado()),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!(" {}", self.etapa.titulo()), theme::acento()),
+                    Span::styled(format!("  ·  {passo}"), theme::apagado()),
+                ]),
+            ])),
             cabecalho,
         );
 
-        let bloco = theme::bloco().border_style(theme::modal_borda());
-        let interno = bloco.inner(corpo);
-        f.render_widget(bloco, corpo);
-
+        // Sem caixa: o assistente usa o mesmo vocabulário visual da interface
+        // principal (espaço vazio separa; borda só no que é interativo).
+        let interno = Rect {
+            x: corpo.x + 2,
+            y: corpo.y,
+            width: corpo.width.saturating_sub(4).max(1),
+            height: corpo.height,
+        };
         let [texto, lateral] =
             Layout::horizontal([Constraint::Min(40), Constraint::Length(20)]).areas(interno);
         let linhas = self.linhas_etapa();
@@ -439,29 +445,33 @@ impl Assistente {
         } else {
             EstadoMascote::Ocioso
         };
-        if self.config.ui.show_mascot {
-            let animacao = mascot::AnimacaoPip {
-                deslocamento: mascot::deslocamento_de(self.tick / 3),
-                piscando: self.tick % 143 == 142,
-            };
-            // Duas linhas de Pip com o estado ao pé — o mesmo tamanho usado no
-            // indicador de trabalho: nada de mascote grande no assistente.
-            let linhas_pip = mascot::linhas(mascot::TamanhoMascote::Mini, animacao);
-            let altura = linhas_pip.len() as u16 + 1;
+        if self.config.ui.show_mascot
+            && let Some(pip) = &self.pip_grafico
+        {
+            let altura = mascot::LINHAS + 1;
             if lateral.height >= altura && lateral.width > 0 {
+                let mut animacao = mascot::quadro_de(self.tick / 3);
+                if animacao.dx == 0 {
+                    animacao.piscando = self.tick % 143 == 142;
+                }
+                let imagem = Rect {
+                    x: lateral.x,
+                    y: lateral.y,
+                    width: mascot::COLUNAS.min(lateral.width),
+                    height: mascot::LINHAS.min(lateral.height),
+                };
                 let rotulo =
                     crate::util::truncate(&format!(" {}", estado.label()), lateral.width as usize);
-                let mut conteudo = Text::from(linhas_pip);
-                conteudo.push_line(Line::from(Span::styled(rotulo, theme::apagado())));
                 f.render_widget(
-                    Paragraph::new(conteudo),
+                    Paragraph::new(Line::from(Span::styled(rotulo, theme::apagado()))),
                     Rect {
                         x: lateral.x,
-                        y: lateral.y,
+                        y: lateral.y + mascot::LINHAS,
                         width: lateral.width,
-                        height: altura,
+                        height: 1,
                     },
                 );
+                pip.desenhar(f, imagem, animacao);
             }
         }
 
@@ -751,8 +761,9 @@ fn paragrafo(texto: impl Into<String>) -> Line<'static> {
 pub async fn executar(
     terminal: &mut ratatui::DefaultTerminal,
     config: Config,
+    pip_grafico: Option<PipGrafico>,
 ) -> anyhow::Result<Config> {
-    let mut assistente = Assistente::novo(config);
+    let mut assistente = Assistente::novo(config, pip_grafico);
     let mut eventos = ui::canal_terminal();
     let mut tique = tokio::time::interval(Duration::from_millis(120));
     tique.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -767,6 +778,16 @@ pub async fn executar(
             Some(evento) = eventos.recv() => {
                 match evento {
                     Event::Key(tecla) if tecla.kind == KeyEventKind::Press => {
+                        // Ctrl+C no assistente encerra de forma limpa; antes a
+                        // tecla era ignorada e não havia como sair sem concluir.
+                        if tecla.code == KeyCode::Char('c')
+                            && tecla.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            anyhow::bail!(
+                                "configuração inicial cancelada pelo usuário (Ctrl+C); \
+                                 execute `kestrel --setup` para recomeçar"
+                            );
+                        }
                         assistente.tratar_tecla(tecla);
                     }
                     Event::Resize(_, _) => {}

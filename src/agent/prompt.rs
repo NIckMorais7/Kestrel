@@ -19,6 +19,8 @@ pub struct PromptContext<'a> {
     pub dossie: Option<String>,
     pub workdir: &'a Path,
     pub diretorios_extra: Vec<String>,
+    /// Personalidade ativa, se houver. Só comportamento; nunca configuração.
+    pub comp: Option<&'a crate::comps::Comp>,
 }
 
 /// Monta o prompt de sistema completo.
@@ -45,6 +47,11 @@ pub fn construir(ctx: &PromptContext<'_>) -> String {
         - Use `load_skill` quando uma skill listada for pertinente à tarefa.\n\
         - Trabalhe dentro do projeto; para agir fora dele, explique por quê.\n\n",
     );
+
+    if let Some(comp) = ctx.comp {
+        p.push_str(&comp.bloco_prompt());
+        p.push('\n');
+    }
 
     p.push_str(&format!(
         "## Ambiente\n\
@@ -195,6 +202,7 @@ mod tests {
             dossie: None,
             workdir: Path::new("/proj"),
             diretorios_extra: vec![],
+            comp: None,
         };
         let texto = construir(&ctx);
         assert!(texto.contains("Kestrel"));
@@ -220,6 +228,7 @@ mod tests {
             dossie: None,
             workdir: Path::new("/p"),
             diretorios_extra: vec![],
+            comp: None,
         };
         let texto = construir(&ctx);
         assert!(texto.contains("Não pode modificar arquivos"));
@@ -240,6 +249,7 @@ mod tests {
             dossie: None,
             workdir: Path::new("/p"),
             diretorios_extra: vec![],
+            comp: None,
         };
         let texto = construir(&ctx);
         assert!(texto.contains("Modo de operação: chat"));

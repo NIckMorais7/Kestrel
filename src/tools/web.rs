@@ -12,8 +12,77 @@ use crate::provider::ToolSpec;
 use futures_util::StreamExt;
 use regex::Regex;
 use serde_json::{Value, json};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+
+/// Tamanho máximo de corpo lido por `fetch_url` (o restante é descartado).
+const LIMITE_CORPO_FETCH: usize = 8 * 1024 * 1024;
+
+/// Endereços que nunca devem ser acessados pelas ferramentas web.
+///
+/// Link-local (`169.254.0.0/16`) inclui o serviço de metadados de nuvem
+/// (169.254.169.254), alvo clássico de SSRF; CGNAT e multicast também não são
+/// destinos legítimos de uma busca. Loopback e redes privadas continuam
+/// liberados de propósito: rodar algo em `localhost:3000` e abrir é uso normal.
+fn ip_interno(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                // 100.64.0.0/10 (CGNAT; inclui o metadata do Alibaba)
+                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+        }
+        IpAddr::V6(v6) => {
+            v6.is_unspecified()
+                || v6.is_multicast()
+                // Link-local fe80::/10.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // Metadata IPv6 da AWS (fd00:ec2::254).
+                || v6 == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+        }
+    }
+}
+
+/// Valida esquema, host literal e IPs resolvidos antes de uma requisição.
+async fn validar_url_externa(url: &str) -> Result<reqwest::Url, ToolError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| ToolError::Argumentos(format!("URL inválida `{url}`: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ToolError::Argumentos(
+            "a URL deve usar http:// ou https://".into(),
+        ));
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err(ToolError::Argumentos("a URL não tem host".into()));
+    };
+    // `host_str` devolve IPv6 entre colchetes; `IpAddr` não aceita.
+    let host_limpo = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host_limpo.parse::<IpAddr>() {
+        if ip_interno(ip) {
+            return Err(ToolError::Permissao(format!(
+                "acesso a endereço interno bloqueado: {host}"
+            )));
+        }
+        return Ok(parsed);
+    }
+    // Nome (inclusive `metadata.google.internal`): resolve antes e confere
+    // todos os endereços. Se a resolução falhar, deixa a requisição reportar.
+    let porta = parsed.port_or_known_default().unwrap_or(443);
+    if let Ok(enderecos) = tokio::net::lookup_host((host_limpo, porta)).await {
+        for endereco in enderecos {
+            if ip_interno(endereco.ip()) {
+                return Err(ToolError::Permissao(format!(
+                    "acesso a endereço interno bloqueado: {host} → {}",
+                    endereco.ip()
+                )));
+            }
+        }
+    }
+    Ok(parsed)
+}
 
 /// Navegadores conhecidos, na ordem de preferência.
 const NAVEGADORES: &[&str] = &[
@@ -277,11 +346,7 @@ impl Tool for FetchUrl {
 
     async fn executar(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let url = arg_str(&args, "url")?;
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(ToolError::Argumentos(
-                "a URL deve começar com http:// ou https://".into(),
-            ));
-        }
+        let url = validar_url_externa(&url).await?;
         let max = arg_u64(&args, "max_caracteres").unwrap_or(20_000) as usize;
         let formato = arg_str_opt(&args, "formato").unwrap_or_else(|| "texto".into());
         let incluir_links = args
@@ -291,7 +356,7 @@ impl Tool for FetchUrl {
 
         let resposta = ctx
             .http
-            .get(&url)
+            .get(url.clone())
             .header(
                 "Accept",
                 "text/html,application/xhtml+xml,application/json;q=0.9,text/plain;q=0.8,*/*;q=0.5",
@@ -306,10 +371,6 @@ impl Tool for FetchUrl {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let corpo = resposta
-            .text()
-            .await
-            .map_err(|e| ToolError::msg(format!("falha ao ler o corpo de {url}: {e}")))?;
 
         if !status.is_success() {
             let dica = match status.as_u16() {
@@ -324,6 +385,11 @@ impl Tool for FetchUrl {
                 "{url} respondeu HTTP {status}. {dica}"
             )));
         }
+
+        // Lê com teto: `.text()` carregava a resposta inteira na memória.
+        let corpo = ler_corpo_limitado(resposta, LIMITE_CORPO_FETCH)
+            .await
+            .map_err(|e| ToolError::msg(format!("falha ao ler o corpo de {url}: {e}")))?;
 
         if formato == "html"
             || (!tipo.contains("html") && !tipo.is_empty() && !tipo.contains("text"))
@@ -359,10 +425,35 @@ impl Tool for FetchUrl {
         let texto = partes.join("\n");
         Ok(ToolOutput::texto(texto).com_resumo(format!(
             "abriu {} ({} caracteres)",
-            crate::util::truncate(&url, 50),
+            crate::util::truncate(url.as_str(), 50),
             pagina.texto.chars().count()
         )))
     }
+}
+
+/// Lê o corpo de uma resposta com teto de bytes, em streaming.
+async fn ler_corpo_limitado(resposta: reqwest::Response, limite: usize) -> Result<String, String> {
+    if let Some(tamanho) = resposta.content_length()
+        && tamanho as usize > limite
+    {
+        return Err(format!(
+            "o corpo tem {} e excede o limite de {}",
+            crate::util::human_bytes(tamanho),
+            crate::util::human_bytes(limite as u64)
+        ));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stream = resposta.bytes_stream();
+    while let Some(pedaco) = stream.next().await {
+        let pedaco = pedaco.map_err(|e| e.to_string())?;
+        let restante = limite.saturating_sub(bytes.len());
+        if pedaco.len() >= restante {
+            bytes.extend_from_slice(&pedaco[..restante]);
+            break;
+        }
+        bytes.extend_from_slice(&pedaco);
+    }
+    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 pub struct DownloadFile;
@@ -411,12 +502,17 @@ impl Tool for DownloadFile {
 
     async fn executar(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let url = arg_str(&args, "url")?;
+        let url = validar_url_externa(&url).await?;
         let destino = resolver_caminho(ctx, &arg_str(&args, "caminho")?);
-        let limite = arg_u64(&args, "max_bytes").unwrap_or(ctx.web.max_download_bytes);
+        // O pedido do modelo não pode furar o limite da configuração (antes
+        // `max_bytes` era honrado sem teto e enchia o disco).
+        let limite = arg_u64(&args, "max_bytes")
+            .unwrap_or(ctx.web.max_download_bytes)
+            .min(ctx.web.max_download_bytes);
 
         let resposta = ctx
             .http
-            .get(&url)
+            .get(url.clone())
             .send()
             .await
             .map_err(|e| ToolError::msg(format!("falha ao baixar {url}: {e}")))?;
@@ -449,8 +545,14 @@ impl Tool for DownloadFile {
         let mut total: u64 = 0;
         let mut stream = resposta.bytes_stream();
         while let Some(pedaco) = stream.next().await {
-            let bytes =
-                pedaco.map_err(|e| ToolError::msg(format!("falha durante o download: {e}")))?;
+            let bytes = match pedaco {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    drop(arquivo);
+                    let _ = std::fs::remove_file(&temporario);
+                    return Err(ToolError::msg(format!("falha durante o download: {e}")));
+                }
+            };
             total += bytes.len() as u64;
             if total > limite {
                 drop(arquivo);
@@ -460,19 +562,25 @@ impl Tool for DownloadFile {
                     crate::util::human_bytes(limite)
                 )));
             }
-            arquivo
-                .write_all(&bytes)
-                .await
-                .map_err(|e| ToolError::msg(format!("falha ao gravar o arquivo: {e}")))?;
+            if let Err(e) = arquivo.write_all(&bytes).await {
+                drop(arquivo);
+                let _ = std::fs::remove_file(&temporario);
+                return Err(ToolError::msg(format!("falha ao gravar o arquivo: {e}")));
+            }
         }
-        arquivo
-            .flush()
-            .await
-            .map_err(|e| ToolError::msg(format!("falha ao finalizar o arquivo: {e}")))?;
+        if let Err(e) = arquivo.flush().await {
+            drop(arquivo);
+            let _ = std::fs::remove_file(&temporario);
+            return Err(ToolError::msg(format!("falha ao finalizar o arquivo: {e}")));
+        }
         drop(arquivo);
-        std::fs::rename(&temporario, &destino).map_err(|e| {
-            ToolError::msg(format!("falha ao finalizar {}: {e}", destino.display()))
-        })?;
+        if let Err(e) = std::fs::rename(&temporario, &destino) {
+            let _ = std::fs::remove_file(&temporario);
+            return Err(ToolError::msg(format!(
+                "falha ao finalizar {}: {e}",
+                destino.display()
+            )));
+        }
 
         // Identificação básica do conteúdo (sem executar nada).
         let amostra = std::fs::read(&destino)
@@ -551,6 +659,7 @@ impl Tool for BrowserRender {
 
     async fn executar(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let url = arg_str(&args, "url")?;
+        let url = validar_url_externa(&url).await?;
         let espera = arg_u64(&args, "espera_ms").unwrap_or(6000);
         let max = arg_u64(&args, "max_caracteres").unwrap_or(20_000) as usize;
         let navegador = detectar_navegador(ctx.web.browser_bin.as_deref()).ok_or_else(|| {
@@ -562,22 +671,25 @@ impl Tool for BrowserRender {
             ))
         })?;
 
-        let saida = tokio::process::Command::new(&navegador)
+        let espera_texto = espera.to_string();
+        let mut comando = tokio::process::Command::new(&navegador);
+        comando
             .args([
                 "--headless=new",
                 "--disable-gpu",
-                "--no-sandbox",
+                // Sem `--no-sandbox`: o padrão do navegador é a sandbox; abrir
+                // mão dela por padrão transformava qualquer página renderizada
+                // em execução de JS sem isolamento.
                 "--hide-scrollbars",
                 "--virtual-time-budget",
-                &espera.to_string(),
+                &espera_texto,
                 "--dump-dom",
-                &url,
+                url.as_str(),
             ])
-            .output()
-            .await
-            .map_err(|e| {
-                ToolError::msg(format!("falha ao executar {}: {e}", navegador.display()))
-            })?;
+            .kill_on_drop(true);
+        let saida = comando.output().await.map_err(|e| {
+            ToolError::msg(format!("falha ao executar {}: {e}", navegador.display()))
+        })?;
         if !saida.status.success() {
             return Err(ToolError::msg(format!(
                 "o navegador terminou com código {:?}: {}",
@@ -629,8 +741,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_url_valida_esquema() {
-        // Não faz rede: apenas valida a URL antes da requisição.
-        assert!("ftp://x".starts_with("http").eq(&false));
+    async fn bloqueia_enderecos_internos_e_esquemas_invalidos() {
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://[fe80::1]/",
+            "http://0.0.0.0/",
+            "ftp://exemplo.com/x",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                validar_url_externa(url).await.is_err(),
+                "deveria bloquear: {url}"
+            );
+        }
+        // Loopback (servidor local de desenvolvimento) continua permitido.
+        assert!(validar_url_externa("http://127.0.0.1:3000").await.is_ok());
+        assert!(validar_url_externa("http://localhost:8080").await.is_ok());
+    }
+
+    #[test]
+    fn ip_interno_cobre_metadados_de_nuvem() {
+        use std::net::IpAddr;
+        for ip in ["169.254.169.254", "100.100.100.200", "0.0.0.0", "fe80::1"] {
+            assert!(ip_interno(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+        for ip in ["127.0.0.1", "192.168.1.10", "10.0.0.1", "8.8.8.8", "::1"] {
+            assert!(!ip_interno(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
     }
 }

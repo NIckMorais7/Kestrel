@@ -310,6 +310,16 @@ pub const COMANDOS_SLASH: &[ComandoSlash] = &[
         descricao: "mostra ou oculta o raciocínio do modelo na conversa (padrão: oculto)",
     },
     ComandoSlash {
+        nome: "/person",
+        argumentos: "[new|use|edit|see|remove|off] [nome]",
+        descricao: "Comps (personalidades): cria, edita, ativa e remove comportamentos do agente",
+    },
+    ComandoSlash {
+        nome: "/skin",
+        argumentos: "[nome]",
+        descricao: "lista ou troca a skin visual (kestrel, mono, daylight)",
+    },
+    ComandoSlash {
         nome: "/permissions",
         argumentos: "[nível]",
         descricao: "mostra ou altera o nível de permissão (read/write/semi/full)",
@@ -322,7 +332,7 @@ pub const COMANDOS_SLASH: &[ComandoSlash] = &[
     ComandoSlash {
         nome: "/agent",
         argumentos: "",
-        descricao: "modo agente: trabalha no projeto conforme as permissões",
+        descricao: "modo build: trabalha no projeto conforme as permissões",
     },
     ComandoSlash {
         nome: "/clear",

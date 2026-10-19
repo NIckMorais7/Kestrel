@@ -128,9 +128,11 @@ impl Default for ProviderConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ModoOperacao {
     /// Somente conversa e leitura: nenhuma ferramenta altera arquivos ou executa comandos.
+    #[serde(alias = "conversa")]
     Chat,
     /// Trabalho completo no projeto, sempre respeitando o nível de permissão.
     #[default]
+    #[serde(alias = "agent")]
     Agente,
 }
 
@@ -138,7 +140,7 @@ impl ModoOperacao {
     pub fn label(&self) -> &'static str {
         match self {
             ModoOperacao::Chat => "chat",
-            ModoOperacao::Agente => "agente",
+            ModoOperacao::Agente => "build",
         }
     }
 
@@ -156,7 +158,7 @@ impl ModoOperacao {
     pub fn parse(valor: &str) -> Option<Self> {
         match valor.trim().to_lowercase().as_str() {
             "chat" | "conversa" => Some(ModoOperacao::Chat),
-            "agente" | "agent" | "trabalho" => Some(ModoOperacao::Agente),
+            "agente" | "agent" | "build" | "trabalho" => Some(ModoOperacao::Agente),
             _ => None,
         }
     }
@@ -168,8 +170,6 @@ pub struct AgentConfig {
     pub permission: PermissionLevel,
     /// Modo de operação atual (chat ou agente).
     pub modo: ModoOperacao,
-    /// Máximo de iterações do ciclo de ferramentas por turno.
-    pub max_iterations: u32,
     /// Fração do contexto utilizável que dispara o dossiê de continuidade.
     pub context_compact_threshold: f32,
     /// Tokens reservados para a resposta do modelo.
@@ -202,7 +202,6 @@ impl Default for AgentConfig {
         Self {
             permission: PermissionLevel::Semi,
             modo: ModoOperacao::Agente,
-            max_iterations: 40,
             context_compact_threshold: 0.90,
             reserve_response_tokens: 4096,
             default_context_window: 128_000,
@@ -212,7 +211,7 @@ impl Default for AgentConfig {
             external_dirs: Vec::new(),
             max_history_messages: 200,
             recovery_timeout_secs: 1200,
-            recovery_max_attempts: 9,
+            recovery_max_attempts: 15,
         }
     }
 }
@@ -222,9 +221,12 @@ impl Default for AgentConfig {
 pub struct UiConfig {
     pub show_mascot: bool,
     pub max_input_history: usize,
-    pub confirm_destructive: bool,
     pub show_reasoning: bool,
     pub language: String,
+    /// Skin visual ativa (`kestrel`, `mono` ou `daylight`).
+    pub skin: String,
+    /// Comp (personalidade) ativo; `None` usa o tom padrão do Kestrel.
+    pub active_comp: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -232,9 +234,10 @@ impl Default for UiConfig {
         Self {
             show_mascot: true,
             max_input_history: 200,
-            confirm_destructive: true,
             show_reasoning: false,
             language: "pt-BR".to_string(),
+            skin: "mono".to_string(),
+            active_comp: None,
         }
     }
 }
@@ -257,9 +260,10 @@ impl Default for WebConfig {
         Self {
             engine: "duckduckgo".to_string(),
             searx_url: None,
-            user_agent:
-                "Mozilla/5.0 (X11; Linux x86_64) Kestrel/0.1 (agente de codificação; +terminal)"
-                    .to_string(),
+            user_agent: format!(
+                "Mozilla/5.0 (X11; Linux x86_64) Kestrel/{} (agente de codificação; +terminal)",
+                env!("CARGO_PKG_VERSION")
+            ),
             max_download_bytes: 50 * 1024 * 1024,
             browser_bin: None,
             request_timeout_secs: 60,
@@ -288,7 +292,8 @@ impl Config {
     /// - **arquivo corrompido**: padrão + aviso claro, **mas** o arquivo ruim é
     ///   preservado como `.corrompido-<data>` em vez de ser sobrescrito, para o
     ///   usuário poder recuperar o que tinha;
-    /// - **valor fora da faixa**: o padrão é usado e o ajuste é listado no aviso.
+    /// - **valor fora da faixa**: o valor é **preservado** (não descartamos a
+    ///   configuração do usuário) e um aviso lista o que revisar.
     pub fn load(paths: &Paths) -> (Self, Option<String>) {
         let file = paths.config_file();
         let texto = match std::fs::read_to_string(&file) {
@@ -298,7 +303,8 @@ impl Config {
                 return (
                     Config::default(),
                     Some(format!(
-                        "não foi possível ler a configuração em {}: {e}",
+                        "não foi possível ler a configuração em {}: {e}. \
+                         Usando a configuração padrão.",
                         file.display()
                     )),
                 );
@@ -330,7 +336,7 @@ impl Config {
             (inteiro, None)
         } else {
             let lista = avisos.join("; ");
-            (inteiro, Some(format!("ajustes na configuração: {lista}")))
+            (inteiro, Some(format!("verifique a configuração: {lista}")))
         }
     }
 
@@ -338,6 +344,13 @@ impl Config {
     /// obscura. Nada aqui muda o comportamento: só avisa.
     fn validar(&self) -> Vec<String> {
         let mut avisos = Vec::new();
+        if self.provider.base_url.trim().is_empty() {
+            avisos.push("provider.base_url vazio (nenhuma requisição seria possível)".into());
+        }
+        if self.provider.api_key_env.trim().is_empty() {
+            avisos
+                .push("provider.api_key_env vazio (nenhuma variável de ambiente será lida)".into());
+        }
         if self.provider.max_tokens == 0 {
             avisos.push("provider.max_tokens = 0 (o modelo talvez não aceite)".into());
         }
@@ -353,11 +366,18 @@ impl Config {
         if self.provider.temperature.is_nan() {
             avisos.push("provider.temperature não é um número válido".into());
         }
-        if self.agent.max_iterations == 0 {
-            avisos.push("agent.max_iterations = 0 (o turno não faria nada)".into());
-        }
         if self.agent.max_history_messages == 0 {
             avisos.push("agent.max_history_messages = 0 (sem histórico)".into());
+        }
+        if self.agent.default_context_window == 0 {
+            avisos.push("agent.default_context_window = 0 (nenhum contexto caberia)".into());
+        }
+        if self.agent.reserve_response_tokens as usize >= self.agent.default_context_window as usize
+        {
+            avisos.push(format!(
+                "agent.reserve_response_tokens = {} não cabe em default_context_window = {}",
+                self.agent.reserve_response_tokens, self.agent.default_context_window
+            ));
         }
         if !(0.0..=1.0).contains(&self.agent.context_compact_threshold) {
             avisos.push(format!(
@@ -365,11 +385,35 @@ impl Config {
                 self.agent.context_compact_threshold
             ));
         }
+        if self.agent.recovery_timeout_secs == 0 {
+            avisos
+                .push("agent.recovery_timeout_secs = 0 (recuperação desativada na prática)".into());
+        }
+        if self.agent.recovery_max_attempts == 0 {
+            avisos.push("agent.recovery_max_attempts = 0 (nenhuma tentativa de correção)".into());
+        }
         if !matches!(self.web.engine.as_str(), "duckduckgo" | "searx") {
             avisos.push(format!(
                 "web.engine = `{}` não é conhecido (usando DuckDuckGo)",
                 self.web.engine
             ));
+        }
+        if self.web.engine == "searx"
+            && self
+                .web
+                .searx_url
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            avisos.push("web.engine = searx sem web.searx_url definido".into());
+        }
+        if self.web.max_download_bytes == 0 {
+            avisos.push("web.max_download_bytes = 0 (nenhum download seria possível)".into());
+        }
+        if self.web.request_timeout_secs == 0 {
+            avisos.push("web.request_timeout_secs = 0".into());
         }
         avisos
     }
@@ -507,11 +551,11 @@ fn config_invalida_valores_sem_descartar() {
     std::fs::create_dir_all(&dir).unwrap();
     let arquivo = dir.join("config").join("config.toml");
     std::fs::create_dir_all(arquivo.parent().unwrap()).unwrap();
-    std::fs::write(&arquivo, "[agent]\nmax_iterations = 0\n").unwrap();
+    std::fs::write(&arquivo, "[agent]\nrecovery_max_attempts = 0\n").unwrap();
     let paths = Paths::with_root(&dir);
     let (_cfg, aviso) = Config::load(&paths);
-    let aviso = aviso.expect("max_iterations = 0 deveria gerar aviso");
-    assert!(aviso.contains("max_iterations"), "{aviso}");
+    let aviso = aviso.expect("recovery_max_attempts = 0 deveria gerar aviso");
+    assert!(aviso.contains("recovery_max_attempts"), "{aviso}");
     // O arquivo continua no lugar (nada foi descartado).
     assert!(arquivo.exists(), "a configuração válida deveria permanecer");
     let _ = std::fs::remove_dir_all(&dir);
@@ -583,5 +627,38 @@ mod tests {
         assert_eq!(c.provider.models.len(), 2);
         c.upsert_model(ModelEntry::new("a"));
         assert_eq!(c.provider.models.len(), 2);
+    }
+
+    /// Os rótulos que a interface/`/permissions` mostram em português também
+    /// precisam ser aceitos no TOML: um valor inválido descartava o arquivo
+    /// inteiro.
+    #[test]
+    fn aceita_rotulos_em_portugues() {
+        let cfg: Config =
+            toml::from_str("[agent]\npermission = \"leitura\"\nmodo = \"conversa\"\n")
+                .expect("rótulos em português devem ser aceitos");
+        assert_eq!(cfg.agent.permission, PermissionLevel::Read);
+        assert_eq!(cfg.agent.modo, ModoOperacao::Chat);
+
+        let cfg: Config = toml::from_str("[agent]\npermission = \"escrita\"\nmodo = \"agente\"\n")
+            .expect("rótulos em português devem ser aceitos");
+        assert_eq!(cfg.agent.permission, PermissionLevel::Write);
+        assert_eq!(cfg.agent.modo, ModoOperacao::Agente);
+
+        let cfg: Config = toml::from_str("[agent]\npermission = \"completo\"\n").unwrap();
+        assert_eq!(cfg.agent.permission, PermissionLevel::Full);
+        let cfg: Config = toml::from_str("[agent]\npermission = \"semiautônomo\"\n").unwrap();
+        assert_eq!(cfg.agent.permission, PermissionLevel::Semi);
+    }
+
+    /// Chaves removidas (não fazem mais sentido) não podem derrubar a config
+    /// de quem já as tinha no arquivo.
+    #[test]
+    fn chaves_antigas_nao_derrubam_a_config() {
+        let cfg: Config =
+            toml::from_str("[agent]\nmax_iterations = 40\n[ui]\nconfirm_destructive = false\n")
+                .expect("chaves antigas devem ser ignoradas");
+        assert_eq!(cfg.agent.permission, PermissionLevel::Semi);
+        assert!(cfg.ui.show_mascot);
     }
 }

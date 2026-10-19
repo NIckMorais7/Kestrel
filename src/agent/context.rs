@@ -146,8 +146,9 @@ pub fn construir_dossie(
         d.objetivo = sessao.objective.unwrap_or_else(|| sessao.title.clone());
     }
 
-    // Instruções: mensagens do usuário.
-    for m in store.messages(session_id, 2000)? {
+    // Instruções: mensagens do usuário (as mais recentes — o dossiê precisa
+    // do que está em andamento, não do começo da conversa).
+    for m in store.recent_messages(session_id, 2000)? {
         if m.role == "user" {
             d.instrucoes
                 .push(crate::util::truncate(m.content.trim(), 400));

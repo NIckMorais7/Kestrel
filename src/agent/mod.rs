@@ -5,6 +5,7 @@ pub mod context;
 pub mod prompt;
 pub mod recovery;
 
+use crate::comps;
 use crate::config::Config;
 use crate::db::Store;
 use crate::events::{AgentEvent, ConfirmRequest, PlanoPasso, StatusPasso, TarefaView, UiCommand};
@@ -142,6 +143,61 @@ impl Compartilhado {
             .ok();
     }
 
+    /// Define a skin visual e persiste, mantendo a cópia do agente alinhada
+    /// com a da interface (senão um `/model` posterior gravaria a skin antiga).
+    pub fn definir_skin(&self, skin: String) -> anyhow::Result<()> {
+        {
+            let mut estado = self.estado.write().expect("estado");
+            estado.config.ui.skin = skin.clone();
+            estado
+                .config
+                .save(&self.paths)
+                .map_err(|e| anyhow::anyhow!("falha ao salvar configuração: {e}"))?;
+        }
+        self.store
+            .audit(
+                Some(&self.sessao().id),
+                "config",
+                Some(&format!("skin: {skin}")),
+                Some("definir_skin"),
+            )
+            .ok();
+        Ok(())
+    }
+
+    /// Ativa ou desativa um Comp. O arquivo já precisa existir; a criação é
+    /// feita pela interface ou pela ferramenta `create_comp`.
+    pub fn definir_comp(&self, comp: Option<String>) -> anyhow::Result<()> {
+        if let Some(nome) = &comp
+            && comps::encontrar(&self.paths.comps_dir(), nome).is_none()
+        {
+            anyhow::bail!(
+                "Comp `{nome}` não encontrado em {}",
+                self.paths.comps_dir().display()
+            );
+        }
+        {
+            let mut estado = self.estado.write().expect("estado");
+            estado.config.ui.active_comp = comp.clone();
+            estado
+                .config
+                .save(&self.paths)
+                .map_err(|e| anyhow::anyhow!("falha ao salvar configuração: {e}"))?;
+        }
+        self.store
+            .audit(
+                Some(&self.sessao().id),
+                "config",
+                Some(&format!(
+                    "Comp ativo: {}",
+                    comp.as_deref().unwrap_or("(nenhum)")
+                )),
+                Some("definir_comp"),
+            )
+            .ok();
+        Ok(())
+    }
+
     /// Define o nível de permissão e persiste.
     pub fn definir_permissao(&self, nivel: PermissionLevel) -> anyhow::Result<()> {
         {
@@ -243,6 +299,7 @@ impl Compartilhado {
             cfg.agent.permission.label(),
             None,
         )?;
+        self.permitidos.lock().expect("lock").clear();
         self.definir_sessao(EstadoSessao {
             id: id.clone(),
             titulo: titulo.clone(),
@@ -286,6 +343,7 @@ impl Compartilhado {
             permitidos: self.permitidos.clone(),
             skills: self.skills(),
             skills_dir: self.paths.skills_dir(),
+            comps_dir: self.paths.comps_dir(),
             projeto: self.projeto(),
             web: config.web.clone(),
             http: self.http.clone(),
@@ -419,7 +477,10 @@ impl Agente {
         let (fim_tx, mut fim_rx) = mpsc::unbounded_channel::<()>();
         let mut turno_ativo = false;
         let mut cancel_atual: Option<CancellationToken> = None;
-        let mut pendente: Option<(String, bool)> = None;
+        // Fila, não um único slot: duas mensagens enviadas durante um turno
+        // não podem se sobrescrever (a primeira era perdida em silêncio).
+        let mut pendentes: std::collections::VecDeque<(String, bool)> =
+            std::collections::VecDeque::new();
 
         // Sessões interrompidas do mesmo projeto que podem ser retomadas.
         if let Ok(sessoes) = self.comp.store.sessions_para_recuperar() {
@@ -443,7 +504,7 @@ impl Agente {
                     match comando {
                         UiCommand::EnviarMensagem(texto) => {
                             if turno_ativo {
-                                pendente = Some((texto, false));
+                                pendentes.push_back((texto, false));
                                 if let Some(c) = &cancel_atual { c.cancel(); }
                             } else {
                                 let cancel = CancellationToken::new();
@@ -454,7 +515,10 @@ impl Agente {
                         }
                         UiCommand::Redirecionar(texto) => {
                             if turno_ativo {
-                                pendente = Some((texto, true));
+                                // Redirecionar substitui os pedidos enfileirados:
+                                // as instruções novas são o que importa agora.
+                                pendentes.clear();
+                                pendentes.push_back((texto, true));
                                 if let Some(c) = &cancel_atual { c.cancel(); }
                                 self.comp.evento(AgentEvent::Aviso {
                                     mensagem: "Redirecionamento recebido: interrompendo a execução atual e aplicando as novas instruções.".into(),
@@ -472,8 +536,8 @@ impl Agente {
                             // pede "interromper" não quer que o agente continue
                             // trabalhando no pedido anterior assim que o turno
                             // atual terminar.
-                            if pendente.is_some() {
-                                pendente = None;
+                            if !pendentes.is_empty() {
+                                pendentes.clear();
                                 self.comp.evento(AgentEvent::Aviso {
                                     mensagem: "Turno interrompido; o pedido enfileirado foi descartado."
                                         .into(),
@@ -523,11 +587,45 @@ impl Agente {
                             // (e para o atual, no próximo delta).
                             self.comp.definir_raciocinio(visivel);
                         }
+                        UiCommand::DefinirSkin(skin) => {
+                            if let Err(e) = self.comp.definir_skin(skin) {
+                                self.comp.evento(AgentEvent::Erro {
+                                    mensagem: format!("falha ao salvar a skin: {e}"),
+                                    dica: None,
+                                    recuperavel: true,
+                                });
+                            }
+                        }
+                        UiCommand::DefinirComp(comp) => {
+                            if let Err(e) = self.comp.definir_comp(comp) {
+                                self.comp.evento(AgentEvent::Erro {
+                                    mensagem: format!("falha ao ativar o Comp: {e}"),
+                                    dica: Some("use /person para listar os Comps disponíveis".into()),
+                                    recuperavel: true,
+                                });
+                            }
+                        }
                         UiCommand::NovaSessao => {
+                            if turno_ativo {
+                                if let Some(c) = &cancel_atual { c.cancel(); }
+                                pendentes.clear();
+                                self.comp.evento(AgentEvent::Aviso {
+                                    mensagem: "Nova sessão: interrompendo a execução atual.".into(),
+                                });
+                            }
                             self.nova_sessao();
                         }
                         UiCommand::RetomarSessao(id) => {
-                            self.retomar_sessao(&id, &mut turno_ativo, &mut cancel_atual, &fim_tx);
+                            if turno_ativo {
+                                // Trocar a sessão ativa no meio de um turno faria o
+                                // turno em andamento gravar ferramentas na sessão
+                                // errada. Melhor recusar com instrução clara.
+                                self.comp.evento(AgentEvent::Aviso {
+                                    mensagem: "Há um turno em andamento. Interrompa-o (Esc) antes de retomar outra sessão.".into(),
+                                });
+                            } else {
+                                self.retomar_sessao(&id, &mut turno_ativo, &mut cancel_atual, &fim_tx);
+                            }
                         }
                         UiCommand::AnalisarProjeto => {
                             let info = self.comp.reanalisar_projeto();
@@ -538,7 +636,7 @@ impl Agente {
                         UiCommand::TrocarProjeto(caminho) => {
                             if turno_ativo {
                                 if let Some(c) = &cancel_atual { c.cancel(); }
-                                pendente = None;
+                                pendentes.clear();
                                 self.comp.evento(AgentEvent::Aviso {
                                     mensagem: "Troca de projeto: interrompendo a execução atual."
                                         .into(),
@@ -574,7 +672,7 @@ impl Agente {
                 Some(()) = fim_rx.recv() => {
                     turno_ativo = false;
                     cancel_atual = None;
-                    if let Some((texto, redirecionado)) = pendente.take() {
+                    if let Some((texto, redirecionado)) = pendentes.pop_front() {
                         let cancel = CancellationToken::new();
                         cancel_atual = Some(cancel.clone());
                         turno_ativo = true;
@@ -609,6 +707,9 @@ impl Agente {
             });
             return;
         }
+        // Nova sessão, nova allowlist: um "permitir sempre" dado no contexto
+        // anterior não deve valer para outro trabalho.
+        self.comp.permitidos.lock().expect("lock").clear();
         self.comp.definir_sessao(EstadoSessao {
             id: id.clone(),
             titulo: titulo.clone(),
@@ -635,6 +736,7 @@ impl Agente {
             });
             return;
         };
+        self.comp.permitidos.lock().expect("lock").clear();
         self.comp.definir_sessao(EstadoSessao {
             id: sessao.id.clone(),
             titulo: sessao.title.clone(),
@@ -713,8 +815,26 @@ fn spawn_turno(
     tokio::spawn(async move {
         // O guard roda no Drop: cobre erro E pânico.
         let _fim = SinalizaFim(fim_tx);
+        let comp_erro = comp.clone();
         if let Err(e) = executar_turno(comp, texto, redirecionado, cancel).await {
             eprintln!("kestrel: falha inesperada no turno: {e}");
+            // Antes só ia para o stderr: a interface ficava sem saber que o
+            // turno morreu (e a sessão continuava marcada como ativa).
+            comp_erro.evento(AgentEvent::Erro {
+                mensagem: format!("falha interna ao executar o turno: {e}"),
+                dica: Some(
+                    "as alterações já feitas foram preservadas; verifique o disco/banco e tente novamente"
+                        .into(),
+                ),
+                recuperavel: true,
+            });
+            comp_erro
+                .store
+                .update_session_status(&comp_erro.sessao().id, "interrompida")
+                .ok();
+            comp_erro.evento(AgentEvent::TurnoConcluido {
+                resumo: format!("Turno encerrado por falha interna: {e}"),
+            });
         }
     });
 }
@@ -733,9 +853,17 @@ async fn executar_turno(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let inicio = std::time::Instant::now();
-    let cfg = comp.config();
+    // `mut`: a configuração pode mudar durante o turno (/model, /permission,
+    // /mode); reler a cada iteração mantém o turno consistente com a escolha
+    // atual do usuário em vez de congelar no início.
+    let mut cfg = comp.config();
     // `mut`: a compactação de contexto troca a sessão ativa no meio do turno.
     let mut sessao = comp.sessao();
+    // Contabilidade discreta exibida no fim do turno: só duração, velocidade
+    // aproximada de geração, modelo e modo. Nada de arquivos/ferramentas.
+    let mut tokens_gerados_turno: u64 = 0;
+    let modelo_turno = cfg.provider.model.clone();
+    let modo_turno = cfg.agent.modo;
     comp.evento(AgentEvent::TurnoIniciado);
     comp.evento(AgentEvent::SessaoAtiva {
         id: sessao.id.clone(),
@@ -760,8 +888,6 @@ async fn executar_turno(
     }
 
     let mut historico = carregar_historico(&comp, &sessao.id, cfg.agent.max_history_messages);
-    let mut ctx_ferramentas = comp.contexto_ferramentas(cancel.clone());
-    ctx_ferramentas.subagente = Some(Compartilhado::novo_subagente(&comp));
     let mut recuperacao = recovery::Recuperacao::novo(
         cfg.agent.recovery_max_attempts,
         Duration::from_secs(cfg.agent.recovery_timeout_secs),
@@ -786,6 +912,7 @@ async fn executar_turno(
         // mais manter a conversa. Um teto fixo só fazia o trabalho parar no
         // meio e exigir que o usuario reenviasse a instrução — e iterações
         // longas são justamente o caso normal de uma tarefa grande.
+        cfg = comp.config();
         iteracoes += 1;
         comp.estado_ui(format!("trabalhando… {iteracoes}ª interação"));
 
@@ -890,6 +1017,8 @@ async fn executar_turno(
                             uso.reasoning_tokens,
                         )
                         .ok();
+                    tokens_gerados_turno +=
+                        u64::from(uso.completion_tokens) + u64::from(uso.reasoning_tokens);
                     comp.evento(AgentEvent::Tokens {
                         prompt: uso.prompt_tokens,
                         completion: uso.completion_tokens,
@@ -934,11 +1063,15 @@ async fn executar_turno(
 
         let tool_calls = completion.tool_calls.clone();
         let texto_assistente = completion.text.clone();
+        // O provedor exige que `arguments` seja JSON válido. Modelos (e a
+        // NVIDIA) às vezes devolvem texto quebrado; a cópia segura preserva o
+        // protocolo, enquanto a original ainda serve para diagnóstico.
+        let chamadas_seguras = chamadas_para_historico(&tool_calls);
 
-        let chamadas_json = if tool_calls.is_empty() {
+        let chamadas_json = if chamadas_seguras.is_empty() {
             None
         } else {
-            Some(serde_json::to_string(&tool_calls)?)
+            Some(serde_json::to_string(&chamadas_seguras)?)
         };
         comp.store.append_message(
             &sessao.id,
@@ -960,7 +1093,7 @@ async fn executar_turno(
         }
         historico.push(ChatMessage::assistant_with_calls(
             texto_assistente.clone(),
-            tool_calls.clone(),
+            chamadas_seguras.clone(),
         ));
 
         if tool_calls.is_empty() {
@@ -977,6 +1110,9 @@ async fn executar_turno(
             malformadas_seguidas += 1;
             let classe = recovery::Classificacao::RespostaMalformada;
             let diag = recuperacao.diagnosticar(classe);
+            // Primeiro os `tool` results, depois o pedido de nova resposta: a
+            // API exige um resultado para cada `tool_call` já gravado.
+            registrar_malformadas(&comp, &sessao, &mut historico, malformadas)?;
             comp.store.append_message(
                 &sessao.id,
                 "user",
@@ -1017,7 +1153,11 @@ async fn executar_turno(
         }
         malformadas_seguidas = 0;
 
-        // Executa as chamadas.
+        // Executa as chamadas. O contexto é recriado aqui (e não no início do
+        // turno) para refletir sessão ativa, nível, modo e raízes atuais —
+        // inclusive depois de uma compactação ou de /permission no meio do turno.
+        let mut ctx_ferramentas = comp.contexto_ferramentas(cancel.clone());
+        ctx_ferramentas.subagente = Some(Compartilhado::novo_subagente(&comp));
         comp.estado_ui(format!(
             "executando {} ferramenta(s)",
             validas.len() + malformadas.len()
@@ -1091,37 +1231,14 @@ async fn executar_turno(
             comp.evento(AgentEvent::FerramentaConcluida {
                 nome: call.name.clone(),
                 sucesso,
-                resumo,
+                resumo: crate::util::redact_secrets(&resumo),
                 adicoes,
                 remocoes,
             });
         }
 
         // Chamadas malformadas viram resultados de erro para o modelo corrigir.
-        for (call, erro) in malformadas {
-            let erro = crate::util::redact_secrets(&erro);
-            comp.store.append_message(
-                &sessao.id,
-                "tool",
-                &erro,
-                None,
-                Some(&call.id),
-                Some(&call.name),
-                None,
-            )?;
-            historico.push(ChatMessage::tool_result(
-                call.id.clone(),
-                call.name.clone(),
-                erro.clone(),
-            ));
-            comp.evento(AgentEvent::FerramentaConcluida {
-                nome: call.name.clone(),
-                sucesso: false,
-                resumo: format!("argumentos inválidos: {}", crate::util::truncate(&erro, 80)),
-                adicoes: 0,
-                remocoes: 0,
-            });
-        }
+        registrar_malformadas(&comp, &sessao, &mut historico, malformadas)?;
 
         // Só depois de persistir e devolver todos os resultados é que o turno
         // termina — nunca no meio do laço.
@@ -1145,19 +1262,17 @@ async fn executar_turno(
     // Finalização do turno.
     comp.store.touch_session(&sessao.id).ok();
     let duracao = inicio.elapsed();
-    let stats = comp.store.session_stats(&sessao.id).unwrap_or_default();
     if resultado.concluido {
         comp.store.update_session_status(&sessao.id, "ativa").ok();
+        let segundos = duracao.as_secs_f64().max(0.001);
+        let velocidade = tokens_gerados_turno as f64 / segundos;
         comp.evento(AgentEvent::TurnoConcluido {
             resumo: format!(
-                "{}\n\nDuração: {}\nArquivos alterados: {} | +{} -{} linhas | ferramentas: {} ({} falhas)",
-                resultado.resumo,
+                "{} · {:.1} tok/s · {} · {}",
                 crate::util::format_duration_ms(duracao.as_millis() as u64),
-                stats.files_touched,
-                stats.additions,
-                stats.deletions,
-                stats.tool_runs,
-                stats.tool_failures
+                velocidade,
+                crate::util::truncate(&modelo_turno, 32),
+                modo_turno.label()
             ),
         });
     } else if cancel.is_cancelled() {
@@ -1220,9 +1335,17 @@ fn montar_prompt(comp: &Compartilhado, cfg: &Config, dossie: Option<&str>) -> St
         })
         .collect();
     let workdir = cfg.workdir();
+    // A personalidade é carregada do disco a cada turno: editar o arquivo
+    // (ou remover o Comp) vale imediatamente, sem reiniciar o Kestrel.
+    let personalidade = cfg
+        .ui
+        .active_comp
+        .as_deref()
+        .and_then(|nome| comps::encontrar(&comp.paths.comps_dir(), nome).map(|(comp, _)| comp));
     prompt::construir(&prompt::PromptContext {
         projeto: &projeto,
         skills: &skills,
+        comp: personalidade.as_ref(),
         nivel: cfg.agent.permission,
         modo: cfg.agent.modo,
         esforco: cfg.provider.reasoning_effort.as_deref(),
@@ -1259,6 +1382,9 @@ fn carregar_historico(comp: &Compartilhado, sessao: &str, limite: usize) -> Vec<
             "assistant" => {
                 let mut mensagem = if let Some(json) = &linha.tool_calls {
                     let calls: Vec<ToolCall> = serde_json::from_str(json).unwrap_or_default();
+                    // Um histórico antigo (ou um modelo que mandou JSON
+                    // quebrado) não pode derrubar o próximo turno com 400.
+                    let calls = chamadas_para_historico(&calls);
                     ChatMessage::assistant_with_calls(linha.content, calls)
                 } else {
                     ChatMessage::assistant(linha.content)
@@ -1274,26 +1400,45 @@ fn carregar_historico(comp: &Compartilhado, sessao: &str, limite: usize) -> Vec<
             _ => {}
         }
     }
-    // Remove mensagens de ferramenta órfãs (sem chamada correspondente).
+    // Fecha pares `assistant(tool_calls)` / `tool`: a API rejeita um
+    // `tool_call` sem resultado (turno interrompido no meio, histórico cortado
+    // no limite ou chamada nunca respondida). Resultados órfãos são descartados.
     let mut resultado: Vec<ChatMessage> = Vec::with_capacity(mensagens.len());
-    let mut ids: HashSet<String> = HashSet::new();
+    let mut pendentes: Vec<(String, String)> = Vec::new();
+    fn resolver_pendentes(resultado: &mut Vec<ChatMessage>, pendentes: &mut Vec<(String, String)>) {
+        for (id, nome) in pendentes.drain(..) {
+            resultado.push(ChatMessage::tool_result(
+                id,
+                nome,
+                "ERRO: resultado da ferramenta perdido (turno interrompido); reexecute se necessário.",
+            ));
+        }
+    }
     for m in mensagens {
         match m.role {
             crate::provider::Role::Assistant => {
-                for c in &m.tool_calls {
-                    ids.insert(c.id.clone());
-                }
+                resolver_pendentes(&mut resultado, &mut pendentes);
+                pendentes = m
+                    .tool_calls
+                    .iter()
+                    .map(|c| (c.id.clone(), c.name.clone()))
+                    .collect();
                 resultado.push(m);
             }
             crate::provider::Role::Tool => {
                 let id = m.tool_call_id.clone().unwrap_or_default();
-                if ids.contains(&id) {
+                if pendentes.iter().any(|(p, _)| *p == id) {
+                    pendentes.retain(|(p, _)| *p != id);
                     resultado.push(m);
                 }
             }
-            _ => resultado.push(m),
+            _ => {
+                resolver_pendentes(&mut resultado, &mut pendentes);
+                resultado.push(m);
+            }
         }
     }
+    resolver_pendentes(&mut resultado, &mut pendentes);
     resultado
 }
 
@@ -1377,6 +1522,15 @@ fn compactar_contexto(
 }
 
 /// Separa chamadas válidas das malformadas.
+/// Cópia das chamadas pronta para voltar ao provedor: os argumentos inválidos
+/// do modelo não podem ser reenviar como texto quebrado (a API responde 400).
+fn chamadas_para_historico(chamadas: &[ToolCall]) -> Vec<ToolCall> {
+    chamadas
+        .iter()
+        .map(ToolCall::com_argumentos_validos)
+        .collect()
+}
+
 fn separar_chamadas(chamadas: Vec<ToolCall>) -> (Vec<ToolCall>, Vec<(ToolCall, String)>) {
     let mut validas = Vec::new();
     let mut malformadas = Vec::new();
@@ -1529,7 +1683,13 @@ fn converter(resultado: Result<crate::tools::ToolOutput, ToolError>) -> Resultad
             } else {
                 saida.conteudo.clone()
             };
-            (true, conteudo, saida.resumo, saida.adicoes, saida.remocoes)
+            (
+                saida.sucesso,
+                conteudo,
+                saida.resumo,
+                saida.adicoes,
+                saida.remocoes,
+            )
         }
         Err(erro) => {
             let texto = match &erro {
@@ -1591,6 +1751,45 @@ impl SubagentRunner for ExecutorSubagente {
     ) -> Result<String, String> {
         executar_subagente_interno(self.comp.clone(), tarefa, contexto, cancel, eventos).await
     }
+}
+
+/// Persiste e devolve ao histórico os resultados de erro de chamadas
+/// malformadas.
+///
+/// A mensagem do assistente já foi gravada com `tool_calls`; a API exige um
+/// `tool` para cada `id`. Sem isto, o caminho "todas malformadas" deixava o
+/// histórico inválido e a requisição seguinte falhava com HTTP 400.
+fn registrar_malformadas(
+    comp: &Compartilhado,
+    sessao: &EstadoSessao,
+    historico: &mut Vec<ChatMessage>,
+    malformadas: Vec<(ToolCall, String)>,
+) -> anyhow::Result<()> {
+    for (call, erro) in malformadas {
+        let erro = crate::util::redact_secrets(&erro);
+        comp.store.append_message(
+            &sessao.id,
+            "tool",
+            &erro,
+            None,
+            Some(&call.id),
+            Some(&call.name),
+            None,
+        )?;
+        historico.push(ChatMessage::tool_result(
+            call.id.clone(),
+            call.name.clone(),
+            erro.clone(),
+        ));
+        comp.evento(AgentEvent::FerramentaConcluida {
+            nome: call.name,
+            sucesso: false,
+            resumo: format!("argumentos inválidos: {}", crate::util::truncate(&erro, 80)),
+            adicoes: 0,
+            remocoes: 0,
+        });
+    }
+    Ok(())
 }
 
 /// Ferramentas disponíveis para subagentes (sem planejamento nem recursão).
@@ -1678,21 +1877,47 @@ async fn executar_subagente_interno(
         if !completion.text.trim().is_empty() {
             relatorio = completion.text.clone();
         }
-        let (validas, _) = separar_chamadas(completion.tool_calls.clone());
+        let (validas, malformadas) = separar_chamadas(completion.tool_calls.clone());
         historico.push(ChatMessage::assistant_with_calls(
             completion.text.clone(),
-            completion.tool_calls.clone(),
+            chamadas_para_historico(&completion.tool_calls),
         ));
-        if validas.is_empty() {
+        if validas.is_empty() && malformadas.is_empty() {
             break;
         }
+        // Chamadas malformadas também precisam de um `tool` result: sem ele o
+        // histórico fica inválido para a próxima requisição.
+        for (chamada, erro) in malformadas {
+            historico.push(ChatMessage::tool_result(
+                chamada.id,
+                chamada.name,
+                format!("ERRO: argumentos inválidos: {erro}"),
+            ));
+        }
         for chamada in validas {
+            // O filtro de specs só esconde a ferramenta do modelo; sem esta
+            // checagem uma chamada explícita executava qualquer ferramenta,
+            // inclusive as que o subagente não deveria ter (ex.: delete_file,
+            // spawn_subagent).
+            if !FERRAMENTAS_SUBAGENTE.contains(&chamada.name.as_str()) {
+                historico.push(ChatMessage::tool_result(
+                    chamada.id,
+                    chamada.name.clone(),
+                    format!(
+                        "ERRO: a ferramenta `{}` não está disponível para subagentes",
+                        chamada.name
+                    ),
+                ));
+                continue;
+            }
             let args: Value = serde_json::from_str(&chamada.arguments).unwrap_or(Value::Null);
             let resultado = comp.registro.executar(&chamada.name, args, &ctx).await;
             let texto = match resultado {
                 Ok(saida) => saida.conteudo,
                 Err(erro) => format!("ERRO: {erro}"),
             };
+            // Segredos não podem voltar ao modelo nem ao relatório.
+            let texto = crate::util::redact_secrets(&texto);
             historico.push(ChatMessage::tool_result(
                 chamada.id.clone(),
                 chamada.name.clone(),
@@ -1937,7 +2162,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mensagens = ambiente.comp.store.messages("s", 100).unwrap();
+        let mensagens = ambiente.comp.store.recent_messages("s", 100).unwrap();
         let ferramentas: Vec<&str> = mensagens
             .iter()
             .filter(|m| m.role == "tool")
@@ -2123,7 +2348,7 @@ mod tests {
         .unwrap();
 
         let eventos = drenar_eventos(&mut ambiente);
-        let mensagens = ambiente.comp.store.messages("s", 100).unwrap();
+        let mensagens = ambiente.comp.store.recent_messages("s", 100).unwrap();
         assert!(eventos.iter().any(|e| matches!(
             e,
             AgentEvent::FerramentaConcluida { nome, sucesso, .. }
@@ -2270,7 +2495,7 @@ mod tests {
             dir.join("dados/arquivo.txt").exists(),
             "a operação negada foi executada"
         );
-        let mensagens = ambiente.comp.store.messages("s", 100).unwrap();
+        let mensagens = ambiente.comp.store.recent_messages("s", 100).unwrap();
         let ferramenta = mensagens
             .iter()
             .find(|m| m.role == "tool")
@@ -2344,7 +2569,7 @@ mod tests {
                 if mensagem.contains("dossiê de continuidade aplicado")
         )));
 
-        let mensagens = ambiente.comp.store.messages("s2", 100).unwrap();
+        let mensagens = ambiente.comp.store.recent_messages("s2", 100).unwrap();
         let retomada = mensagens
             .iter()
             .rev()
@@ -2421,7 +2646,7 @@ mod tests {
         assert_ne!(nova.id, "s");
         let nova_linha = ambiente.comp.store.get_session(&nova.id).unwrap().unwrap();
         assert_eq!(nova_linha.parent_id.as_deref(), Some("s"));
-        let primeira = ambiente.comp.store.messages(&nova.id, 10).unwrap();
+        let primeira = ambiente.comp.store.recent_messages(&nova.id, 10).unwrap();
         assert!(primeira[0].content.contains("# Dossiê de continuidade"));
         let _ = std::fs::remove_dir_all(&dir);
     }

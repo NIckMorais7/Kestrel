@@ -15,7 +15,33 @@ fn parece_binario(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|b| *b == 0)
 }
 
+/// Teto para leitura de um arquivo inteiro em memória.
+///
+/// Sem ele, `read_file` num log/arquivo gigante (ou num FIFO/`/dev/zero`)
+/// travava a task e podia estourar a memória sem chance de timeout.
+const LIMITE_LEITURA_BYTES: u64 = 32 * 1024 * 1024;
+
 fn ler_texto(path: &Path) -> Result<String, ToolError> {
+    let meta = std::fs::metadata(path).map_err(|e| {
+        ToolError::msg(format!(
+            "não foi possível ler {}: {e}\nDica: verifique se o caminho existe e se você tem permissão de leitura.",
+            path.display()
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(ToolError::msg(format!(
+            "{} não é um arquivo regular (FIFO, dispositivo ou socket); leitura recusada para não travar o agente.",
+            path.display()
+        )));
+    }
+    if meta.len() > LIMITE_LEITURA_BYTES {
+        return Err(ToolError::msg(format!(
+            "{} tem {} e excede o limite de {} para leitura em memória. Use run_command com `head`/`sed` para recortes, ou start_line/end_line num arquivo menor.",
+            path.display(),
+            crate::util::human_bytes(meta.len()),
+            crate::util::human_bytes(LIMITE_LEITURA_BYTES)
+        )));
+    }
     let bytes = std::fs::read(path).map_err(|e| {
         ToolError::msg(format!(
             "não foi possível ler {}: {e}\nDica: verifique se o caminho existe e se você tem permissão de leitura.",
@@ -38,6 +64,10 @@ fn ler_texto(path: &Path) -> Result<String, ToolError> {
 }
 
 /// Escrita atômica: grava em arquivo temporário e renomeia.
+///
+/// As permissões do arquivo existente são copiadas para o temporário antes do
+/// `rename`: sem isso, reescrever um script/executável com `write_file` ou
+/// `edit_file` trocava o modo para o padrão do umask e perdia o `+x`.
 fn escrever_atomico(path: &Path, conteudo: &str) -> Result<(), ToolError> {
     let tmp = path.with_extension(format!(
         "{}kestrel-tmp",
@@ -45,8 +75,15 @@ fn escrever_atomico(path: &Path, conteudo: &str) -> Result<(), ToolError> {
             .map(|e| format!("{}.", e.to_string_lossy()))
             .unwrap_or_default()
     ));
-    std::fs::write(&tmp, conteudo)
-        .map_err(|e| ToolError::msg(format!("falha ao gravar {}: {e}", tmp.display())))?;
+    let permissoes = std::fs::metadata(path).ok().map(|m| m.permissions());
+    std::fs::write(&tmp, conteudo).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        ToolError::msg(format!("falha ao gravar {}: {e}", tmp.display()))
+    })?;
+    if let Some(perms) = permissoes {
+        // Falha em preservar o modo não deve impedir a gravação do conteúdo.
+        let _ = std::fs::set_permissions(&tmp, perms);
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         ToolError::msg(format!("falha ao substituir {}: {e}", path.display()))
@@ -63,6 +100,11 @@ fn com_numeros(conteudo: &str, inicio: usize) -> String {
         .join("\n")
 }
 
+/// Marcador gravado no lugar do diff quando ele é grande demais para o
+/// `/undo` confiar no recorte. A definição fica em [`crate::diff`] para que o
+/// reverso também saiba recusá-lo.
+pub(crate) use crate::diff::DIFF_TRUNCADO;
+
 /// Registra uma alteração no banco e devolve estatísticas reais do diff.
 pub(crate) fn registrar_alteracao(
     ctx: &ToolContext,
@@ -75,6 +117,11 @@ pub(crate) fn registrar_alteracao(
     // O diff pode conter segredos (linha `api_key = ...`, token): o banco só
     // recebe a versão redigida.
     let texto = crate::util::redact_secrets(&d.text);
+    let guardado: &str = if texto.chars().count() > 20_000 {
+        DIFF_TRUNCADO
+    } else {
+        &texto
+    };
     ctx.store
         .record_file_change(
             &ctx.session_id,
@@ -82,7 +129,7 @@ pub(crate) fn registrar_alteracao(
             tipo,
             d.stats.additions,
             d.stats.deletions,
-            Some(&crate::util::truncate(&texto, 20_000)),
+            Some(guardado),
         )
         .ok();
     ctx.arquivos.registrar(path, depois);
@@ -93,16 +140,108 @@ pub(crate) fn caminho_relativo(ctx: &ToolContext, path: &Path) -> String {
     crate::util::display_path(&ctx.workdir, path)
 }
 
+/// Devolve a linha com strings e comentários mascarados por espaços,
+/// preservando o código (chaves e identificadores). Mantém o estado de
+/// comentário de bloco entre linhas.
+///
+/// Sem isto, `localizar_bloco` contava chaves dentro de strings (`"}"`) e
+/// encontrava identificadores em comentários, fechando o bloco cedo demais.
+fn linha_sem_strings_e_comentarios(linha: &str, em_bloco: &mut bool) -> String {
+    let chars: Vec<char> = linha.chars().collect();
+    let mut saida = String::with_capacity(linha.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if *em_bloco {
+            if c == '*' && chars.get(i + 1) == Some(&'/') {
+                *em_bloco = false;
+                saida.push_str("  ");
+                i += 2;
+            } else {
+                saida.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            '"' | '`' => {
+                saida.push(' ');
+                i += 1;
+                while i < chars.len() {
+                    let c2 = chars[i];
+                    if c2 == '\\' {
+                        saida.push_str("  ");
+                        i += 2;
+                        continue;
+                    }
+                    saida.push(' ');
+                    i += 1;
+                    if c2 == c {
+                        break;
+                    }
+                }
+            }
+            '\'' => {
+                // `'a'`/`'\n'` são literais de caractere; `'a` é lifetime em
+                // Rust (não pode abrir "string" e mascarar o resto da linha).
+                let fecha = matches!(
+                    (chars.get(i + 1), chars.get(i + 2)),
+                    (Some('\\'), _) | (Some(_), Some('\''))
+                );
+                if fecha {
+                    saida.push(' ');
+                    i += 1;
+                    while i < chars.len() {
+                        let c2 = chars[i];
+                        if c2 == '\\' {
+                            saida.push_str("  ");
+                            i += 2;
+                            continue;
+                        }
+                        saida.push(' ');
+                        i += 1;
+                        if c2 == '\'' {
+                            break;
+                        }
+                    }
+                } else {
+                    saida.push('\'');
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'/') => {
+                saida.extend(std::iter::repeat_n(' ', chars.len() - i));
+                i = chars.len();
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                *em_bloco = true;
+                saida.push_str("  ");
+                i += 2;
+            }
+            _ => {
+                saida.push(c);
+                i += 1;
+            }
+        }
+    }
+    saida
+}
+
 /// Localiza o bloco que contém `identificador` (função, classe, seção).
 fn localizar_bloco(conteudo: &str, identificador: &str) -> Option<(usize, usize)> {
     let linhas: Vec<&str> = conteudo.lines().collect();
-    let inicio = linhas.iter().position(|l| l.contains(identificador))?;
-    // Determina a indentação da linha de abertura.
+    let mut em_bloco = false;
+    let mascaradas: Vec<String> = linhas
+        .iter()
+        .map(|l| linha_sem_strings_e_comentarios(l, &mut em_bloco))
+        .collect();
+    let inicio = mascaradas.iter().position(|l| l.contains(identificador))?;
+    // Determina a indentação da linha de abertura (no texto original).
     let indentacao = linhas[inicio].len() - linhas[inicio].trim_start().len();
     let mut profundidade = 0i32;
     let mut fim = inicio;
     let mut encontrou_abertura = false;
-    for (i, linha) in linhas.iter().enumerate().skip(inicio) {
+    for (i, linha) in mascaradas.iter().enumerate().skip(inicio) {
         for ch in linha.chars() {
             match ch {
                 '{' => {
@@ -518,12 +657,36 @@ impl Tool for InspectFileMetadata {
                 "linguagem detectada: {}",
                 linguagem_por_extensao(&caminho)
             ));
-            if let Ok(conteudo) = std::fs::read(&caminho) {
-                if parece_binario(&conteudo) {
+            // Conta linhas em streaming: ler o arquivo inteiro só para exibir
+            // metadados estourava a memória em arquivos grandes.
+            if let Ok(mut arquivo) = std::fs::File::open(&caminho) {
+                use std::io::Read;
+                let mut buffer = vec![0u8; 64 * 1024];
+                let mut total_quebras = 0usize;
+                let mut ultimo = 0u8;
+                let mut tem_bytes = false;
+                let mut binario = false;
+                loop {
+                    match arquivo.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let pedaco = &buffer[..n];
+                            if !tem_bytes && parece_binario(pedaco) {
+                                binario = true;
+                                break;
+                            }
+                            tem_bytes = true;
+                            total_quebras += pedaco.iter().filter(|b| **b == b'\n').count();
+                            ultimo = pedaco[n - 1];
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if binario {
                     linhas.push("conteúdo: binário".into());
                 } else {
-                    let texto = String::from_utf8_lossy(&conteudo);
-                    linhas.push(format!("linhas: {}", texto.lines().count()));
+                    let total = total_quebras + usize::from(tem_bytes && ultimo != b'\n');
+                    linhas.push(format!("linhas: {total}"));
                 }
             }
         }
@@ -846,22 +1009,49 @@ impl Tool for DeleteFile {
     }
 
     async fn executar(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let caminho = resolver_caminho(ctx, &arg_str(&args, "path")?);
-        if caminho == ctx.workdir || ctx.roots.contains(&caminho) {
+        let entrada = arg_str(&args, "path")?;
+        // O caminho literal preserva o symlink final: `resolver_caminho`
+        // canonicaliza e faria o `remove_file` apagar o **alvo** do link.
+        let literal = {
+            let bruto = crate::util::expand_tilde(entrada.trim());
+            let absoluto = if bruto.is_absolute() {
+                bruto
+            } else {
+                ctx.workdir.join(bruto)
+            };
+            // Canonicaliza só o **diretório pai**: o último componente pode ser
+            // um symlink e deve ser removido como link, não como alvo. Fazer
+            // normalização lexical aqui resolveria `link/../x` errado e poderia
+            // apagar outro arquivo.
+            match (absoluto.parent(), absoluto.file_name()) {
+                (Some(pai), Some(nome)) => std::fs::canonicalize(pai)
+                    .unwrap_or_else(|_| crate::util::normalize_path(pai))
+                    .join(nome),
+                _ => crate::util::normalize_path(&absoluto),
+            }
+        };
+        let caminho = resolver_caminho(ctx, &entrada);
+        if caminho == ctx.workdir
+            || ctx.roots.contains(&caminho)
+            || literal == ctx.workdir
+            || ctx.roots.contains(&literal)
+        {
             return Err(ToolError::msg(
                 "recusando remover a raiz do projeto ou do espaço de trabalho",
             ));
         }
-        let lock = ctx.arquivos.lock_de(&caminho);
+        let lock = ctx.arquivos.lock_de(&literal);
         let _guarda = lock.lock().await;
-        let meta = std::fs::metadata(&caminho).map_err(|e| {
+        let meta = std::fs::symlink_metadata(&literal).map_err(|e| {
             ToolError::msg(format!(
                 "não foi possível remover {}: {e}",
-                caminho.display()
+                literal.display()
             ))
         })?;
-        let anterior = if meta.is_file() {
-            std::fs::read_to_string(&caminho).unwrap_or_default()
+        let eh_link = meta.file_type().is_symlink();
+        let alvo = if eh_link { &literal } else { &caminho };
+        let anterior = if meta.file_type().is_file() {
+            std::fs::read_to_string(alvo).unwrap_or_default()
         } else {
             String::new()
         };
@@ -872,15 +1062,13 @@ impl Tool for DeleteFile {
                     caminho.display()
                 )));
             }
-            std::fs::remove_dir_all(&caminho).map_err(|e| {
-                ToolError::msg(format!("falha ao remover {}: {e}", caminho.display()))
-            })?;
+            std::fs::remove_dir_all(alvo)
+                .map_err(|e| ToolError::msg(format!("falha ao remover {}: {e}", alvo.display())))?;
         } else {
-            std::fs::remove_file(&caminho).map_err(|e| {
-                ToolError::msg(format!("falha ao remover {}: {e}", caminho.display()))
-            })?;
+            std::fs::remove_file(alvo)
+                .map_err(|e| ToolError::msg(format!("falha ao remover {}: {e}", alvo.display())))?;
         }
-        let remocoes = if meta.is_file() {
+        let remocoes = if meta.file_type().is_file() {
             crate::util::count_lines(&anterior)
         } else {
             0
@@ -997,5 +1185,94 @@ mod tests {
             linguagem_por_extensao(Path::new("x.semextensao")),
             "desconhecida"
         );
+    }
+
+    /// Chaves dentro de strings e identificadores em comentários confundiam a
+    /// localização do bloco (fechava cedo demais ou abria no lugar errado).
+    #[test]
+    fn localiza_bloco_ignora_strings_e_comentarios() {
+        let codigo = "fn f() {\n    let s = \"}\";\n    let t = 1;\n}\n";
+        assert_eq!(localizar_bloco(codigo, "fn f").unwrap(), (0, 3));
+
+        let codigo = "// fn processar aparece aqui\nfn processar() {\n    x();\n}\n";
+        assert_eq!(localizar_bloco(codigo, "fn processar").unwrap(), (1, 3));
+
+        // Lifetimes em Rust não podem mascarar o resto da linha.
+        let codigo = "fn f<'a>(x: &'a str) -> &'a str {\n    x\n}\n";
+        assert_eq!(localizar_bloco(codigo, "fn f").unwrap(), (0, 2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escrita_preserva_modo_do_executavel() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kestrel-fs-mode-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("script.sh");
+        std::fs::write(&alvo, "#!/bin/sh\necho oi\n").unwrap();
+        std::fs::set_permissions(&alvo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        escrever_atomico(&alvo, "#!/bin/sh\necho tchau\n").unwrap();
+        let modo = std::fs::metadata(&alvo).unwrap().permissions().mode() & 0o777;
+        assert_eq!(modo, 0o755, "o bit de execução foi perdido");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leitura_recusa_arquivo_gigante() {
+        let dir = std::env::temp_dir().join(format!("kestrel-fs-big-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("grande.log");
+        let arquivo = std::fs::File::create(&alvo).unwrap();
+        arquivo.set_len(LIMITE_LEITURA_BYTES + 1).unwrap();
+        let erro = ler_texto(&alvo).unwrap_err().to_string();
+        assert!(erro.contains("excede o limite"), "{erro}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `delete_file` num symlink precisa remover o link, não o alvo.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_file_remove_o_link_nao_o_alvo() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-fs-link-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("alvo.txt");
+        std::fs::write(&alvo, "conteudo").unwrap();
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&alvo, &link).unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        DeleteFile
+            .executar(
+                serde_json::json!({"path": link.display().to_string()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "o link deveria sumir"
+        );
+        assert!(alvo.exists(), "o alvo não pode ser removido");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Diff maior que o teto não pode ser guardado truncado: o `/undo`
+    /// aplicaria um patch parcial e corromperia o arquivo.
+    #[tokio::test]
+    async fn diff_grande_nao_e_guardado_truncado() {
+        let dir = std::env::temp_dir().join(format!("kestrel-fs-diff-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        let depois: String = (0..3000)
+            .map(|i| format!("linha numero {i} com algum texto\n"))
+            .collect();
+        registrar_alteracao(&ctx, &dir.join("x.txt"), "", &depois, "criacao");
+        let alteracao = ctx
+            .store
+            .ultima_alteracao(&ctx.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(alteracao.diff, DIFF_TRUNCADO);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
