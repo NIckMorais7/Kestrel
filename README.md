@@ -199,32 +199,28 @@ O espaço reservado é fixo: **6 colunas × 2 linhas**. O PNG é recortado na ca
 opaca, redimensionado para a resolução de pixels dessa área e só então movido
 dentro dela. Assim o Pip **nunca passa de duas linhas** e não cobre a conversa.
 
-A renderização usa o protocolo gráfico do terminal quando existe (Sixel, Kitty
-ou iTerm2) e cai para meias-células (`▀`/`▄`) do próprio `ratatui-image` quando
-não existe. A arte continua geométrica: a massa branca do gato com a tinta
-(contorno e olhos) vazada em transparência — no terminal os furos deixam
-aparecer o fundo do aplicativo, ou seja, a própria tinta do desenho.
+A renderização é feita pelo `ratatui-image`, sempre em **halfblocks**
+(`▀`/`▄`) no tamanho fixo de 6×2. Halfblocks evita o “rastro”/duplicação que
+protocolos gráficos estado-dependentes causavam ao redesenhar a animação. A arte
+continua geométrica: a massa branca do gato com a tinta (contorno e olhos)
+vazada; os buracos dos olhos são pintados com a cor de fundo da aplicação, então
+não ficam brancos em terminal claro.
 
 O ciclo tem 128 tiques e é determinístico: repouso respirando (e piscando),
 caminhada leve para a esquerda e volta, caminhada leve para a direita e volta,
-repouso de novo. Com a cadência de 120 ms durante o turno ativo, isso dá cerca
-de 15 segundos de ciclo.
+repouso de novo.
 
-Onde ele aparece:
+A partir da v0.5.0, o Pip **não fica mais no rodapé** nem no assistente. Ele
+aparece somente na **recepção de nova sessão**, no chat, junto de instruções
+curtas. Ao enviar a primeira mensagem, o Pip e as instruções somem juntos e a
+conversa segue limpa.
 
-- **no rodapé da interface**, como indicador de trabalho: enquanto o modelo
-  pensa, executa ferramentas ou redige a resposta, o Pip respira, caminha e
-  pisca no lugar da antiga animação de pontos; quando o turno termina, ele sai
-  de cena;
-- **no assistente de configuração**, do mesmo tamanho, com o estado
-  (`contemplando`, `raciocinando`, `ocioso`, …) logo abaixo.
+Durante o turno, o progresso aparece no chat como uma **estrela branca** que
+cresce e diminuindo, fluida, acima do campo de mensagem.
 
 Limitações documentadas:
 
-- terminais sem protocolo gráfico mostram o Pip em meias-células coloridas;
 - terminais sem cor verdadeira aproximam as cores;
-- com altura de terminal abaixo de 14 linhas o indicador dá lugar ao status
-  compacto, para não espremer a conversa;
 - a animação é sempre contida dentro da mesma caixa de 6×2 e pode ser desligada
   com `ui.show_mascot = false`;
 - o fundo do aplicativo é **preto** e o acento é branco, no estilo Claude Code

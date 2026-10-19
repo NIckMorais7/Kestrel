@@ -67,18 +67,17 @@ pub fn desenhar(f: &mut Frame, app: &mut App) {
     }
 
     let altura_entrada = (app.entrada.total_linhas().min(8) as u16) + 2;
-    // Enquanto o modelo trabalha, o Pip ocupa o lugar dos antigos pontinhos:
-    // o indicador cresce acima do campo de mensagem (duas linhas) e volta ao
-    // normal quando o turno termina. Em terminais baixos ele dá lugar ao
-    // status compacto.
-    let mostrar_pip = app.turno_ativo
-        && app.config.ui.show_mascot
-        && app.pip_grafico.is_some()
-        && area.height >= 14;
-    let altura_status = if mostrar_pip { mascot::LINHAS + 1 } else { 1 };
-    // Em telas com folga, o campo de mensagem desce uma linha: a conversa
-    // respira melhor e o Pip não encosta na caixa de entrada.
-    let respiro = if area.height >= 16 { 2 } else { 1 };
+    // Rodapé compacto: só uma linha. O mascote não fica mais aqui.
+    let altura_status = 1;
+    // Com o rodapé vazio, o campo de mensagem pode descer: três linhas de
+    // respiro em telas com folga deixam a conversa mais arejada.
+    let respiro = if area.height >= 20 {
+        3
+    } else if area.height >= 16 {
+        2
+    } else {
+        1
+    };
     // Três faixas, como o Claude Code/Hermes: cabeçalho, conversa e rodapé.
     // O campo de mensagem fica logo acima do rodapé; o respiro separa a
     // conversa da caixa de entrada sem desenhar mais uma borda.
@@ -91,18 +90,29 @@ pub fn desenhar(f: &mut Frame, app: &mut App) {
     ])
     .areas(area);
 
+    // Durante o turno, uma linha do chat vira linha de progresso: a estrela
+    // branca aparece ali, acima do campo, sem cobrir o texto da conversa.
+    let (corpo, linha_progresso) = if app.turno_ativo && corpo.height >= 3 {
+        let [conversa, linha] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(corpo);
+        (conversa, Some(linha))
+    } else {
+        (corpo, None)
+    };
+
     desenhar_cabecalho(f, app, cabecalho);
     desenhar_conversa(f, app, corpo);
+    desenhar_progresso_estrela(f, app, linha_progresso);
     desenhar_entrada(f, app, area_entrada);
     desenhar_sugestoes(f, app, area_entrada);
-    desenhar_status(f, app, status, mostrar_pip);
+    desenhar_status(f, app, status);
     desenhar_modal(f, app, area);
 }
 
 /// Cabeçalho em duas linhas, sem caixa e sem provedor:
 ///
 /// ```text
-///  ◆ Kestrel v0.4.0   modelo/teste · high
+///  ◆ Kestrel v0.5.0   modelo/teste · high
 ///  ~/Projetos/Kestrel (master) · build · Semi
 /// ```
 fn desenhar_cabecalho(f: &mut Frame, app: &App, area: Rect) {
@@ -160,18 +170,34 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let largura = interno.width.max(1) as usize;
 
-    // Estado vazio: uma recepção curta em vez de uma tela sem nada.
+    // Estado vazio: recepção de nova sessão, no estilo Claude Code. O mascote
+    // aparece aqui (e em nenhum outro lugar da interface), com instruções que
+    // somem junto com ele na primeira mensagem.
     if app.blocos.is_empty() {
+        let com_pip = app.config.ui.show_mascot && app.pip_grafico.is_some();
+        let texto_area = if com_pip && interno.width > mascot::COLUNAS + 4 {
+            Rect {
+                x: interno.x + mascot::COLUNAS + 2,
+                y: interno.y,
+                width: interno.width.saturating_sub(mascot::COLUNAS + 2),
+                height: interno.height,
+            }
+        } else {
+            interno
+        };
         let linhas: Vec<Line<'static>> = vec![
             Line::default(),
             Line::from(vec![
                 Span::styled("◆ ", theme::titulo()),
                 Span::styled("Kestrel", theme::titulo()),
-                Span::styled("  agente de codificação para o terminal", theme::apagado()),
+                Span::styled(
+                    format!("  v{}", env!("CARGO_PKG_VERSION")),
+                    theme::apagado(),
+                ),
             ]),
             Line::default(),
             Line::from(Span::styled(
-                "Bem-vindo ao Kestrel. Descreva a tarefa em linguagem natural.",
+                "Nova sessão. Descreva a tarefa em linguagem natural.",
                 theme::texto(),
             )),
             Line::default(),
@@ -180,18 +206,37 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled("  comandos", theme::apagado()),
                 Span::styled("     /model", theme::rotulo()),
                 Span::styled("  troca o modelo", theme::apagado()),
+                Span::styled("     /person", theme::rotulo()),
+                Span::styled("  personalidades", theme::apagado()),
             ]),
             Line::from(vec![
                 Span::styled("/agent", theme::rotulo()),
                 Span::styled("  modo build", theme::apagado()),
-                Span::styled("   /plan", theme::rotulo()),
-                Span::styled("  plano da sessão", theme::apagado()),
+                Span::styled("   /chat", theme::rotulo()),
+                Span::styled("  modo conversa", theme::apagado()),
+                Span::styled("   /skin", theme::rotulo()),
+                Span::styled("  troca a aparência", theme::apagado()),
             ]),
         ];
         f.render_widget(
             Paragraph::new(Text::from(linhas)).wrap(Wrap { trim: false }),
-            interno,
+            texto_area,
         );
+        if com_pip && interno.height >= mascot::LINHAS {
+            // Por último: a imagem ocupa 6×2 e não é coberta pelo texto.
+            if let Some(pip) = &app.pip_grafico {
+                pip.desenhar(
+                    f,
+                    Rect {
+                        x: interno.x,
+                        y: interno.y,
+                        width: mascot::COLUNAS.min(interno.width),
+                        height: mascot::LINHAS.min(interno.height),
+                    },
+                    app.pip,
+                );
+            }
+        }
         return;
     }
 
@@ -232,18 +277,39 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect, mostrar_pip: bool) {
-    // Rodapé no estilo Claude Code: estado à esquerda, atalhos à direita.
-    // O Pip é uma imagem real de 6×2; o escape do protocolo gráfico fica na
-    // primeira célula da área, então a imagem é o **último** widget desenhado.
-    let desenhando_pip =
-        mostrar_pip && area.height >= mascot::LINHAS && area.width > mascot::COLUNAS + 24;
+/// Fases da estrela: pequena → grande → pequena. O ciclo é rápido o bastante
+/// para ficar fluido na cadência de 80 ms, sem piscar.
+fn estrela_progresso(tique: u64) -> &'static str {
+    const FASES: [&str; 10] = ["✧", "✶", "✦", "✪", "✰", "★", "✰", "✪", "✦", "✶"];
+    let fase = ((tique / 2) % FASES.len() as u64) as usize;
+    FASES[fase]
+}
+
+fn desenhar_progresso_estrela(f: &mut Frame, app: &App, area: Option<Rect>) {
+    let Some(area) = area else { return };
+    if !app.turno_ativo || area.height == 0 || area.width < 4 {
+        return;
+    }
+    let linha = Line::from(vec![
+        Span::styled(estrela_progresso(app.tick), theme::acento()),
+        Span::styled(format!("  {}", app.estado_texto), theme::apagado()),
+    ]);
+    f.render_widget(
+        Paragraph::new(linha),
+        Rect {
+            x: area.x + 2,
+            y: area.y,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        },
+    );
+}
+
+fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect) {
+    // Rodapé compacto no estilo Claude Code: estado à esquerda, atalhos à
+    // direita. O mascote saiu daqui; o progresso agora acontece no chat.
     let linha_texto = area.y + area.height.saturating_sub(1);
-    let deslocamento_texto = if desenhando_pip {
-        mascot::COLUNAS + 3
-    } else {
-        1
-    };
+    let deslocamento_texto = 1;
 
     let estilo_estado = match app.estado {
         EstadoMascote::Erro => theme::falha(),
@@ -252,15 +318,15 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect, mostrar_pip: bool) 
         _ => theme::em_execucao(),
     };
     let mut spans = Vec::new();
-    if !desenhando_pip {
-        // O marcador pulsa enquanto há trabalho; parado, fica no acento fixo.
-        let estilo_marcador = if app.turno_ativo {
+    // O marcador pulsa enquanto há trabalho; parado, fica no acento fixo.
+    spans.push(Span::styled(
+        "● ".to_string(),
+        if app.turno_ativo {
             theme::pulso(app.tick, true)
         } else {
             estilo_estado
-        };
-        spans.push(Span::styled("● ".to_string(), estilo_marcador));
-    }
+        },
+    ));
     spans.push(Span::styled(app.estado_texto.clone(), estilo_estado));
     if app.token_total.0 + app.token_total.1 > 0 {
         let total = app.token_total.0 + app.token_total.1;
@@ -346,17 +412,6 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect, mostrar_pip: bool) 
         );
     }
 
-    // Por último: a imagem do Pip. O texto começa em `COLUNAS + 3`, então não
-    // há sobreposição com a área da imagem.
-    if desenhando_pip && let Some(pip) = &app.pip_grafico {
-        let destino = Rect {
-            x: area.x + 1,
-            y: area.y + area.height.saturating_sub(mascot::LINHAS),
-            width: mascot::COLUNAS.min(area.width.saturating_sub(2)),
-            height: mascot::LINHAS.min(area.height),
-        };
-        pip.desenhar(f, destino, app.pip);
-    }
     // A interface usa a mesma área para decidir o clique.
     app.area_voltar = area_botao;
 }
@@ -1018,7 +1073,7 @@ mod tests {
     fn interface_limpa_sem_painel_de_sessao() {
         let mut app = app_de_teste();
         let tela = desenhar_em(&mut app, 120, 36);
-        assert!(tela.contains("Bem-vindo ao Kestrel"));
+        assert!(tela.contains("Nova sessão"));
         for antigo in [
             "Plano",
             "Subtarefas",
@@ -1042,7 +1097,7 @@ mod tests {
         // O provedor não é informação de cabeçalho: saiu do topo a pedido do
         // usuário e continua disponível em /config.
         assert!(!tela.contains("nvidia"));
-        assert!(tela.contains("agente"));
+        assert!(tela.contains("build"));
         assert!(tela.contains("Semi"));
         // Contexto distante do limite não ocupa o cabeçalho.
         app.contexto = (100, 10_000);
@@ -1102,50 +1157,38 @@ mod tests {
     }
 
     #[test]
-    fn pip_substitui_o_spinner_so_quando_o_modelo_trabalha() {
+    fn pip_e_instrucoes_somem_depois_da_primeira_mensagem() {
         let mut app = app_de_teste();
-        // Parado: nenhum bloco do Pip aparece na tela (nada de gato fixo).
+        // Sem Pip configurado, nada de meias-células na tela.
         let parado = desenhar_em(&mut app, 120, 36);
         assert!(!parado.contains('▀') && !parado.contains('▄'));
-        assert!(parado.contains('●'));
-        // Trabalhando: o Pip aparece junto ao campo de mensagem, no lugar dos
-        // antigos pontinhos (nenhum glifo de braille no rodapé).
+
         app.pip_grafico = Some(
             crate::ui::mascot::PipGrafico::novo(&ratatui_image::picker::Picker::halfblocks())
                 .expect("Pip de teste"),
         );
+        app.tick = 10; // fase grande da estrela de progresso.
         app.tratar_evento(crate::events::AgentEvent::TurnoIniciado);
-        let trabalhando = desenhar_em(&mut app, 120, 36);
-        // O Pip é uma imagem de 6×2; no protocolo de halfblocks ela vira
-        // várias meias-células.
+        let nova = desenhar_em(&mut app, 120, 36);
+        // Nova sessão: mascote + instruções + progresso com estrela no chat.
+        assert!(nova.contains("Nova sessão"));
+        assert!(nova.contains("/help"));
+        assert!(nova.contains("★"), "estrela de progresso deveria aparecer");
         assert!(
-            trabalhando.matches('▀').count() + trabalhando.matches('▄').count() >= 6,
-            "o Pip deveria estar desenhado enquanto o modelo trabalha"
+            nova.matches('▀').count() + nova.matches('▄').count() >= 6,
+            "o Pip deveria aparecer na recepção de nova sessão"
         );
-        for glifo in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
-            assert!(
-                !trabalhando.contains(glifo),
-                "o spinner antigo ainda aparece: {glifo}"
-            );
-        }
-        // A conversa continua completa e o texto de estado fica ao lado do Pip.
-        assert!(trabalhando.contains("Bem-vindo ao Kestrel"));
-        assert!(trabalhando.contains("pensando"));
-        // O Pip fica no rodapé, abaixo do campo de mensagem.
-        let linha_pip = trabalhando
-            .lines()
-            .position(|l| l.contains('▀') || l.contains('▄'))
-            .unwrap();
-        // O campo de mensagem não tem mais título: a linha dele é a do
-        // placeholder que ocupa quando está vazio.
-        let linha_mensagem = trabalhando
-            .lines()
-            .position(|l| l.contains("descreva a tarefa"))
-            .unwrap();
-        assert!(linha_pip > linha_mensagem);
-        // Terminal baixo usa o status compacto (sem Pip) e não quebra.
-        let baixo = desenhar_em(&mut app, 120, 13);
-        assert!(!baixo.contains('▀') && !baixo.contains('▄'));
+
+        // Depois da primeira mensagem, mascote e instruções saem juntos.
+        app.tratar_evento(crate::events::AgentEvent::Texto {
+            delta: "linha da conversa".into(),
+        });
+        let depois = desenhar_em(&mut app, 120, 36);
+        assert!(depois.contains("linha da conversa"));
+        assert!(!depois.contains("Nova sessão"));
+        assert!(!depois.contains("▀") && !depois.contains("▄"));
+        // O progresso continua, mas agora é só a estrela no chat.
+        assert!(depois.contains("★"));
     }
 
     #[test]

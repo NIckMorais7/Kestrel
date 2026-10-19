@@ -384,6 +384,7 @@ impl Store {
     }
 
     /// Sessões marcadas como ativas no encerramento anterior (recuperação).
+    #[cfg(test)]
     pub fn sessions_para_recuperar(&self) -> Result<Vec<SessionRow>> {
         self.with(|c| {
             let mut stmt = c.prepare(

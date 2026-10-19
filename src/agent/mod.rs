@@ -482,20 +482,9 @@ impl Agente {
         let mut pendentes: std::collections::VecDeque<(String, bool)> =
             std::collections::VecDeque::new();
 
-        // Sessões interrompidas do mesmo projeto que podem ser retomadas.
-        if let Ok(sessoes) = self.comp.store.sessions_para_recuperar() {
-            let atual = self.comp.sessao().id;
-            let projeto = self.comp.config().workdir().display().to_string();
-            let retomaveis = sessoes_retomaveis(sessoes, &projeto, &atual);
-            if let Some(ultima) = retomaveis.first() {
-                self.comp.evento(AgentEvent::Aviso {
-                    mensagem: format!(
-                        "A sessão anterior em {} foi interrompida. Use /retomar para continuar de onde parou.",
-                        ultima.project_path
-                    ),
-                });
-            }
-        }
+        // Sem aviso de “sessão anterior interrompida”: ele aparecia em quase
+        // toda abertura e virava ruído. A recuperação continua existindo, mas
+        // quem decide usá-la é o usuário, via /retomar.
 
         loop {
             tokio::select! {
@@ -1943,6 +1932,7 @@ impl Compartilhado {
 ///
 /// O filtro por projeto é o que impede o aviso (e a retomada) de vazar entre
 /// projetos diferentes.
+#[cfg(test)]
 fn sessoes_retomaveis(
     sessoes: Vec<crate::db::SessionRow>,
     projeto: &str,

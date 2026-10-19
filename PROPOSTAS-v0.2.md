@@ -117,6 +117,11 @@ duração, tokens/s, modelo e modo), rodapé sem skills/“enter envia”, skin 
 recuperação até 15 tentativas, animações curtas em glifos e recomendação de
 fonte **Geist Mono**.
 
+**v0.5.0 — "sessão limpa"** — *implementado*: Pip somente na recepção de nova
+sessão, com instruções que somem na primeira mensagem; aviso de “sessão anterior
+interrompida” removido; progresso no chat com estrela branca fluida; campo de
+mensagem mais baixo e rodapé compacto.
+
 **v0.3.0 — "capaz"** (~20 dias)
 A6–A11, C1 (imagens), C2 (edições atômicas), C7 (memória de projeto), D2 (copiar),
 D3 (contexto), B3 (fallback de modelos), E4 (provedores).

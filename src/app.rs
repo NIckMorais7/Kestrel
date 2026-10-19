@@ -2680,6 +2680,10 @@ fn texto_de_ajuda() -> Vec<Line<'static>> {
          ## Rodapé do turno\n\n\
          - Ao fim de cada turno aparece só uma linha discreta: duração, tokens por segundo, modelo e modo.\n\
          - O rodapé inferior não mostra skills nem “enter envia”; use `/skills` para ver as skills.\n\n\
+         ## Nova sessão e progresso\n\n\
+         - Em uma sessão nova, o Pip e instruções curtas aparecem no chat; ambos somem na primeira mensagem.\n\
+         - Durante o turno, o progresso aparece no chat como uma estrela branca que cresce e diminui.\n\
+         - Não aparece mais o aviso de “sessão anterior interrompida”; use `/retomar` quando quiser.\n\n\
          ## Comps e skins\n\n\
          - **Comps** são personalidades: um bloco de instruções que muda o tom e o estilo da resposta. \
 `/person` lista, `/person new <nome>` cria com o editor dentro do Kestrel, `/person use <nome>` ativa, \

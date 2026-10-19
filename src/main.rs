@@ -182,7 +182,8 @@ async fn executar(
     pip_grafico: Option<PipGrafico>,
 ) -> anyhow::Result<()> {
     let config = if !config.setup_complete || forcar_setup {
-        let pronto = ui::setup::executar(terminal, config, pip_grafico.clone()).await?;
+        // O mascote não aparece no assistente: ele é elemento de nova sessão.
+        let pronto = ui::setup::executar(terminal, config, None).await?;
         pronto.save(paths)?;
         pronto
     } else {
