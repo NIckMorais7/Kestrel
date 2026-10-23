@@ -17,7 +17,7 @@ fn regex_compilada() -> &'static Regexes {
     R.get_or_init(|| Regexes {
         titulo: Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("regex"),
         blocos_ignorados: Regex::new(
-            r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>|<svg[^>]*>.*?</svg>|<template[^>]*>.*?</template>|<iframe[^>]*>.*?</iframe>",
+            r"(?is)<head[^>]*>.*?</head>|<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>|<svg[^>]*>.*?</svg>|<template[^>]*>.*?</template>|<iframe[^>]*>.*?</iframe>",
         )
         .expect("regex"),
         comentarios: Regex::new(r"(?s)<!--.*?-->").expect("regex"),
@@ -47,11 +47,17 @@ struct Regexes {
 /// Converte HTML em texto legível.
 pub fn html_para_texto(html: &str) -> PaginaTexto {
     let r = regex_compilada();
+    // O título também pode conter tags (`<title>Olá <b>mundo</b></title>`) e
+    // títulos dentro de comentários não são o título real da página.
+    let sem_comentarios = r.comentarios.replace_all(html, " ");
     let titulo = r
         .titulo
-        .captures(html)
+        .captures(&sem_comentarios)
         .and_then(|c| c.get(1))
-        .map(|m| limpar_texto(&decodificar_entidades(m.as_str())))
+        .map(|m| {
+            let sem_tags = r.tags.replace_all(m.as_str(), "");
+            limpar_texto(&decodificar_entidades(&sem_tags))
+        })
         .unwrap_or_default();
 
     let mut links = Vec::new();
@@ -178,6 +184,14 @@ pub fn percent_decode(input: &str) -> String {
     let mut saida = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // `+` só significa espaço quando aparece literalmente na URL. Trocar
+        // todo `+` depois de decodificar transformava `%2B` (um mais literal)
+        // em espaço.
+        if bytes[i] == b'+' {
+            saida.push(b' ');
+            i += 1;
+            continue;
+        }
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
             if let Ok(v) = u8::from_str_radix(hex, 16) {
@@ -189,9 +203,7 @@ pub fn percent_decode(input: &str) -> String {
         saida.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&saida)
-        .to_string()
-        .replace('+', " ")
+    String::from_utf8_lossy(&saida).to_string()
 }
 
 #[cfg(test)]
@@ -234,6 +246,19 @@ mod tests {
             "https://exemplo.com/?q=1"
         );
         assert_eq!(percent_decode("a+b"), "a b");
+        // `%2B` é um mais literal, não o `+` de formulário.
+        assert_eq!(percent_decode("a%2Bb"), "a+b");
+        assert_eq!(percent_decode("100%25"), "100%");
+    }
+
+    #[test]
+    fn titulo_remove_tags_e_ignora_comentarios() {
+        let html = r#"<!-- <title>falso</title> -->
+            <html><head><title>Olá <b>mundo</b></title></head>
+            <body><p>corpo</p></body></html>"#;
+        let pagina = html_para_texto(html);
+        assert_eq!(pagina.titulo, "Olá mundo");
+        assert!(!pagina.texto.contains("Olá mundo"), "cabeçalho duplicado");
     }
 
     #[test]

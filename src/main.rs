@@ -31,7 +31,7 @@ use clap::Parser;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
-use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::picker::Picker;
 use std::path::PathBuf;
 
 /// Kestrel — agente autônomo de codificação para o terminal.
@@ -96,6 +96,9 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!("diretório de trabalho inválido: `{}`", dir.display());
         }
         config.agent.workdir = Some(std::fs::canonicalize(&dir).unwrap_or(dir));
+        // Sem fixar, `Config::workdir()` ignora o valor e usa o diretório
+        // atual: a opção `-C` não teria efeito nenhum numa configuração nova.
+        config.agent.pin_workdir = true;
     }
 
     if let Some(modelo) = &cli.modelo {
@@ -145,22 +148,28 @@ fn main() -> anyhow::Result<()> {
         // na tela alternativa e antes de começar a ler eventos. Se a consulta
         // falhar, o próprio ratatui-image cai para halfblocks; não existe mais
         // a textura 6×4 desenhada à mão.
+        // O Pip e o ícone usam o protocolo real do terminal (Sixel/Kitty quando
+        // disponível): halfblocks deixava o Pip pixelado. O Picker é consultado
+        // depois da tela alternativa e acerta a métrica real da fonte.
+        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
         let pip_grafico = if config.ui.show_mascot {
-            // A consulta ao terminal continua (ela acerta a métrica real da
-            // fonte), mas o Pip é desenhado em halfblocks: protocolos gráficos
-            // como Sixel/Kitty podem deixar “rastro”/duplicar o mascote ao
-            // redesenhar o mesmo quadro várias vezes. Halfblocks é célula, então
-            // cada animação limpa e substitui a anterior de forma confiável.
-            let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-            picker.set_protocol_type(ProtocolType::Halfblocks);
             PipGrafico::novo(&picker).ok()
         } else {
             None
         };
+        let icone = ui::icone::IconeKestrel::novo(&picker).ok();
         // A interface trata rolagem do mouse e colagem de texto (bracketed paste).
         let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
-        let resultado =
-            executar(&mut terminal, config, &paths, store, cli.setup, pip_grafico).await;
+        let resultado = executar(
+            &mut terminal,
+            config,
+            &paths,
+            store,
+            cli.setup,
+            pip_grafico,
+            icone,
+        )
+        .await;
         let _ = crossterm::execute!(
             std::io::stdout(),
             DisableBracketedPaste,
@@ -180,6 +189,7 @@ async fn executar(
     store: Store,
     forcar_setup: bool,
     pip_grafico: Option<PipGrafico>,
+    icone: Option<ui::icone::IconeKestrel>,
 ) -> anyhow::Result<()> {
     let config = if !config.setup_complete || forcar_setup {
         // O mascote não aparece no assistente: ele é elemento de nova sessão.
@@ -189,5 +199,5 @@ async fn executar(
     } else {
         config
     };
-    app::executar(terminal, config, paths.clone(), store, pip_grafico).await
+    app::executar(terminal, config, paths.clone(), store, pip_grafico, icone).await
 }

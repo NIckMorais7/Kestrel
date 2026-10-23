@@ -122,6 +122,11 @@ sessão, com instruções que somem na primeira mensagem; aviso de “sessão an
 interrompida” removido; progresso no chat com estrela branca fluida; campo de
 mensagem mais baixo e rodapé compacto.
 
+**v0.9.0 — "nitidez e contexto real"** — *implementado*: Pip em protocolo
+gráfico real, sem segundo resize e sem fantasmas; ícone branco/preto do Kestrel
+no cabeçalho; remoção da forma geométrica antes de `Kestrel` nas respostas;
+capitalização dos estados; rodapé mostrando contexto usado/total com percentual.
+
 **v0.3.0 — "capaz"** (~20 dias)
 A6–A11, C1 (imagens), C2 (edições atômicas), C7 (memória de projeto), D2 (copiar),
 D3 (contexto), B3 (fallback de modelos), E4 (provedores).
@@ -348,7 +353,7 @@ ativo**), `web`.
 **Banco:** sessions, messages, tool_runs, plans, tasks, file_changes, decisions,
 audit, context_state, usage, kv (11 tabelas; `usage` entrou na migração 3).
 
-**Testes (266):** 263 testes unitários (tools, ui, agent, perm, provider, app,
+**Testes (268):** 265 testes unitários (tools, ui, agent, perm, provider, app,
 util, diff, html, db, skills, config, project, cli) + 3 de integração em
 `tests/cli.rs`. O streaming SSE agora tem servidor local e cobre `[DONE]`,
 conexão cortada, chunk dividido, tool_call fragmentada e erro no meio do stream.

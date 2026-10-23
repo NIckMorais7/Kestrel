@@ -167,6 +167,7 @@ pub trait SubagentRunner: Send + Sync {
 }
 
 /// Contexto de execução compartilhado por todas as ferramentas.
+#[derive(Clone)]
 pub struct ToolContext {
     pub workdir: PathBuf,
     pub roots: Vec<PathBuf>,
@@ -187,15 +188,25 @@ pub struct ToolContext {
     pub comps_dir: PathBuf,
     pub projeto: Arc<ProjectInfo>,
     pub web: WebConfig,
-    pub http: reqwest::Client,
     pub max_saida: usize,
     pub subagente: Option<Arc<dyn SubagentRunner>>,
+    /// Escopo único da chamada de ferramenta atual, usado para encerrar
+    /// somente os processos que ela criou. Vazio fora do registro.
+    pub escopo_processos: String,
+    /// Identificador da chamada do modelo, quando houver. A interface usa para
+    /// casar saída/início/fim de chamadas paralelas de mesmo nome.
+    pub chamada_id: Option<String>,
 }
 
 impl ToolContext {
     /// Emite um evento para a interface (ignora falhas de canal).
     pub fn evento(&self, evento: AgentEvent) {
         let _ = self.eventos.send(evento);
+    }
+
+    /// Escopo de processos da chamada atual, quando definido pelo registro.
+    pub fn escopo_processos(&self) -> Option<&str> {
+        (!self.escopo_processos.is_empty()).then_some(self.escopo_processos.as_str())
     }
 
     /// Verifica cancelamento e devolve erro coerente.
@@ -399,6 +410,13 @@ impl ToolRegistry {
             )));
         };
 
+        // Cada chamada recebe um escopo próprio para a limpeza de processos.
+        // Uma fotografia global de "processos ativos" matava também os
+        // processos iniciados por chamadas paralelas depois da fotografia.
+        let mut ctx_local = ctx.clone();
+        ctx_local.escopo_processos = format!("ferramenta:{}", uuid::Uuid::new_v4());
+        let ctx = &ctx_local;
+
         // O modo de operação vale para toda chamada, inclusive subagentes.
         if ctx.modo == crate::config::ModoOperacao::Chat && !permitida_no_chat(nome) {
             ctx.store
@@ -456,7 +474,7 @@ impl ToolRegistry {
                         )
                         .ok();
                     return Err(ToolError::Permissao(format!(
-                        "o caminho {} está fora do projeto e o nível Read não permite escrita. \\
+                        "o caminho {} está fora do projeto e o nível Read não permite escrita. \
                          Use /permissions para mudar de nível.",
                         norm.display()
                     )));
@@ -532,20 +550,11 @@ impl ToolRegistry {
 
         ctx.checar_cancelamento()?;
         let inicio = std::time::Instant::now();
-        // Fotografia dos processos já em execução: se o tempo limite estourar
-        // aqui (e não dentro da ferramenta), os processos que ela criou
-        // precisam ser encerrados — senão ficam órfãos, porque o future
-        // descartado no estouro do timeout ninguém mais os mata.
-        let processos_antes = ctx.processos.ids_ativas();
-        let encerrar_novos = || {
-            let novos: Vec<String> = ctx
-                .processos
-                .ids_ativas()
-                .into_iter()
-                .filter(|id| !processos_antes.contains(id))
-                .collect();
-            ctx.processos.encerrar_varios(&novos);
-        };
+        // Se o tempo limite estourar aqui (e não dentro da ferramenta), os
+        // processos que ela criou precisam ser encerrados — senão ficam
+        // órfãos, porque o future descartado ninguém mais os mata. O escopo
+        // garante que processos de chamadas paralelas não sejam atingidos.
+        let encerrar_novos = || ctx.processos.encerrar_do_escopo(&ctx.escopo_processos);
         let resultado = tokio::select! {
             _ = ctx.cancel.cancelled() => {
                 // Cancelar também não pode deixar órfão o processo que a
@@ -894,6 +903,12 @@ mod tests {
         );
         let lista = ctx.processos.listar();
         eprintln!("processos apos o timeout: {lista:?}");
+        // O estado terminal só é anunciado depois que o `wait` colhe o filho
+        // e drena a saída; dá um instante para o SIGTERM ser processado.
+        let limite = std::time::Instant::now() + Duration::from_secs(5);
+        while !ctx.processos.ids_ativas().is_empty() && std::time::Instant::now() < limite {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let ativas = ctx.processos.ids_ativas();
         eprintln!("ativas: {ativas:?}");
         assert!(ativas.is_empty(), "processo orfao continuou rodando");
@@ -1079,9 +1094,10 @@ mod tests {
             comps_dir: dir.join("comps"),
             projeto: Arc::new(ProjectInfo::default()),
             web: WebConfig::default(),
-            http: reqwest::Client::new(),
             max_saida: 1000,
             subagente: None,
+            escopo_processos: String::new(),
+            chamada_id: None,
         };
         let erro = reg
             .executar(

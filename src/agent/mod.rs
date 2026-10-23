@@ -20,6 +20,7 @@ use crate::tools::{FileRegistry, SubagentRunner, ToolContext, ToolError, ToolReg
 use crate::util::Paths;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -49,7 +50,6 @@ pub struct Compartilhado {
     pub registro: ToolRegistry,
     pub processos: Arc<ProcessManager>,
     pub arquivos: Arc<FileRegistry>,
-    pub http: reqwest::Client,
     pub eventos: mpsc::UnboundedSender<AgentEvent>,
     pub confirmacoes: mpsc::UnboundedSender<ConfirmRequest>,
     pub permitidos: Arc<Mutex<HashSet<String>>>,
@@ -258,14 +258,13 @@ impl Compartilhado {
         skills
     }
 
-    /// Troca o projeto ativo: valida e persiste o diretório, reanalisa o
-    /// projeto, recarrega as skills e abre uma nova sessão no novo local.
-    pub fn trocar_projeto(&self, caminho: &str) -> anyhow::Result<()> {
-        let bruto = crate::util::expand_tilde(caminho.trim());
-        if !bruto.is_dir() {
-            anyhow::bail!("`{}` não é um diretório válido", bruto.display());
-        }
-        let caminho = std::fs::canonicalize(&bruto).unwrap_or(bruto);
+    /// Fixa o diretório de trabalho, persiste e reanalisa projeto e skills.
+    ///
+    /// Retomar uma sessão de outro projeto também passa por aqui: sem isso o
+    /// histórico de um projeto era continuado com as ferramentas apontando
+    /// para o projeto atual.
+    pub fn definir_projeto(&self, caminho: &Path) -> anyhow::Result<PathBuf> {
+        let caminho = std::fs::canonicalize(caminho).unwrap_or_else(|_| caminho.to_path_buf());
         {
             let mut estado = self.estado.write().expect("estado");
             estado.config.agent.workdir = Some(caminho.clone());
@@ -279,9 +278,21 @@ impl Compartilhado {
         self.store
             .kv_set("ultimo_projeto", &caminho.display().to_string())
             .ok();
+        self.reanalisar_projeto();
+        self.recarregar_skills();
+        Ok(caminho)
+    }
 
-        let info = self.reanalisar_projeto();
-        let skills = self.recarregar_skills();
+    /// Troca o projeto ativo: valida e persiste o diretório, reanalisa o
+    /// projeto, recarrega as skills e abre uma nova sessão no novo local.
+    pub fn trocar_projeto(&self, caminho: &str) -> anyhow::Result<()> {
+        let bruto = crate::util::expand_tilde(caminho.trim());
+        if !bruto.is_dir() {
+            anyhow::bail!("`{}` não é um diretório válido", bruto.display());
+        }
+        let caminho = self.definir_projeto(&bruto)?;
+        let info = self.projeto();
+        let skills = self.skills();
 
         // Cada projeto tem seu próprio histórico: abre uma sessão nova.
         let cfg = self.config();
@@ -305,7 +316,11 @@ impl Compartilhado {
             titulo: titulo.clone(),
             objetivo: String::new(),
         });
-        self.evento(AgentEvent::SessaoAtiva { id, titulo });
+        self.evento(AgentEvent::SessaoAtiva {
+            id,
+            titulo,
+            workdir: caminho.display().to_string(),
+        });
         // O plano e as subtarefas pertencem à sessão anterior.
         self.evento(AgentEvent::PlanoAtualizado {
             objetivo: String::new(),
@@ -346,9 +361,10 @@ impl Compartilhado {
             comps_dir: self.paths.comps_dir(),
             projeto: self.projeto(),
             web: config.web.clone(),
-            http: self.http.clone(),
             max_saida: 30_000,
             subagente: None,
+            escopo_processos: String::new(),
+            chamada_id: None,
         }
     }
 }
@@ -401,19 +417,12 @@ pub fn iniciar(config: Config, paths: Paths, store: Store) -> anyhow::Result<Age
     let skills = Arc::new(SkillRegistry::discover(&paths, &workdir));
     let provider: Arc<dyn Provider> = Arc::from(crate::provider::nvidia::create_provider(&config)?);
 
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(config.web.request_timeout_secs.max(10)))
-        .user_agent(config.web.user_agent.clone())
-        .build()?;
-
     let comp = Arc::new(Compartilhado {
         paths,
         store,
         registro: ToolRegistry::novo(),
         processos: Arc::new(ProcessManager::new()),
         arquivos: Arc::new(FileRegistry::new()),
-        http,
         eventos: eventos_tx,
         confirmacoes: confirm_tx,
         permitidos: Arc::new(Mutex::new(HashSet::new())),
@@ -436,6 +445,7 @@ pub fn iniciar(config: Config, paths: Paths, store: Store) -> anyhow::Result<Age
         comp.evento(AgentEvent::SessaoAtiva {
             id: sessao.id,
             titulo: sessao.titulo,
+            workdir: workdir.display().to_string(),
         });
         let cfg = comp.config();
         comp.evento(AgentEvent::ModeloAtual {
@@ -466,6 +476,16 @@ pub fn iniciar(config: Config, paths: Paths, store: Store) -> anyhow::Result<Age
     })
 }
 
+/// Ação que só pode ser aplicada quando o turno em andamento terminar.
+///
+/// Criar uma sessão ou trocar de projeto no meio de um turno faria o turno
+/// antigo continuar gravando mensagens, ferramentas e status na sessão nova.
+#[derive(Debug)]
+enum AcaoPosTurno {
+    NovaSessao,
+    TrocarProjeto(String),
+}
+
 /// Motor do agente: laço de comandos e turnos.
 pub struct Agente {
     comp: Arc<Compartilhado>,
@@ -481,6 +501,9 @@ impl Agente {
         // não podem se sobrescrever (a primeira era perdida em silêncio).
         let mut pendentes: std::collections::VecDeque<(String, bool)> =
             std::collections::VecDeque::new();
+        // Troca de sessão/projeto pedida durante um turno: fica para depois
+        // que o turno cancelado realmente terminar.
+        let mut acao_pendente: Option<AcaoPosTurno> = None;
 
         // Sem aviso de “sessão anterior interrompida”: ele aparecia em quase
         // toda abertura e virava ruído. A recuperação continua existindo, mas
@@ -598,11 +621,13 @@ impl Agente {
                             if turno_ativo {
                                 if let Some(c) = &cancel_atual { c.cancel(); }
                                 pendentes.clear();
+                                acao_pendente = Some(AcaoPosTurno::NovaSessao);
                                 self.comp.evento(AgentEvent::Aviso {
                                     mensagem: "Nova sessão: interrompendo a execução atual.".into(),
                                 });
+                            } else {
+                                self.nova_sessao();
                             }
-                            self.nova_sessao();
                         }
                         UiCommand::RetomarSessao(id) => {
                             if turno_ativo {
@@ -626,19 +651,13 @@ impl Agente {
                             if turno_ativo {
                                 if let Some(c) = &cancel_atual { c.cancel(); }
                                 pendentes.clear();
+                                acao_pendente = Some(AcaoPosTurno::TrocarProjeto(caminho));
                                 self.comp.evento(AgentEvent::Aviso {
                                     mensagem: "Troca de projeto: interrompendo a execução atual."
                                         .into(),
                                 });
-                            }
-                            if let Err(e) = self.comp.trocar_projeto(&caminho) {
-                                self.comp.evento(AgentEvent::Erro {
-                                    mensagem: format!("falha ao trocar de projeto: {e}"),
-                                    dica: Some(
-                                        "escolha um diretório existente em /projetos".into(),
-                                    ),
-                                    recuperavel: true,
-                                });
+                            } else {
+                                self.trocar_projeto(&caminho);
                             }
                         }
                         UiCommand::ListarProcessos => {
@@ -661,6 +680,15 @@ impl Agente {
                 Some(()) = fim_rx.recv() => {
                     turno_ativo = false;
                     cancel_atual = None;
+                    // A troca de sessão/projeto só acontece agora: o turno
+                    // cancelado já terminou de gravar no banco.
+                    match acao_pendente.take() {
+                        Some(AcaoPosTurno::NovaSessao) => self.nova_sessao(),
+                        Some(AcaoPosTurno::TrocarProjeto(caminho)) => {
+                            self.trocar_projeto(&caminho);
+                        }
+                        None => {}
+                    }
                     if let Some((texto, redirecionado)) = pendentes.pop_front() {
                         let cancel = CancellationToken::new();
                         cancel_atual = Some(cancel.clone());
@@ -669,6 +697,16 @@ impl Agente {
                     }
                 }
             }
+        }
+    }
+
+    fn trocar_projeto(&self, caminho: &str) {
+        if let Err(e) = self.comp.trocar_projeto(caminho) {
+            self.comp.evento(AgentEvent::Erro {
+                mensagem: format!("falha ao trocar de projeto: {e}"),
+                dica: Some("escolha um diretório existente em /projetos".into()),
+                recuperavel: true,
+            });
         }
     }
 
@@ -704,7 +742,11 @@ impl Agente {
             titulo: titulo.clone(),
             objetivo: String::new(),
         });
-        self.comp.evento(AgentEvent::SessaoAtiva { id, titulo });
+        self.comp.evento(AgentEvent::SessaoAtiva {
+            id,
+            titulo,
+            workdir: workdir.display().to_string(),
+        });
         self.comp.evento(AgentEvent::Aviso {
             mensagem: "Nova sessão iniciada. O histórico anterior continua salvo e pode ser retomado com /retomar.".into(),
         });
@@ -725,6 +767,34 @@ impl Agente {
             });
             return;
         };
+        // O projeto da sessão é a fonte da verdade. Retomar uma sessão de
+        // outro diretório sem trocar o workdir faria o agente ler e escrever
+        // no projeto errado enquanto exibe o histórico antigo.
+        let bruto = crate::util::expand_tilde(sessao.project_path.trim());
+        if !bruto.is_dir() {
+            self.comp.evento(AgentEvent::Erro {
+                mensagem: format!(
+                    "o projeto da sessão `{id}` não existe mais: {}",
+                    bruto.display()
+                ),
+                dica: Some(
+                    "abra a sessão pelo projeto original ou crie o diretório novamente".into(),
+                ),
+                recuperavel: true,
+            });
+            return;
+        }
+        let caminho = std::fs::canonicalize(&bruto).unwrap_or(bruto);
+        if caminho != self.comp.config().workdir()
+            && let Err(e) = self.comp.definir_projeto(&caminho)
+        {
+            self.comp.evento(AgentEvent::Erro {
+                mensagem: format!("falha ao trocar para o projeto da sessão: {e}"),
+                dica: None,
+                recuperavel: true,
+            });
+            return;
+        }
         self.comp.permitidos.lock().expect("lock").clear();
         self.comp.definir_sessao(EstadoSessao {
             id: sessao.id.clone(),
@@ -743,6 +813,7 @@ impl Agente {
         self.comp.evento(AgentEvent::SessaoAtiva {
             id: sessao.id.clone(),
             titulo: sessao.title.clone(),
+            workdir: self.comp.config().workdir().display().to_string(),
         });
         self.comp.evento(AgentEvent::Aviso {
             mensagem: format!(
@@ -857,6 +928,7 @@ async fn executar_turno(
     comp.evento(AgentEvent::SessaoAtiva {
         id: sessao.id.clone(),
         titulo: sessao.titulo.clone(),
+        workdir: cfg.workdir().display().to_string(),
     });
     comp.evento(AgentEvent::ModeloAtual {
         modelo: cfg.provider.model.clone(),
@@ -915,7 +987,9 @@ async fn executar_turno(
         );
         comp.evento(AgentEvent::Contexto {
             usados,
-            capacidade: orcamento.capacidade_utilizavel(),
+            // A interface mostra a janela total do modelo (1M, 128k etc.),
+            // não o orçamento útil da compactação.
+            capacidade: cfg.context_window(),
         });
         if orcamento.precisa_compactar(usados, cfg.agent.context_compact_threshold) {
             comp.estado_ui("compactando contexto (dossiê de continuidade)");
@@ -931,6 +1005,11 @@ async fn executar_turno(
                     continue;
                 }
                 Err(e) => {
+                    // A compactação pode ter criado a sessão de continuação e
+                    // falhado logo depois (cancelamento). Relê o estado real
+                    // antes de encerrar para não finalizar o turno na sessão
+                    // antiga.
+                    sessao = comp.sessao();
                     comp.evento(AgentEvent::Erro {
                         mensagem: format!("falha ao compactar o contexto: {e}"),
                         dica: Some(
@@ -939,6 +1018,12 @@ async fn executar_turno(
                         ),
                         recuperavel: true,
                     });
+                    // Sem este encerramento, a próxima iteração tentaria
+                    // compactar de novo indefinidamente com o mesmo contexto.
+                    break ResultadoTurno {
+                        resumo: format!("Turno interrompido: falha ao compactar o contexto: {e}"),
+                        concluido: false,
+                    };
                 }
             }
         }
@@ -1218,6 +1303,7 @@ async fn executar_turno(
                 conteudo.clone(),
             ));
             comp.evento(AgentEvent::FerramentaConcluida {
+                id: Some(call.id.clone()),
                 nome: call.name.clone(),
                 sucesso,
                 resumo: crate::util::redact_secrets(&resumo),
@@ -1497,6 +1583,7 @@ fn compactar_contexto(
     comp.evento(AgentEvent::SessaoAtiva {
         id: novo_id.clone(),
         titulo,
+        workdir: cfg.workdir().display().to_string(),
     });
 
     if cancel.is_cancelled() {
@@ -1596,6 +1683,7 @@ async fn executar_chamadas(
 ) -> Vec<(ToolCall, ResultadoFerramenta)> {
     for chamada in chamadas {
         comp.evento(AgentEvent::FerramentaIniciada {
+            id: Some(chamada.id.clone()),
             nome: chamada.name.clone(),
             detalhe: detalhe_chamada(chamada),
         });
@@ -1611,8 +1699,10 @@ async fn executar_chamadas(
                 let args: Value = serde_json::from_str(&chamada.arguments).unwrap_or(Value::Null);
                 let chamada = chamada.clone();
                 let registro = &comp.registro;
+                let mut ctx = ctx.clone();
+                ctx.chamada_id = Some(chamada.id.clone());
                 async move {
-                    let resultado = registro.executar(&chamada.name, args, ctx).await;
+                    let resultado = registro.executar(&chamada.name, args, &ctx).await;
                     (chamada, converter(resultado))
                 }
             })
@@ -1621,7 +1711,12 @@ async fn executar_chamadas(
     } else {
         for chamada in chamadas {
             let args: Value = serde_json::from_str(&chamada.arguments).unwrap_or(Value::Null);
-            let resultado = comp.registro.executar(&chamada.name, args, ctx).await;
+            let mut ctx_local = ctx.clone();
+            ctx_local.chamada_id = Some(chamada.id.clone());
+            let resultado = comp
+                .registro
+                .executar(&chamada.name, args, &ctx_local)
+                .await;
             resultados.push((chamada.clone(), converter(resultado)));
         }
     }
@@ -1771,6 +1866,7 @@ fn registrar_malformadas(
             erro.clone(),
         ));
         comp.evento(AgentEvent::FerramentaConcluida {
+            id: Some(call.id),
             nome: call.name,
             sucesso: false,
             resumo: format!("argumentos inválidos: {}", crate::util::truncate(&erro, 80)),
@@ -1855,6 +1951,7 @@ async fn executar_subagente_interno(
                 Some(evento) = delta_rx.recv() => {
                     if let StreamEvent::ToolCall { name: Some(nome), .. } = evento {
                         let _ = eventos.send(AgentEvent::FerramentaIniciada {
+                            id: None,
                             nome: format!("subagente:{nome}"),
                             detalhe: tarefa.to_string(),
                         });
@@ -1877,6 +1974,17 @@ async fn executar_subagente_interno(
         // Chamadas malformadas também precisam de um `tool` result: sem ele o
         // histórico fica inválido para a próxima requisição.
         for (chamada, erro) in malformadas {
+            // A interface recebeu `FerramentaIniciada` para esta chamada ao
+            // acompanhar o stream; sem a conclusão correspondente o bloco
+            // ficaria girando para sempre.
+            let _ = eventos.send(AgentEvent::FerramentaConcluida {
+                id: None,
+                nome: format!("subagente:{}", chamada.name),
+                sucesso: false,
+                resumo: format!("argumentos inválidos: {}", crate::util::truncate(&erro, 80)),
+                adicoes: 0,
+                remocoes: 0,
+            });
             historico.push(ChatMessage::tool_result(
                 chamada.id,
                 chamada.name,
@@ -1889,6 +1997,14 @@ async fn executar_subagente_interno(
             // inclusive as que o subagente não deveria ter (ex.: delete_file,
             // spawn_subagent).
             if !FERRAMENTAS_SUBAGENTE.contains(&chamada.name.as_str()) {
+                let _ = eventos.send(AgentEvent::FerramentaConcluida {
+                    id: None,
+                    nome: format!("subagente:{}", chamada.name),
+                    sucesso: false,
+                    resumo: "ferramenta indisponível para subagentes".into(),
+                    adicoes: 0,
+                    remocoes: 0,
+                });
                 historico.push(ChatMessage::tool_result(
                     chamada.id,
                     chamada.name.clone(),
@@ -1901,10 +2017,37 @@ async fn executar_subagente_interno(
             }
             let args: Value = serde_json::from_str(&chamada.arguments).unwrap_or(Value::Null);
             let resultado = comp.registro.executar(&chamada.name, args, &ctx).await;
-            let texto = match resultado {
-                Ok(saida) => saida.conteudo,
-                Err(erro) => format!("ERRO: {erro}"),
+            let (sucesso, texto, resumo, adicoes, remocoes) = match resultado {
+                Ok(saida) => {
+                    let texto = if saida.conteudo.trim().is_empty() {
+                        saida.resumo.clone()
+                    } else {
+                        saida.conteudo
+                    };
+                    (
+                        saida.sucesso,
+                        texto,
+                        saida.resumo,
+                        saida.adicoes,
+                        saida.remocoes,
+                    )
+                }
+                Err(erro) => (
+                    false,
+                    format!("ERRO: {erro}"),
+                    format!("falha: {erro}"),
+                    0,
+                    0,
+                ),
             };
+            let _ = eventos.send(AgentEvent::FerramentaConcluida {
+                id: None,
+                nome: format!("subagente:{}", chamada.name),
+                sucesso,
+                resumo: crate::util::redact_secrets(&resumo),
+                adicoes,
+                remocoes,
+            });
             // Segredos não podem voltar ao modelo nem ao relatório.
             let texto = crate::util::redact_secrets(&texto);
             historico.push(ChatMessage::tool_result(
@@ -2015,6 +2158,69 @@ mod tests {
         assert_eq!(detalhe_chamada(&chamada), "cargo test");
     }
 
+    /// Retomar uma sessão de outro diretório precisa mudar o workdir do
+    /// agente; senão o histórico antigo é continuado com ferramentas
+    /// apontando para o projeto errado.
+    #[tokio::test]
+    async fn retomar_sessao_troca_para_o_projeto_da_sessao() {
+        let projeto_a = dir_de_teste("retomar-a");
+        let projeto_b = dir_de_teste("retomar-b");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_session(
+                "s-a",
+                &projeto_a.display().to_string(),
+                "a",
+                "modelo/teste",
+                None,
+                "semi",
+                None,
+            )
+            .unwrap();
+        store
+            .create_session(
+                "s-b",
+                &projeto_b.display().to_string(),
+                "b",
+                "modelo/teste",
+                None,
+                "semi",
+                None,
+            )
+            .unwrap();
+        let mut ambiente = ambiente_de_teste(store, |cfg| {
+            cfg.agent.workdir = Some(projeto_a.clone());
+            cfg.agent.pin_workdir = true;
+        });
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let agente = Agente {
+            comp: ambiente.comp.clone(),
+            cmd_rx,
+        };
+        let mut turno_ativo = true; // evita iniciar um turno automático
+        let mut cancel = None;
+        let (fim_tx, _fim_rx) = mpsc::unbounded_channel();
+        agente.retomar_sessao("s-b", &mut turno_ativo, &mut cancel, &fim_tx);
+
+        assert_eq!(ambiente.comp.sessao().id, "s-b");
+        assert_eq!(
+            ambiente.comp.config().workdir(),
+            std::fs::canonicalize(&projeto_b).unwrap()
+        );
+        let eventos = drenar_eventos(&mut ambiente);
+        let esperado = std::fs::canonicalize(&projeto_b)
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(eventos.iter().any(|e| matches!(
+            e,
+            AgentEvent::SessaoAtiva { id, workdir, .. }
+                if id == "s-b" && workdir == &esperado
+        )));
+        let _ = std::fs::remove_dir_all(&projeto_a);
+        let _ = std::fs::remove_dir_all(&projeto_b);
+    }
+
     #[test]
     fn historico_descarta_resultados_orfaos() {
         let store = Store::open_in_memory().unwrap();
@@ -2060,7 +2266,6 @@ mod tests {
             registro: ToolRegistry::novo(),
             processos: Arc::new(ProcessManager::new()),
             arquivos: Arc::new(FileRegistry::new()),
-            http: reqwest::Client::new(),
             eventos: eventos_tx,
             confirmacoes: confirmacoes_tx,
             permitidos: Arc::new(Mutex::new(HashSet::new())),
@@ -2295,6 +2500,71 @@ mod tests {
         ] {
             assert!(FERRAMENTAS_SUBAGENTE.contains(&esperada));
         }
+    }
+
+    /// O subagente anuncia as ferramentas que executa na interface; cada
+    /// anúncio precisa de uma conclusão, senão o bloco fica "rodando" para
+    /// sempre na conversa.
+    #[tokio::test]
+    async fn subagente_conclui_as_ferramentas_que_executou() {
+        let dir = dir_de_teste("subagente-eventos");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_session(
+                "s",
+                &dir.display().to_string(),
+                "t",
+                "modelo/teste",
+                None,
+                "full",
+                None,
+            )
+            .unwrap();
+        let ambiente = ambiente_de_teste(store, |cfg| {
+            cfg.agent.workdir = Some(dir.clone());
+            cfg.agent.pin_workdir = true;
+            cfg.agent.permission = PermissionLevel::Full;
+        });
+        usar_roteiro(
+            &ambiente,
+            vec![
+                chamada("c1", "list_files", json!({"path": "."})),
+                resposta("relatório do subagente"),
+            ],
+        );
+        let (eventos_tx, mut eventos) = mpsc::unbounded_channel();
+        let relatorio = executar_subagente_interno(
+            ambiente.comp.clone(),
+            "listar arquivos",
+            "",
+            CancellationToken::new(),
+            eventos_tx,
+        )
+        .await
+        .unwrap();
+        assert!(relatorio.contains("relatório"));
+
+        let mut concluidas = 0;
+        while let Ok(evento) = eventos.try_recv() {
+            if let AgentEvent::FerramentaConcluida {
+                nome,
+                sucesso,
+                adicoes,
+                remocoes,
+                ..
+            } = evento
+                && nome == "subagente:list_files"
+            {
+                assert!(sucesso);
+                assert_eq!((adicoes, remocoes), (0, 0));
+                concluidas += 1;
+            }
+        }
+        assert_eq!(
+            concluidas, 1,
+            "a ferramenta do subagente não recebeu conclusão"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ------------------------------------------------- testes de ponta a ponta

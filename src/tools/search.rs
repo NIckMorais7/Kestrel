@@ -140,7 +140,7 @@ impl Tool for SearchCode {
             modo == Modo::Texto && regex_aparente(&consulta),
         ) || modo == Modo::Definicoes;
         let case_sensitive = arg_bool(&args, "case_sensitive", false);
-        let max = arg_u64(&args, "max_resultados").unwrap_or(80) as usize;
+        let max = arg_u64(&args, "max_resultados").unwrap_or(80).max(1) as usize;
         let contexto = arg_u64(&args, "contexto").unwrap_or(0) as usize;
         let glob = arg_str_opt(&args, "glob");
         let base = resolver_caminho(
@@ -148,8 +148,12 @@ impl Tool for SearchCode {
             &arg_str_opt(&args, "path").unwrap_or_else(|| ctx.workdir.display().to_string()),
         );
 
-        let raiz = if base.is_file() {
-            base.parent()
+        // Quando `path` é um arquivo, a busca vale só para ele. Antes o código
+        // subia para o diretório pai e varria todos os arquivos vizinhos.
+        let arquivo_unico = base.is_file().then(|| base.clone());
+        let raiz = if let Some(arquivo) = &arquivo_unico {
+            arquivo
+                .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| ctx.workdir.clone())
         } else {
@@ -166,7 +170,8 @@ impl Tool for SearchCode {
         let mut arquivos_com_match = 0usize;
         let mut total = 0usize;
 
-        let walker = ignore::WalkBuilder::new(&raiz)
+        let inicio_caminhada = arquivo_unico.as_deref().unwrap_or(&raiz);
+        let walker = ignore::WalkBuilder::new(inicio_caminhada)
             .hidden(false)
             .git_ignore(true)
             .max_depth(Some(20))
@@ -176,6 +181,11 @@ impl Tool for SearchCode {
                 continue;
             }
             let caminho = entrada.path();
+            if let Some(alvo) = &arquivo_unico
+                && caminho != alvo
+            {
+                continue;
+            }
             let ext = caminho
                 .extension()
                 .and_then(|e| e.to_str())
@@ -188,6 +198,14 @@ impl Tool for SearchCode {
                     continue;
                 }
             }
+            // O limite precisa ser checado antes da leitura: antes o arquivo
+            // inteiro era carregado em memória para só então ser descartado.
+            let Ok(meta) = std::fs::metadata(caminho) else {
+                continue;
+            };
+            if meta.len() > 2_000_000 {
+                continue; // arquivo grande demais para busca em memória
+            }
             let Ok(bytes) = std::fs::read(caminho) else {
                 continue;
             };
@@ -195,9 +213,6 @@ impl Tool for SearchCode {
                 continue; // binário
             }
             let texto = String::from_utf8_lossy(&bytes);
-            if texto.len() > 2_000_000 {
-                continue; // arquivo grande demais para busca em memória
-            }
 
             let padrao = match modo {
                 Modo::Texto => compilar_busca(&consulta, usar_regex, case_sensitive),
@@ -211,7 +226,11 @@ impl Tool for SearchCode {
                         // Linguagem sem padrões: cai para busca textual.
                         compilar_busca(&consulta, false, case_sensitive)
                     } else {
-                        Regex::new(&format!("(?m){}", alternativas.join("|")))
+                        // O modo de definições também respeita
+                        // `case_sensitive`; antes ele sempre diferenciava
+                        // maiúsculas mesmo com a opção padrão (insensível).
+                        let flags = if case_sensitive { "(?m)" } else { "(?im)" };
+                        Regex::new(&format!("{flags}{}", alternativas.join("|")))
                             .map_err(|e| ToolError::msg(format!("padrão inválido: {e}")))
                     }
                 }
@@ -361,5 +380,30 @@ mod tests {
         assert!(regex_aparente("fn\\s+main"));
         assert!(regex_aparente("a.*b"));
         assert!(!regex_aparente("fn main"));
+    }
+
+    /// `path` apontando para um arquivo limitava a busca ao arquivo; antes o
+    /// diretório pai inteiro era varrido.
+    #[tokio::test]
+    async fn busca_em_arquivo_unico_nao_varre_o_diretorio() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-busca-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("alvo.txt");
+        std::fs::write(&alvo, "agulha no alvo\n").unwrap();
+        std::fs::write(dir.join("vizinho.txt"), "agulha no vizinho\n").unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        let args = serde_json::json!({
+            "consulta": "agulha",
+            "path": alvo.display().to_string(),
+        });
+        let saida = SearchCode.executar(args, &ctx).await.unwrap();
+        assert!(saida.conteudo.contains("alvo.txt"), "{}", saida.conteudo);
+        assert!(
+            !saida.conteudo.contains("vizinho.txt"),
+            "a busca vazou para o diretório: {}",
+            saida.conteudo
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

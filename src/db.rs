@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS plans (
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
-    id          TEXT PRIMARY KEY,
+    id          TEXT NOT NULL,
     session_id  TEXT NOT NULL,
     parent_id   TEXT,
     title       TEXT NOT NULL,
@@ -67,7 +67,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     order_idx   INTEGER NOT NULL DEFAULT 0,
     result      TEXT,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    -- O id é escolhido pelo modelo (ex.: `t1`) e só precisa ser único dentro
+    -- da sessão; com `id` como chave global, duas sessões colidiam e uma
+    -- sobrescrevia as tarefas da outra.
+    PRIMARY KEY (id, session_id)
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id, order_idx);
 
@@ -562,7 +566,8 @@ impl Store {
             c.execute(
                 "INSERT INTO tasks (id, session_id, parent_id, title, description, status, depends_on, order_idx, result, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
-                 ON CONFLICT(id) DO UPDATE SET
+                 ON CONFLICT(id, session_id) DO UPDATE SET
+                    parent_id = excluded.parent_id,
                     title = excluded.title,
                     description = excluded.description,
                     status = excluded.status,
@@ -946,6 +951,59 @@ fn migracao_2_para_3_cria_usage() {
     assert_eq!(stats.prompt_tokens, 123);
     assert_eq!(stats.completion_tokens, 45);
     assert_eq!(stats.reasoning_tokens, 6);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Banco na versão 3 tinha `tasks.id` como chave global. A migração precisa
+/// preservar as tarefas e permitir o mesmo id em sessões diferentes.
+#[test]
+fn migracao_3_para_4_torna_id_de_tarefa_por_sessao() {
+    use rusqlite::Connection;
+    let dir = std::env::temp_dir().join(format!("kestrel-tarefas-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let caminho = dir.join("kestrel.db");
+    {
+        let conn = Connection::open(&caminho).unwrap();
+        conn.execute_batch(SCHEMA_BASE).unwrap();
+        // Recria a tabela no formato antigo (id global).
+        conn.execute_batch(
+            "DROP TABLE tasks;
+             CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                parent_id TEXT,
+                title TEXT NOT NULL,
+                description TEXT,
+                status TEXT NOT NULL,
+                depends_on TEXT,
+                order_idx INTEGER NOT NULL DEFAULT 0,
+                result TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             INSERT INTO tasks (id, session_id, title, status, created_at, updated_at)
+                VALUES ('t1', 's1', 'antiga', 'pendente', '2026-01-01', '2026-01-01');
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&caminho).unwrap();
+    assert_eq!(store.tasks("s1").unwrap()[0].title, "antiga");
+    store
+        .upsert_task(&TaskRow {
+            id: "t1".into(),
+            session_id: "s2".into(),
+            parent_id: None,
+            title: "nova".into(),
+            description: None,
+            status: "pendente".into(),
+            depends_on: Vec::new(),
+            order_idx: 0,
+            result: None,
+        })
+        .unwrap();
+    assert_eq!(store.tasks("s1").unwrap()[0].title, "antiga");
+    assert_eq!(store.tasks("s2").unwrap()[0].title, "nova");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

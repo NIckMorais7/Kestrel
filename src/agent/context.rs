@@ -187,13 +187,19 @@ pub fn construir_dossie(
         }
     }
 
-    // Arquivos alterados.
-    for (path, tipo, adicoes, remocoes) in store.file_changes(session_id)? {
-        d.arquivos
-            .push(format!("{path} ({tipo}, +{adicoes} -{remocoes})"));
+    // Arquivos alterados: o dossiê guarda a alteração mais recente de cada
+    // caminho. Antes o `dedup_by` comparava o primeiro token separado por
+    // espaço, então caminhos com espaço colidiam e duplicatas não adjacentes
+    // sobreviviam.
+    let mut vistos = std::collections::HashSet::new();
+    let mut arquivos = Vec::new();
+    for (path, tipo, adicoes, remocoes) in store.file_changes(session_id)?.into_iter().rev() {
+        if vistos.insert(path.clone()) {
+            arquivos.push(format!("{path} ({tipo}, +{adicoes} -{remocoes})"));
+        }
     }
-    d.arquivos
-        .dedup_by(|a, b| a.split_whitespace().next() == b.split_whitespace().next());
+    arquivos.reverse();
+    d.arquivos = arquivos;
 
     // Comandos e testes.
     let recentes = store.recent_messages(session_id, 400)?;
@@ -333,5 +339,39 @@ mod tests {
         let texto = d.para_texto();
         assert!(texto.contains("## Ponto de interrupção"));
         assert!(texto.contains("rodar cargo test"));
+    }
+
+    /// Deduplicar pelo primeiro token separado por espaço fazia dois caminhos
+    /// com espaço colidirem e deixava duplicatas não adjacentes passarem.
+    #[test]
+    fn dossie_deduplica_por_caminho_inteiro() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_session("s1", "/p", "tarefa", "m", None, "semi", None)
+            .unwrap();
+        for (path, tipo) in [
+            ("src/meu arquivo.rs", "edicao"),
+            ("src/outro.rs", "edicao"),
+            ("src/meu arquivo.rs", "edicao"),
+            ("src/outro.rs", "criacao"),
+        ] {
+            store
+                .record_file_change("s1", path, tipo, 1, 0, None)
+                .unwrap();
+        }
+        let d = construir_dossie(&store, "s1", "", "", "").unwrap();
+        assert_eq!(d.arquivos.len(), 2, "{:?}", d.arquivos);
+        assert_eq!(
+            d.arquivos
+                .iter()
+                .filter(|a| a.contains("meu arquivo.rs"))
+                .count(),
+            1
+        );
+        assert!(
+            d.arquivos.iter().any(|a| a.contains("outro.rs (criacao")),
+            "deveria manter a alteração mais recente: {:?}",
+            d.arquivos
+        );
     }
 }

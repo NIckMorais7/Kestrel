@@ -183,16 +183,23 @@ fn coletar_dir(dir: &Path, escopo: Escopo, saida: &mut Vec<SkillInfo>) {
 pub fn parse_skill(path: &Path, escopo: Escopo) -> Option<SkillInfo> {
     let texto = std::fs::read_to_string(path).ok()?;
     let (front, _) = dividir_frontmatter(&texto);
-    let mut nome = path
-        .parent()
-        .filter(|p| p.file_name().is_some())
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "skill".into())
-        });
+    // `skills/<nome>/SKILL.md` usa o nome do diretório; um `skills/<nome>.md`
+    // solto usa o nome do arquivo. Antes todo arquivo herdava o nome do
+    // diretório pai (`skills`), e todas as skills planas colidiam entre si.
+    let mut nome = if path
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("SKILL.md"))
+    {
+        path.parent()
+            .filter(|p| p.file_name().is_some())
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "skill".into())
+    } else {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "skill".into())
+    };
     let mut descricao = primeira_frase(&texto);
     for linha in front.lines() {
         let Some((chave, valor)) = linha.split_once(':') else {
@@ -260,6 +267,11 @@ mod tests {
             "---\ndescription: estratégia de testes e cobertura\n---\nSempre execute cargo test.\n",
         )
         .unwrap();
+        std::fs::write(
+            paths.skills_dir().join("revisao.md"),
+            "---\ndescription: revisar mudanças antes de entregar\n---\nRevise o diff.\n",
+        )
+        .unwrap();
         (raiz, paths, projeto)
     }
 
@@ -267,10 +279,12 @@ mod tests {
     fn descobre_skills_do_usuario_e_do_projeto() {
         let (raiz, paths, projeto) = setup();
         let reg = SkillRegistry::discover(&paths, &projeto);
-        assert_eq!(reg.all().len(), 2);
+        assert_eq!(reg.all().len(), 3);
         assert!(reg.get("Refatoração segura").is_some());
-        // Sem frontmatter `name`, usa o nome do diretório.
+        // Sem frontmatter `name`, usa o nome do diretório (SKILL.md) ou do
+        // arquivo (skill plana).
         assert!(reg.get("testes").is_some());
+        assert!(reg.get("revisao").is_some());
         let _ = std::fs::remove_dir_all(&raiz);
     }
 

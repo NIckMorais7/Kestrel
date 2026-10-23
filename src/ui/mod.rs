@@ -3,6 +3,7 @@
 //! Todo o texto da interface está em português brasileiro. Os números de
 //! alterações exibidos vêm dos diffs reais devolvidos pelas ferramentas.
 
+pub mod icone;
 pub mod input;
 pub mod markdown;
 pub mod mascot;
@@ -112,17 +113,36 @@ pub fn desenhar(f: &mut Frame, app: &mut App) {
 /// Cabeçalho em duas linhas, sem caixa e sem provedor:
 ///
 /// ```text
-///  ◆ Kestrel v0.5.0   modelo/teste · high
-///  ~/Projetos/Kestrel (master) · build · Semi
+///  [ícone] Kestrel v0.5.0   modelo/teste · high
+///          ~/Projetos/Kestrel (master) · build · Semi
 /// ```
 fn desenhar_cabecalho(f: &mut Frame, app: &App, area: Rect) {
-    let mut titulo = vec![
-        Span::styled(" ◆ ", theme::titulo()),
-        Span::styled("Kestrel", theme::titulo()),
-        Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), theme::apagado()),
-        Span::styled("   ", theme::apagado()),
-        Span::styled(crate::util::truncate(&app.modelo, 42), theme::texto()),
-    ];
+    // O ícone branco/preto é escolhido pelo tema; sem ícone, cai no losango.
+    let com_icone = app.icone.is_some() && area.width >= icone::COLUNAS + 12;
+    let area_texto = if com_icone {
+        Rect {
+            x: area.x + icone::COLUNAS + 1,
+            y: area.y,
+            width: area.width.saturating_sub(icone::COLUNAS + 1),
+            height: area.height,
+        }
+    } else {
+        area
+    };
+    let mut titulo = vec![Span::styled("Kestrel", theme::titulo())];
+    if !com_icone {
+        // Sem ícone (terminal estreito ou PNG indisponível), mantém o símbolo.
+        titulo.insert(0, Span::styled(" ◆ ", theme::titulo()));
+    }
+    titulo.push(Span::styled(
+        format!(" v{}", env!("CARGO_PKG_VERSION")),
+        theme::apagado(),
+    ));
+    titulo.push(Span::styled("   ", theme::apagado()));
+    titulo.push(Span::styled(
+        crate::util::truncate(&app.modelo, 42),
+        theme::texto(),
+    ));
     if let Some(esforco) = &app.esforco {
         titulo.push(Span::styled(format!(" · {esforco}"), theme::apagado()));
     }
@@ -155,8 +175,24 @@ fn desenhar_cabecalho(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(
         Paragraph::new(Text::from(vec![Line::from(titulo), Line::from(contexto)])),
-        area,
+        area_texto,
     );
+
+    // Ícone por último: ele ocupa 2×1 e a cor acompanha o fundo do tema.
+    if com_icone
+        && let Some(icone) = &app.icone
+        && area.height >= icone::LINHAS
+    {
+        icone.desenhar(
+            f,
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: icone::COLUNAS.min(area.width),
+                height: icone::LINHAS.min(area.height),
+            },
+        );
+    }
 }
 
 fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
@@ -328,22 +364,21 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect) {
         },
     ));
     spans.push(Span::styled(app.estado_texto.clone(), estilo_estado));
-    if app.token_total.0 + app.token_total.1 > 0 {
-        let total = app.token_total.0 + app.token_total.1;
-        spans.push(Span::styled(
-            format!(" · {} tok", crate::util::formatar_num(total)),
-            theme::apagado(),
-        ));
-    }
+    // Contexto real do modelo: usado/total e percentual. Tokens acumulados
+    // continuam em `/cost`; somar tudo no rodapé fazia parecer que uma pergunta
+    // simples consumia 30 mil tokens.
     if app.contexto.1 > 0 {
         let fracao = app.contexto.0 as f32 / app.contexto.1.max(1) as f32;
-        if fracao >= 0.7 {
-            spans.push(Span::styled(" · contexto ", theme::apagado()));
-            spans.push(Span::styled(
-                format!("{:.0}%", fracao * 100.0),
-                Style::default().fg(theme::cor_contexto(fracao)),
-            ));
-        }
+        spans.push(Span::styled(" · contexto ", theme::apagado()));
+        spans.push(Span::styled(
+            format!(
+                "{}/{} ({:.0}%)",
+                crate::util::formatar_tokens(app.contexto.0 as u64),
+                crate::util::formatar_tokens(app.contexto.1 as u64),
+                (fracao * 100.0).round()
+            ),
+            Style::default().fg(theme::cor_contexto(fracao)),
+        ));
     }
     if app.mostrar_raciocinio {
         spans.push(Span::styled(" · thinking ", theme::apagado()));
@@ -908,7 +943,12 @@ fn desenhar_seletor(f: &mut Frame, seletor: &Seletor, area: Rect, tique: u64) {
     }
 
     let visivel = interno.height as usize;
-    let (inicio_selecionado, altura_selecionado) = faixas[seletor.sel.min(faixas.len() - 1)];
+    // Sem item nenhum (catálogo/projetos/processos vazios), não há faixa para
+    // indexar: um `[len - 1]` sobre vetor vazio travaria a interface inteira.
+    let (inicio_selecionado, altura_selecionado) = match faixas.get(seletor.sel) {
+        Some(faixa) => *faixa,
+        None => (0, 0),
+    };
     // Mantém o item selecionado na mesma altura da janela quando possível.
     let janela = if altura_selecionado >= visivel {
         inicio_selecionado
@@ -1099,11 +1139,16 @@ mod tests {
         assert!(!tela.contains("nvidia"));
         assert!(tela.contains("build"));
         assert!(tela.contains("Semi"));
-        // Contexto distante do limite não ocupa o cabeçalho.
-        app.contexto = (100, 10_000);
+        // Sem medição ainda, nada de contexto no rodapé.
+        app.contexto = (0, 0);
         let tela = desenhar_em(&mut app, 120, 30);
         assert!(!tela.contains("contexto"));
-        // Perto do limite, o aviso aparece.
+        // Com medição, o contexto aparece sempre (não só perto do limite).
+        app.contexto = (100, 10_000);
+        let tela = desenhar_em(&mut app, 120, 30);
+        assert!(tela.contains("contexto"));
+        assert!(tela.contains("1%"), "porcentagem deveria aparecer: {tela}");
+        // Perto do limite, o aviso fica vermelho/âmbar, mas continua visível.
         app.contexto = (9_000, 10_000);
         let tela = desenhar_em(&mut app, 120, 30);
         assert!(tela.contains("contexto"));

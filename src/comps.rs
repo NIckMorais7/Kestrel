@@ -157,9 +157,9 @@ impl Comp {
     }
 }
 
-/// Lista os Comps válidos do diretório, ordenados por nome. Arquivos
-/// inválidos são ignorados (e não derrubam a interface).
-pub fn listar(dir: &Path) -> Vec<Comp> {
+/// Lista os Comps válidos do diretório com o caminho real de cada arquivo.
+/// Arquivos inválidos são ignorados (e não derrubam a interface).
+fn listar_com_caminhos(dir: &Path) -> Vec<(Comp, PathBuf)> {
     let Ok(entradas) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -170,20 +170,29 @@ pub fn listar(dir: &Path) -> Vec<Comp> {
             continue;
         }
         if let Ok(comp) = Comp::carregar(&caminho) {
-            comps.push(comp);
+            comps.push((comp, caminho));
         }
     }
-    comps.sort_by_key(|a| a.nome.to_lowercase());
+    comps.sort_by_key(|(a, _)| a.nome.to_lowercase());
     comps
 }
 
-/// Procura por slug ou nome (sem diferenciar maiúsculas).
+/// Lista os Comps válidos do diretório, ordenados por nome.
+pub fn listar(dir: &Path) -> Vec<Comp> {
+    listar_com_caminhos(dir)
+        .into_iter()
+        .map(|(comp, _)| comp)
+        .collect()
+}
+
+/// Procura por slug ou nome (sem diferenciar maiúsculas). O caminho devolvido
+/// é o arquivo real: usar `comp.caminho(dir)` falhava quando o arquivo tinha
+/// sido renomeado (o nome dele não é necessariamente o slug).
 pub fn encontrar(dir: &Path, nome: &str) -> Option<(Comp, PathBuf)> {
     let procurado = nome.trim().to_lowercase();
     let slug = slug_de(nome);
-    for comp in listar(dir) {
+    for (comp, caminho) in listar_com_caminhos(dir) {
         if comp.nome.to_lowercase() == procurado || comp.slug() == slug {
-            let caminho = comp.caminho(dir);
             return Some((comp, caminho));
         }
     }
@@ -288,6 +297,23 @@ mod testes {
             .unwrap();
         let lista = listar(&dir);
         assert_eq!(lista.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O arquivo pode ter sido renomeado: remover precisa usar o caminho real,
+    /// não o slug calculado a partir do nome.
+    #[test]
+    fn encontrar_e_remover_usam_o_caminho_real_do_arquivo() {
+        let dir = dir_temporario();
+        let comp = Comp::novo("Lazy", "seja breve").unwrap();
+        let texto = toml::to_string_pretty(&comp).unwrap();
+        let real = dir.join("renomeado.toml");
+        std::fs::write(&real, texto).unwrap();
+        let (_, caminho) = encontrar(&dir, "Lazy").unwrap();
+        assert_eq!(caminho, real);
+        let removido = remover(&dir, "lazy").unwrap();
+        assert_eq!(removido, real);
+        assert!(!real.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

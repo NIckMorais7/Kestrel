@@ -361,6 +361,18 @@ pub fn fundo() -> Style {
     Style::default().bg(fundo_cor())
 }
 
+/// True quando o fundo atual é claro. Usado para escolher entre o ícone preto
+/// e o branco do Kestrel.
+pub fn fundo_e_claro() -> bool {
+    match fundo_cor() {
+        Color::Rgb(r, g, b) => {
+            // Luminância perceptual aproximada (0..255).
+            (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000 > 128
+        }
+        _ => false,
+    }
+}
+
 /// Estilo com a superfície elevada (campo de mensagem, modais).
 pub fn superficie() -> Style {
     Style::default().bg(superficie_cor())

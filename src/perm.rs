@@ -163,27 +163,17 @@ pub struct AnalysisContext {
     pub roots: Vec<PathBuf>,
 }
 
-/// Padrões catastróficos bloqueados em qualquer nível de permissão.
-const PADROES_PROIBIDOS: &[(&str, &str)] = &[
-    ("mkfs", "formatação de sistema de arquivos"),
-    (":(){", "fork bomb"),
-    ("shutdown", "desligamento do sistema"),
-    ("reboot", "reinicialização do sistema"),
-    ("poweroff", "desligamento do sistema"),
-    ("halt ", "desligamento do sistema"),
-    ("init 0", "desligamento do sistema"),
-    ("> /dev/sd", "escrita direta em dispositivo de bloco"),
-    ("> /dev/nvme", "escrita direta em dispositivo de bloco"),
-    (
-        "chmod -R 777 /",
-        "liberação de permissões na raiz do sistema",
-    ),
-    ("chmod 777 /", "liberação de permissões na raiz do sistema"),
-];
-
 /// Diretórios de sistema cuja escrita é sempre bloqueada.
 const DIRETORIOS_SISTEMA: &[&str] = &[
     "/etc", "/boot", "/sys", "/proc", "/dev", "/usr/bin", "/usr/lib", "/var/lib", "/bin", "/sbin",
+];
+
+/// Diretórios cuja remoção nunca é rotina. A checagem vale para o próprio
+/// diretório e para qualquer caminho dentro dele: `rm -rf /var` e
+/// `rm -rf /usr/local` não podem passar como limpeza de build.
+const DIRETORIOS_VITAIS: &[&str] = &[
+    "/", "/root", "/usr", "/var", "/etc", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt",
+    "/srv", "/snap", "/sys", "/proc", "/dev", "/run",
 ];
 
 /// Nós de dispositivo que podem ser usados para descartar/redirecionar saída
@@ -224,7 +214,11 @@ fn contem_algum(haystack: &str, needles: &[&str]) -> Option<String> {
 /// começa com `/`.
 fn caminhos_no_comando(cmd: &str, raiz: Option<&PathBuf>) -> Vec<PathBuf> {
     cmd.split_whitespace()
-        .map(|tok| tok.trim_matches(|c| c == '"' || c == '\'' || c == ';' || c == '|'))
+        .map(|tok| {
+            tok.trim_matches(|c| {
+                c == '"' || c == '\'' || c == ';' || c == '|' || c == '(' || c == ')'
+            })
+        })
         .filter(|tok| {
             tok.starts_with('/')
                 || tok.starts_with("./")
@@ -275,11 +269,21 @@ fn subcomandos(cmd: &str) -> Vec<String> {
                 atual = String::new();
                 i += 1;
             }
-            '|' | '&' => {
+            '|' => {
+                saida.push(atual.trim().to_string());
+                atual = String::new();
+                i += 1;
+            }
+            // `2>&1` / `&> arquivo` são redirecionamentos, não separadores.
+            '&' if atual.trim_end().ends_with('>') || chars.get(i + 1) == Some(&'>') => {
+                atual.push(c);
+                i += 1;
+            }
+            '&' => {
                 // `&&` e `||` contam como uma única separação.
                 saida.push(atual.trim().to_string());
                 atual = String::new();
-                if c == '&' && i + 1 < chars.len() && chars[i + 1] == '&' {
+                if i + 1 < chars.len() && chars[i + 1] == '&' {
                     i += 2;
                 } else {
                     i += 1;
@@ -324,19 +328,32 @@ fn fundir(atual: Option<Analysis>, outra: Analysis) -> Option<Analysis> {
 /// `rm` com recursão apontando para a raiz do sistema, em qualquer grafia de
 /// flags (`rm -rf /`, `rm -r -f /`, `rm --recursive --force /`, `rm -fr /*`).
 fn remove_raiz_do_sistema(cmd: &str) -> bool {
-    let tokens: Vec<&str> = cmd.split_whitespace().collect();
-    let tem_rm = tokens.iter().any(|t| t.rsplit('/').next() == Some("rm"));
-    if !tem_rm {
-        return false;
+    for parte in subcomandos(&sem_aspas(cmd)) {
+        let (efetivo, _) = comando_efetivo(&parte);
+        let alvo = if efetivo.is_empty() {
+            parte.as_str()
+        } else {
+            efetivo.as_str()
+        };
+        let tokens: Vec<&str> = alvo.split_whitespace().collect();
+        let tem_rm = tokens
+            .first()
+            .is_some_and(|t| t.rsplit('/').next() == Some("rm"));
+        if !tem_rm {
+            continue;
+        }
+        let recursivo = tokens.iter().any(|t| {
+            t.starts_with('-') && (t.contains('r') || t.contains('R') || t.contains("--recursive"))
+        });
+        let alvo_raiz = tokens.iter().any(|t| {
+            let alvo = t.trim_matches(|c| c == '"' || c == '\'');
+            alvo == "/" || alvo == "/*"
+        });
+        if recursivo && alvo_raiz {
+            return true;
+        }
     }
-    let recursivo = tokens.iter().any(|t| {
-        t.starts_with('-') && (t.contains('r') || t.contains('R') || t.contains("--recursive"))
-    });
-    let alvo_raiz = tokens.iter().any(|t| {
-        let alvo = t.trim_matches(|c| c == '"' || c == '\'');
-        alvo == "/" || alvo == "/*"
-    });
-    recursivo && alvo_raiz
+    false
 }
 
 /// `find` capaz de apagar ou executar comandos, em qualquer posição do
@@ -359,10 +376,397 @@ fn sem_aspas(cmd: &str) -> String {
     cmd.replace(['"', '\''], "")
 }
 
+/// Prefixos que apenas embrulham outro comando (`sudo`, `env`, `timeout`,
+/// `xargs`, …). A análise precisa enxergar o comando real: antes
+/// `env rm -rf ~` era classificado pela palavra `env` e liberado como rotina.
+///
+/// Devolve o comando interno e a lista de embrulhos encontrados, para que a
+/// elevação de privilégios continue exigindo confirmação mesmo quando o
+/// comando interno é inofensivo.
+fn comando_efetivo(cmd: &str) -> (String, Vec<String>) {
+    let tokens: Vec<String> = sem_aspas(cmd)
+        .split_whitespace()
+        .map(|t| t.trim_start_matches(['(', '{', '!']).to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut wrappers = Vec::new();
+    let mut inicio = 0;
+    while let Some(token) = tokens.get(inicio) {
+        let nome = token.rsplit('/').next().unwrap_or(token).to_string();
+        match nome.as_str() {
+            "sudo" | "doas" => {
+                wrappers.push(nome);
+                let mut j = inicio + 1;
+                while j < tokens.len() {
+                    let t = &tokens[j];
+                    if t == "--" {
+                        j += 1;
+                        break;
+                    }
+                    if !t.starts_with('-') {
+                        break;
+                    }
+                    j += if matches!(
+                        t.as_str(),
+                        "-u" | "-g"
+                            | "-p"
+                            | "-U"
+                            | "-C"
+                            | "-h"
+                            | "-r"
+                            | "-t"
+                            | "--user"
+                            | "--group"
+                            | "--prompt"
+                            | "--chdir"
+                            | "--host"
+                            | "--role"
+                            | "--type"
+                    ) {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                inicio = j;
+            }
+            "su" => {
+                wrappers.push(nome);
+                let mut j = inicio + 1;
+                while j < tokens.len() {
+                    let t = &tokens[j];
+                    if t == "-c" || t == "--command" {
+                        j += 1;
+                        break;
+                    }
+                    if t == "--" {
+                        j += 1;
+                        continue;
+                    }
+                    if t.starts_with('-') {
+                        j += if matches!(
+                            t.as_str(),
+                            "-g" | "-G" | "-s" | "--group" | "--supp-group" | "--shell"
+                        ) {
+                            2
+                        } else {
+                            1
+                        };
+                    } else {
+                        // Nome do usuário de destino.
+                        j += 1;
+                    }
+                }
+                inicio = j;
+            }
+            "env" => {
+                let mut j = inicio + 1;
+                while j < tokens.len() {
+                    let t = &tokens[j];
+                    if t == "--" {
+                        j += 1;
+                        break;
+                    }
+                    if t.starts_with('-') {
+                        j += if matches!(t.as_str(), "-u" | "-C" | "--unset" | "--chdir") {
+                            2
+                        } else {
+                            1
+                        };
+                    } else if t.contains('=') {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                inicio = j;
+            }
+            "command" | "nohup" | "exec" | "builtin" | "setsid" | "unbuffer" | "busybox"
+            | "chronic" | "time" => {
+                let mut j = inicio + 1;
+                while j < tokens.len() && tokens[j].starts_with('-') {
+                    j += 1;
+                }
+                inicio = j;
+            }
+            "timeout" => {
+                let mut j = inicio + 1;
+                while j < tokens.len() && tokens[j].starts_with('-') {
+                    j += if matches!(
+                        tokens[j].as_str(),
+                        "-s" | "--signal" | "-k" | "--kill-after"
+                    ) {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                // O primeiro argumento após as flags é a duração.
+                inicio = j + 1;
+            }
+            "nice" => {
+                let mut j = inicio + 1;
+                while j < tokens.len() && tokens[j].starts_with('-') {
+                    j += if matches!(tokens[j].as_str(), "-n" | "--adjustment") {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                inicio = j;
+            }
+            "ionice" => {
+                let mut j = inicio + 1;
+                while j < tokens.len() && tokens[j].starts_with('-') {
+                    j += if matches!(
+                        tokens[j].as_str(),
+                        "-c" | "-n"
+                            | "-p"
+                            | "-P"
+                            | "-u"
+                            | "--class"
+                            | "--classdata"
+                            | "--pid"
+                            | "--pgid"
+                            | "--uid"
+                    ) {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                inicio = j;
+            }
+            "stdbuf" => {
+                let mut j = inicio + 1;
+                while j < tokens.len() && tokens[j].starts_with('-') {
+                    j += if matches!(
+                        tokens[j].as_str(),
+                        "-i" | "-o" | "-e" | "--input" | "--output" | "--error"
+                    ) {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                inicio = j;
+            }
+            "xargs" => {
+                let mut j = inicio + 1;
+                while j < tokens.len() && tokens[j].starts_with('-') {
+                    j += if matches!(
+                        tokens[j].as_str(),
+                        "-n" | "-I"
+                            | "-P"
+                            | "-d"
+                            | "-L"
+                            | "-s"
+                            | "-E"
+                            | "-a"
+                            | "--max-args"
+                            | "--replace"
+                            | "--max-procs"
+                            | "--delimiter"
+                            | "--max-lines"
+                            | "--max-chars"
+                            | "--eof"
+                            | "--arg-file"
+                    ) {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                inicio = j;
+            }
+            _ => break,
+        }
+    }
+    let efetivo = tokens
+        .get(inicio..)
+        .map(|resto| resto.join(" "))
+        .unwrap_or_default();
+    (efetivo, wrappers)
+}
+
+/// Conteúdo de substituições de comando (`$(…)`, `` `…` `` e `<(…)`), que
+/// executam de verdade mesmo quando o comando externo é inofensivo:
+/// `echo $(rm -rf ~)` não é leitura.
+fn substituicoes(cmd: &str) -> Vec<String> {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut saida = Vec::new();
+    let mut i = 0;
+    let mut aspa_simples = false;
+    let mut aspa_dupla = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
+        if c == '\'' && !aspa_dupla {
+            aspa_simples = !aspa_simples;
+            i += 1;
+            continue;
+        }
+        if c == '"' && !aspa_simples {
+            aspa_dupla = !aspa_dupla;
+            i += 1;
+            continue;
+        }
+        if aspa_simples {
+            i += 1;
+            continue;
+        }
+        if c == '`' {
+            let inicio = i + 1;
+            let mut j = inicio;
+            while j < chars.len() && chars[j] != '`' {
+                j += 1;
+            }
+            if j < chars.len() {
+                saida.push(chars[inicio..j].iter().collect());
+            }
+            i = j + 1;
+            continue;
+        }
+        let substituicao = (c == '$' && chars.get(i + 1) == Some(&'('))
+            || ((c == '<' || c == '>') && chars.get(i + 1) == Some(&'('));
+        if substituicao {
+            let inicio = i + 2;
+            let mut nivel = 1;
+            let mut j = inicio;
+            while j < chars.len() && nivel > 0 {
+                match chars[j] {
+                    '(' => nivel += 1,
+                    ')' => nivel -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if nivel == 0 {
+                let interno: String = chars[inicio..j - 1].iter().collect();
+                // `$((…))` é aritmética, não executa comando.
+                if !(c == '$' && interno.starts_with('(')) {
+                    saida.push(interno);
+                }
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    saida
+}
+
+/// Comandos que desligam/formatam o sistema, reconhecidos na posição de
+/// comando (não como substring): `echo "shutdown"` é texto, `shutdown -h now`
+/// é desligamento. Embrulhos (`sudo`, `env`, `timeout`…) são atravessados.
+fn comando_catastrofico(cmd: &str) -> Option<(&'static str, &'static str)> {
+    for parte in subcomandos(&sem_aspas(cmd)) {
+        let (efetivo, _) = comando_efetivo(&parte);
+        let alvo = if efetivo.is_empty() {
+            parte.as_str()
+        } else {
+            efetivo.as_str()
+        };
+        let mut palavras = alvo.split_whitespace();
+        let programa = palavras.next().unwrap_or("");
+        let programa = programa.rsplit('/').next().unwrap_or(programa);
+        let argumentos: Vec<&str> = palavras.collect();
+        if programa == "mkfs" || programa.starts_with("mkfs.") {
+            return Some(("mkfs", "formatação de sistema de arquivos"));
+        }
+        if let Some(padrao) = match programa {
+            "shutdown" => Some("shutdown"),
+            "reboot" => Some("reboot"),
+            "poweroff" => Some("poweroff"),
+            "halt" => Some("halt"),
+            _ => None,
+        } {
+            return Some((padrao, "desligamento do sistema"));
+        }
+        if matches!(programa, "init" | "telinit") && argumentos.first() == Some(&"0") {
+            return Some(("init 0", "desligamento do sistema"));
+        }
+        if programa == "systemctl"
+            && let Some(sub) = argumentos
+                .iter()
+                .find(|a| matches!(**a, "poweroff" | "reboot" | "halt" | "shutdown" | "kexec"))
+        {
+            return match *sub {
+                "poweroff" => Some(("systemctl poweroff", "desligamento do sistema")),
+                "reboot" => Some(("systemctl reboot", "reinicialização do sistema")),
+                "halt" => Some(("systemctl halt", "desligamento do sistema")),
+                "shutdown" => Some(("systemctl shutdown", "desligamento do sistema")),
+                _ => Some(("systemctl kexec", "reinicialização do sistema")),
+            };
+        }
+    }
+    None
+}
+
+/// `chmod` permissivo na raiz do sistema (`chmod -R 777 /`).
+fn permissao_na_raiz(cmd: &str) -> bool {
+    for parte in subcomandos(&sem_aspas(cmd)) {
+        let (efetivo, _) = comando_efetivo(&parte);
+        let alvo = if efetivo.is_empty() {
+            parte.as_str()
+        } else {
+            efetivo.as_str()
+        };
+        let mut palavras = alvo.split_whitespace();
+        let programa = palavras.next().unwrap_or("");
+        let programa = programa.rsplit('/').next().unwrap_or(programa);
+        if programa != "chmod" {
+            continue;
+        }
+        let argumentos: Vec<&str> = palavras.collect();
+        let raiz = argumentos.iter().any(|a| matches!(*a, "/" | "/*" | "//"));
+        let permissivo = argumentos
+            .iter()
+            .any(|a| matches!(*a, "777" | "a+rwx" | "ugo+rwx" | "o+w" | "a+w"));
+        if raiz && permissivo {
+            return true;
+        }
+    }
+    false
+}
+
+/// Redirecionamento direto para dispositivo de bloco (`cat x > /dev/sda`).
+fn redireciona_para_dispositivo(cmd: &str) -> bool {
+    redirecionamentos(cmd).iter().any(|alvo| {
+        let alvo = alvo.to_string_lossy().to_lowercase();
+        [
+            "/dev/sd",
+            "/dev/hd",
+            "/dev/nvme",
+            "/dev/mmcblk",
+            "/dev/disk",
+        ]
+        .iter()
+        .any(|prefixo| alvo.starts_with(prefixo))
+    })
+}
+
 /// Escrita direta em dispositivo via `dd` (`of=/dev/…`): o token é
 /// `of=/dev/sda`, não `/dev/sda`, e escapava do filtro de caminhos.
 fn escrita_em_dispositivo(cmd: &str) -> bool {
-    cmd.to_lowercase().contains("of=/dev/")
+    for parte in subcomandos(&sem_aspas(cmd)) {
+        let (efetivo, _) = comando_efetivo(&parte);
+        let alvo = if efetivo.is_empty() {
+            parte.as_str()
+        } else {
+            efetivo.as_str()
+        };
+        let mut palavras = alvo.split_whitespace();
+        let programa = palavras.next().unwrap_or("");
+        let programa = programa.rsplit('/').next().unwrap_or(programa);
+        if programa == "dd" && palavras.any(|t| t.to_lowercase().starts_with("of=/dev/")) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Interpretadores que executam código em linha ou conteúdo baixado da rede.
@@ -633,6 +1037,10 @@ fn alvos_vitais_de_rm(cmd: &str, ctx: &AnalysisContext) -> Vec<PathBuf> {
         }
         let alvo: Option<PathBuf> = if t == "~" || t == "$HOME" || t == "${HOME}" {
             home.clone()
+        } else if t == "~root" {
+            Some(PathBuf::from("/root"))
+        } else if let Some(resto) = t.strip_prefix("~root/") {
+            Some(PathBuf::from("/root").join(resto))
         } else if let Some(resto) = t.strip_prefix("~/") {
             home.as_ref().map(|h| h.join(resto))
         } else if let Some(resto) = t
@@ -656,6 +1064,13 @@ fn alvos_vitais_de_rm(cmd: &str, ctx: &AnalysisContext) -> Vec<PathBuf> {
             norm = pai.to_path_buf();
         }
         let vital = norm == std::path::Path::new("/")
+            || DIRETORIOS_VITAIS.iter().any(|d| {
+                let d = std::path::Path::new(d);
+                // A raiz já foi tratada como igualdade: usá-la como prefixo
+                // tornaria todo caminho absoluto "vital".
+                d != std::path::Path::new("/")
+                    && (norm == d || norm.starts_with(d) || d.starts_with(&norm))
+            })
             || DIRETORIOS_SISTEMA.iter().any(|d| norm.starts_with(d))
             || ctx.roots.iter().any(|r| r.starts_with(&norm))
             || home.as_ref().map(|h| h.starts_with(&norm)).unwrap_or(false);
@@ -670,10 +1085,14 @@ fn alvos_vitais_de_rm(cmd: &str, ctx: &AnalysisContext) -> Vec<PathBuf> {
 /// padrões catastróficos, remoção da raiz e escrita em dispositivo.
 fn barreiras_absolutas(cmd: &str) -> Option<Analysis> {
     let limpo = sem_aspas(cmd);
-    if let Some((padrao, motivo)) = PADROES_PROIBIDOS.iter().find(|(p, _)| {
-        let p = p.to_lowercase();
-        cmd.to_lowercase().contains(&p) || limpo.to_lowercase().contains(&p)
-    }) {
+    if limpo.replace(char::is_whitespace, "").contains(":(){") {
+        return Some(Analysis::new(
+            Decision::Bloquear,
+            CommandCategory::Proibida,
+            "padrão catastrófico detectado (`:(){`): fork bomb",
+        ));
+    }
+    if let Some((padrao, motivo)) = comando_catastrofico(&limpo) {
         return Some(Analysis::new(
             Decision::Bloquear,
             CommandCategory::Proibida,
@@ -687,11 +1106,18 @@ fn barreiras_absolutas(cmd: &str) -> Option<Analysis> {
             "remoção da raiz do sistema",
         ));
     }
-    if escrita_em_dispositivo(&limpo) {
+    if escrita_em_dispositivo(&limpo) || redireciona_para_dispositivo(cmd) {
         return Some(Analysis::new(
             Decision::Bloquear,
             CommandCategory::Proibida,
-            "escrita direta em dispositivo de bloco (`dd of=/dev/…`)",
+            "escrita direta em dispositivo de bloco",
+        ));
+    }
+    if permissao_na_raiz(&limpo) {
+        return Some(Analysis::new(
+            Decision::Bloquear,
+            CommandCategory::Proibida,
+            "liberação de permissões na raiz do sistema",
         ));
     }
     None
@@ -739,8 +1165,17 @@ fn classificar_comandos(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -
         );
     }
 
-    // Cada subcomando é classificado sozinho; a análise mais severa vence.
+    // Substituições de comando executam antes do comando externo: analisá-las
+    // é obrigatório para que `echo $(rm -rf ~)` não seja liberado como leitura.
     let mut resultado: Option<Analysis> = None;
+    if profundidade < 4 {
+        for interno in substituicoes(cmd) {
+            let analise = classificar_comandos(&interno, ctx, profundidade + 1);
+            resultado = fundir(resultado, analise);
+        }
+    }
+
+    // Cada subcomando é classificado sozinho; a análise mais severa vence.
     for parte in subcomandos(cmd) {
         let analise = classificar_parte(&parte, ctx, profundidade);
         resultado = fundir(resultado, analise);
@@ -764,6 +1199,35 @@ fn classificar_parte(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -> A
             "comando vazio",
         );
     }
+
+    // Embrulhos (`sudo`, `env`, `timeout`, `xargs`…) escondiam o comando real:
+    // `env rm -rf ~` era classificado pela palavra `env`. A análise passa a
+    // enxergar o comando interno; a elevação de privilégios, quando existe,
+    // continua exigindo confirmação.
+    let (efetivo, wrappers) = comando_efetivo(cmd);
+    let elevacao = wrappers
+        .iter()
+        .any(|w| matches!(w.as_str(), "sudo" | "doas" | "su"));
+    if elevacao && !efetivo.is_empty() && efetivo != cmd && profundidade < 4 {
+        let interno = classificar_comandos(&efetivo, ctx, profundidade + 1);
+        let privilegio = Analysis::new(
+            Decision::Confirmar,
+            CommandCategory::Sensivel,
+            "execução com privilégios elevados",
+        );
+        return fundir(Some(privilegio), interno).unwrap_or_else(|| {
+            Analysis::new(
+                Decision::Confirmar,
+                CommandCategory::Sensivel,
+                "execução com privilégios elevados",
+            )
+        });
+    }
+    let cmd = if efetivo.is_empty() {
+        cmd
+    } else {
+        efetivo.as_str()
+    };
     let programa = primeira_palavra(cmd);
     let leitura_cmd = combina_leitura(cmd);
 
@@ -1879,6 +2343,105 @@ mod tests {
         assert_eq!(tool_risk("update_plan"), ToolRisk::Interna);
         assert_eq!(
             check_tool("update_plan", PermissionLevel::Read, "").decision,
+            Decision::Permitir
+        );
+    }
+
+    /// Embrulhos (`env`, `command`, `nohup`, `timeout`, `xargs`…) escondiam o
+    /// `rm` da checagem de alvos vitais.
+    #[test]
+    fn embrulhos_nao_escondem_rm_de_caminho_vital() {
+        for cmd in [
+            "env rm -rf ~",
+            "command rm -rf ~",
+            "nohup rm -rf ~",
+            "timeout 5 rm -rf ~",
+            "nice -n 10 rm -rf ~",
+            "xargs rm -rf ~",
+            "(rm -rf ~)",
+            "sudo rm -rf ~",
+            "doas rm -rf ~",
+            "su -c 'rm -rf ~'",
+            "bash -c 'rm -rf ~'",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+            assert_eq!(a.decision, Decision::Bloquear, "{cmd}");
+        }
+    }
+
+    /// Substituições de comando executam de verdade e não podem ser ignoradas
+    /// só porque o comando externo é `echo`/`cat`.
+    #[test]
+    fn substituicao_de_comando_nao_esconde_destrutivo() {
+        for cmd in [
+            "echo $(rm -rf ~)",
+            "echo `rm -rf ~`",
+            "echo \"$(rm -rf /etc/hosts)\"",
+            "cat <(rm -rf ~)",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+            assert_eq!(a.decision, Decision::Bloquear, "{cmd}");
+        }
+        // Substituição inofensiva continua sendo leitura.
+        let a = analyze_command("echo $(date)", &ctx(PermissionLevel::Full));
+        assert_eq!(a.decision, Decision::Permitir, "{}", a.reason);
+    }
+
+    /// A checagem por palavra não confunde texto com comando: antes
+    /// `echo "shutdown"` era bloqueado como desligamento do sistema.
+    #[test]
+    fn texto_nao_e_confundido_com_comando_catastrofico() {
+        for cmd in [
+            "echo \"shutdown\"",
+            "echo reboot",
+            "echo mkfs",
+            "printf 'poweroff\\n'",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.decision, Decision::Permitir, "{cmd}: {}", a.reason);
+        }
+        for cmd in [
+            "halt",
+            "systemctl poweroff",
+            "systemctl reboot",
+            "init 0",
+            "sudo halt",
+            "/sbin/shutdown -h now",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.decision, Decision::Bloquear, "{cmd}");
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}");
+        }
+    }
+
+    /// Diretórios vitais que escapavam da lista (`/root`, `/var`, `/usr`,
+    /// `~root`) nunca são removidos.
+    #[test]
+    fn rm_de_diretorio_vital_e_proibido() {
+        for cmd in [
+            "rm -rf /root",
+            "rm -rf /var",
+            "rm -rf /usr",
+            "rm -rf /usr/local",
+            "rm -rf /var/tmp/qualquer",
+            "rm -rf ~root",
+            "rm -rf ~root/.config",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+            assert_eq!(a.decision, Decision::Bloquear, "{cmd}");
+        }
+    }
+
+    /// `2>&1` é redirecionamento, não separador de subcomandos.
+    #[test]
+    fn redirecionamento_de_fluxo_nao_vira_subcomando() {
+        let a = analyze_command("cargo test 2>&1", &ctx(PermissionLevel::Semi));
+        assert_eq!(a.category, CommandCategory::Build, "{}", a.reason);
+        assert_eq!(
+            apply_level(a, PermissionLevel::Semi).decision,
             Decision::Permitir
         );
     }

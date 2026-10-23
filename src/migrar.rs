@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Versão atual do esquema. Suba sempre que uma migração for acrescentada.
-pub const VERSAO_ATUAL: i64 = 3;
+pub const VERSAO_ATUAL: i64 = 4;
 
 /// Migrações; o índice 0 corresponde à versão 1.
 const MIGRACOES: &[(i64, &str)] = &[
@@ -30,6 +30,33 @@ const MIGRACOES: &[(i64, &str)] = &[
             created_at  TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_usage_session ON usage(session_id, id);",
+    ),
+    // 3 → 4: a chave primária de `tasks` era só `id`, então o `t1` de uma
+    // sessão sobrescrevia o `t1` de outra. Reconstrói a tabela com chave
+    // composta (id, session_id).
+    (
+        4,
+        "CREATE TABLE tasks_novo (
+            id          TEXT NOT NULL,
+            session_id  TEXT NOT NULL,
+            parent_id   TEXT,
+            title       TEXT NOT NULL,
+            description TEXT,
+            status      TEXT NOT NULL,
+            depends_on  TEXT,
+            order_idx   INTEGER NOT NULL DEFAULT 0,
+            result      TEXT,
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (id, session_id)
+        );
+        INSERT INTO tasks_novo
+            (id, session_id, parent_id, title, description, status, depends_on, order_idx, result, created_at, updated_at)
+            SELECT id, session_id, parent_id, title, description, status, depends_on, order_idx, result, created_at, updated_at
+            FROM tasks;
+        DROP TABLE tasks;
+        ALTER TABLE tasks_novo RENAME TO tasks;
+        CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id, order_idx);",
     ),
 ];
 

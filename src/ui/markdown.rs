@@ -37,6 +37,11 @@ struct Renderizador {
     ultima_vazia: bool,
     tabela: Option<Tabela>,
     link_pendente: Option<String>,
+    /// O item de lista atual ainda não teve o marcador emitido. A emissão é
+    /// preguiçosa (no primeiro conteúdo da linha) porque listas justas não
+    /// emitem `Paragraph`: prefixar no `Item` e de novo no `Paragraph`
+    /// duplicava `• • item` nas listas soltas.
+    prefixo_item_pendente: bool,
 }
 
 #[derive(Default)]
@@ -59,6 +64,7 @@ impl Renderizador {
             ultima_vazia: true,
             tabela: None,
             link_pendente: None,
+            prefixo_item_pendente: false,
         }
     }
 
@@ -73,27 +79,34 @@ impl Renderizador {
         }
     }
 
-    /// Prefixos de citação e lista para o começo de uma linha.
-    fn prefixos(&mut self) {
+    /// Emite os prefixos de citação/lista no começo da linha atual, uma única
+    /// vez. Chamado quando o primeiro conteúdo da linha chega.
+    fn garantir_prefixo(&mut self) {
+        if !self.atual.is_empty() {
+            return;
+        }
         if self.citacao > 0 {
             for _ in 0..self.citacao {
                 self.atual.push(Span::styled("▏ ", theme::apagado()));
             }
         }
-        let profundidade = self.listas.len().saturating_sub(1);
-        if let Some(lista) = self.listas.last_mut() {
+        if self.prefixo_item_pendente {
+            let profundidade = self.listas.len().saturating_sub(1);
             if profundidade > 0 {
                 self.atual.push(Span::raw("  ".repeat(profundidade)));
             }
-            let marcador = match lista.ordenada {
-                Some(_) => {
-                    let numero = lista.proximo;
-                    lista.proximo += 1;
-                    format!("{numero}. ")
-                }
-                None => "• ".to_string(),
-            };
-            self.atual.push(Span::styled(marcador, theme::rotulo()));
+            if let Some(lista) = self.listas.last_mut() {
+                let marcador = match lista.ordenada {
+                    Some(_) => {
+                        let numero = lista.proximo;
+                        lista.proximo += 1;
+                        format!("{numero}. ")
+                    }
+                    None => "• ".to_string(),
+                };
+                self.atual.push(Span::styled(marcador, theme::rotulo()));
+            }
+            self.prefixo_item_pendente = false;
         }
     }
 
@@ -158,6 +171,7 @@ impl Renderizador {
         if texto.is_empty() {
             return;
         }
+        self.garantir_prefixo();
         let estilo = self.estilo_span();
         self.atual.push(Span::styled(texto.to_string(), estilo));
         self.ultima_vazia = false;
@@ -171,6 +185,7 @@ impl Renderizador {
                 self.fechar_linha();
             }
             if !pedaco.is_empty() {
+                self.garantir_prefixo();
                 self.atual.push(Span::styled(
                     pedaco.to_string(),
                     Style::default()
@@ -222,6 +237,7 @@ impl Renderizador {
                 self.ultima_vazia = false;
             }
             Event::TaskListMarker(marcado) => {
+                self.garantir_prefixo();
                 self.atual.push(Span::styled(
                     if marcado { "[x] " } else { "[ ] " },
                     theme::rotulo(),
@@ -252,7 +268,7 @@ impl Renderizador {
         match tag {
             Tag::Paragraph => {
                 self.separacao();
-                self.prefixos();
+                self.garantir_prefixo();
             }
             Tag::Heading { level, .. } => {
                 self.separacao();
@@ -279,12 +295,12 @@ impl Renderizador {
                 });
             }
             Tag::Item => {
-                if self.citacao > 0 {
-                    for _ in 0..self.citacao {
-                        self.atual.push(Span::styled("▏ ", theme::apagado()));
-                    }
+                // Um item sempre começa em linha nova (inclusive listas
+                // aninhadas); o marcador só entra quando houver conteúdo.
+                if !self.atual.is_empty() {
+                    self.fechar_linha();
                 }
-                self.prefixos();
+                self.prefixo_item_pendente = true;
             }
             Tag::Emphasis => self.estilo.enfase = true,
             Tag::Strong => self.estilo.forte = true,
@@ -345,6 +361,7 @@ impl Renderizador {
                 }
             }
             TagEnd::Item => {
+                self.prefixo_item_pendente = false;
                 self.fechar_linha();
             }
             TagEnd::Emphasis => self.estilo.enfase = false,
@@ -501,6 +518,27 @@ mod tests {
         assert!(texto.contains("▏ citado"));
         assert!(texto.contains("1. um"));
         assert!(texto.contains("2. dois"));
+    }
+
+    #[test]
+    fn lista_dentro_de_citacao_nao_duplica_prefixo() {
+        let texto = texto_de(&renderizar("> - item"));
+        assert_eq!(texto, "▏ • item");
+    }
+
+    #[test]
+    fn lista_solta_nao_duplica_marcador() {
+        let texto = texto_de(&renderizar("- primeiro\n\n- segundo"));
+        let linhas: Vec<&str> = texto.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(linhas, vec!["• primeiro", "• segundo"]);
+    }
+
+    #[test]
+    fn lista_aninhada_comeca_em_linha_nova() {
+        let texto = texto_de(&renderizar("- pai\n  - filho"));
+        let linhas: Vec<&str> = texto.lines().collect();
+        assert!(linhas.contains(&"• pai"), "{texto:?}");
+        assert!(linhas.contains(&"  • filho"), "{texto:?}");
     }
 
     #[test]

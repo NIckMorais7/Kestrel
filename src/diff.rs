@@ -19,6 +19,12 @@ pub struct Diff {
 /// comparação por conjuntos, que continua contando linhas reais.
 const LIMITE_EXATO: usize = 4000;
 
+/// Linha de metadados do diff: `str::lines()` perde a informação de nova linha
+/// final, e sem ela o `/undo` não consegue restaurar exatamente o arquivo.
+/// O prefixo `\` nunca aparece num diff normal (`+`, `-` ou espaço), então
+/// diffs antigos continuam válidos.
+const MARCA_NOVA_LINHA: &str = "\\ kestrel-nova-linha-final";
+
 /// Calcula o diff entre dois textos.
 pub fn diff(old: &str, new: &str) -> Diff {
     let a: Vec<&str> = if old.is_empty() {
@@ -78,6 +84,16 @@ pub fn diff(old: &str, new: &str) -> Diff {
         linhas.push(format!("+{}", b[j]));
         additions += 1;
         j += 1;
+    }
+
+    // Só registra quando as pontas diferem: assim o caso comum (ambas com
+    // nova linha final) não ganha ruído no `/diff`.
+    if old.ends_with('\n') != new.ends_with('\n') {
+        linhas.push(format!(
+            "{MARCA_NOVA_LINHA} antes={} depois={}",
+            u8::from(old.ends_with('\n')),
+            u8::from(new.ends_with('\n'))
+        ));
     }
 
     Diff {
@@ -192,12 +208,39 @@ pub fn reverter(diff_texto: &str, atual: &str) -> Option<String> {
         }
     }
     // Linhas acrescentadas depois do diff (por outra edição) são preservadas.
-    if atuais.len() > esperado.len() {
+    let acrescentadas = atuais.len() > esperado.len();
+    if acrescentadas {
         saida.extend_from_slice(&atuais[esperado.len()..]);
     }
+    // O estado da nova linha final vem do diff (as duas pontas); diffs antigos
+    // não têm a marca, então usamos o arquivo atual como referência. Quando
+    // houve linhas acrescentadas depois, o fim real é o do arquivo atual.
+    let termina_com_nova_linha = if acrescentadas {
+        atual.ends_with('\n')
+    } else {
+        nova_linha_original(diff_texto).unwrap_or_else(|| atual.ends_with('\n'))
+    };
     let mut texto = saida.join("\n");
-    texto.push('\n');
+    // `saida` vazio significa arquivo original vazio: não inventa um "\n".
+    if termina_com_nova_linha && !saida.is_empty() {
+        texto.push('\n');
+    }
     Some(texto)
+}
+
+/// Lê `antes=0/1` da marca de nova linha final, quando presente.
+fn nova_linha_original(diff_texto: &str) -> Option<bool> {
+    let resto = diff_texto
+        .lines()
+        .find_map(|l| l.strip_prefix(MARCA_NOVA_LINHA))?;
+    match resto
+        .split_whitespace()
+        .find_map(|p| p.strip_prefix("antes="))
+    {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
 }
 
 /// O diff do Kestrel é linha a linha, então reverter é mecânico. Sem isso o
@@ -257,6 +300,35 @@ fn reverter_remocao_de_linhas() {
     let d = diff(antes, depois);
     let recuperado = reverter(&d.text, depois).expect("remocao deveria reverter");
     assert_eq!(recuperado, antes);
+}
+
+/// Arquivo sem nova linha final precisa voltar sem nova linha final (antes o
+/// `/undo` sempre acrescentava `\n`).
+#[test]
+fn reverter_preserva_ausencia_de_nova_linha_final() {
+    let antes = "a\nb";
+    let depois = "a\nB";
+    let d = diff(antes, depois);
+    assert_eq!(reverter(&d.text, depois).as_deref(), Some(antes));
+}
+
+/// A edição pode só acrescentar/remover a nova linha final: o diff não muda
+/// nenhuma linha, mas o `/undo` ainda precisa restaurar o byte exato.
+#[test]
+fn reverter_restaura_estado_da_nova_linha_final() {
+    let sem = "a\nb";
+    let com = "a\nb\n";
+    let d = diff(sem, com);
+    assert_eq!(reverter(&d.text, com).as_deref(), Some(sem));
+    let d = diff(com, sem);
+    assert_eq!(reverter(&d.text, sem).as_deref(), Some(com));
+}
+
+/// Reverter para um arquivo vazio não pode deixar um `\n` solto.
+#[test]
+fn reverter_para_arquivo_vazio() {
+    let d = diff("", "novo\n");
+    assert_eq!(reverter(&d.text, "novo\n").as_deref(), Some(""));
 }
 
 /// Crescer o arquivo depois do fato não deve impedir o reverso.

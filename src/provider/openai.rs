@@ -19,13 +19,39 @@ use tokio_util::sync::CancellationToken;
 /// resposta malformada (ou hostil) e não deve virar alocação sem limite.
 const MAX_CHAMADAS_PARCIALS: usize = 64;
 
+/// Teto de uma linha SSE ainda não terminada. Um servidor que nunca envia
+/// `\n` não pode fazer o buffer crescer até acabar a memória.
+const MAX_LINHA_SSE: usize = 8 * 1024 * 1024;
+
 /// Teto para o `Retry-After` do provedor. Um valor absurdo (horas/dias) não
 /// pode deixar o agente dormindo: acima disso, vale este limite.
 const RETRY_AFTER_MAX_SECS: u64 = 60;
 
+/// Teto do corpo de uma resposta não-streaming. Um endpoint corrompido (ou um
+/// `base_url` mal configurado apontando para outro serviço) pode devolver
+/// gigabytes: `resp.text()` alocaria tudo na memória antes de qualquer corte.
+const LIMITE_CORPO_RESPOSTA: usize = 16 * 1024 * 1024;
+
 /// Espera pedida pelo provedor, limitada ao teto.
 fn espera_retry_after(segundos: u64) -> Duration {
     Duration::from_secs(segundos.min(RETRY_AFTER_MAX_SECS))
+}
+
+/// Lê o corpo da resposta com teto de bytes e devolve como texto.
+async fn texto_com_limite(resp: reqwest::Response, limite: usize) -> Result<String, ProviderError> {
+    let mut stream = resp.bytes_stream();
+    let mut dados: Vec<u8> = Vec::new();
+    while let Some(pedaco) = stream.next().await {
+        let pedaco = pedaco.map_err(|e| ProviderError::Rede(e.to_string()))?;
+        if dados.len().saturating_add(pedaco.len()) > limite {
+            return Err(ProviderError::RespostaInvalida(format!(
+                "resposta do provedor maior que o limite de {limite} bytes"
+            )));
+        }
+        dados.extend_from_slice(&pedaco);
+    }
+    String::from_utf8(dados)
+        .map_err(|_| ProviderError::RespostaInvalida("resposta do provedor não é UTF-8".into()))
 }
 
 /// Cliente compatível com OpenAI.
@@ -157,7 +183,9 @@ impl OpenAiCompatProvider {
                         .get("retry-after")
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u64>().ok());
-                    let texto = resp.text().await.unwrap_or_default();
+                    let texto = texto_com_limite(resp, LIMITE_CORPO_RESPOSTA)
+                        .await
+                        .unwrap_or_default();
                     let erro = classificar_status(status.as_u16(), &texto, retry_after);
                     if erro.transitorio() && tentativa < self.max_retries {
                         tentativa += 1;
@@ -196,7 +224,7 @@ impl OpenAiCompatProvider {
         let resp = self.enviar_com_retentativas(&body, cancel).await?;
         let texto = tokio::select! {
             _ = cancel.cancelled() => return Err(ProviderError::Cancelado),
-            r = resp.text() => r.map_err(|e| ProviderError::Rede(e.to_string()))?,
+            r = texto_com_limite(resp, LIMITE_CORPO_RESPOSTA) => r?,
         };
         let valor: Value = serde_json::from_str(&texto)
             .map_err(|e| ProviderError::RespostaInvalida(format!("JSON inválido: {e}")))?;
@@ -227,7 +255,7 @@ impl OpenAiCompatProvider {
         if let Some(calls) = mensagem.get("tool_calls").and_then(|c| c.as_array()) {
             for c in calls {
                 if let Some(tc) = parse_tool_call(c) {
-                    tool_calls.push(tc);
+                    push_tool_call(&mut tool_calls, tc);
                 }
             }
         }
@@ -258,7 +286,10 @@ impl OpenAiCompatProvider {
         body["stream_options"] = json!({"include_usage": true});
         let resp = self.enviar_com_retentativas(&body, cancel).await?;
         let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+        // Bytes, não `String`: um caractere UTF-8 multibyte pode ser dividido
+        // entre dois chunks da rede. Converter cada chunk isoladamente com
+        // `from_utf8_lossy` trocava as partes por U+FFFD e corrompia o texto.
+        let mut buffer: Vec<u8> = Vec::new();
         let mut completion = Completion {
             finish_reason: String::new(),
             ..Default::default()
@@ -273,12 +304,14 @@ impl OpenAiCompatProvider {
             };
             let Some(chunk) = chunk else { break };
             let bytes = chunk.map_err(|e| ProviderError::Rede(e.to_string()))?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            buffer.extend_from_slice(&bytes);
 
-            while let Some(pos) = buffer.find('\n') {
-                let linha = buffer[..pos].trim_end_matches('\r').to_string();
+            while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+                // A linha inteira já chegou: a conversão respeita caracteres
+                // multibyte que ficaram divididos entre chunks.
+                let linha = String::from_utf8_lossy(&buffer[..pos]).into_owned();
                 buffer.drain(..=pos);
-                let Some(dados) = linha.strip_prefix("data:") else {
+                let Some(dados) = linha.trim_end_matches('\r').strip_prefix("data:") else {
                     continue;
                 };
                 let dados = dados.trim();
@@ -391,25 +424,29 @@ impl OpenAiCompatProvider {
                     }
                 }
             }
+            if buffer.len() > MAX_LINHA_SSE {
+                return Err(ProviderError::RespostaInvalida(format!(
+                    "linha SSE maior que o limite de {MAX_LINHA_SSE} bytes"
+                )));
+            }
         }
 
         for (id, nome, args) in parciais {
             if nome.is_empty() {
                 continue;
             }
-            completion.tool_calls.push(ToolCall {
-                id: if id.is_empty() {
-                    format!("call_{}", completion.tool_calls.len())
-                } else {
-                    id
+            push_tool_call(
+                &mut completion.tool_calls,
+                ToolCall {
+                    id,
+                    name: nome,
+                    arguments: if args.trim().is_empty() {
+                        "{}".to_string()
+                    } else {
+                        args
+                    },
                 },
-                name: nome,
-                arguments: if args.trim().is_empty() {
-                    "{}".to_string()
-                } else {
-                    args
-                },
-            });
+            );
         }
         // Um stream que fecha sem `[DONE]` **nem** `finish_reason` foi cortado
         // no meio (queda de rede/proxy): devolver como sucesso entregava uma
@@ -476,18 +513,49 @@ fn argumentos_de_chamada(func: &Value) -> String {
 fn parse_tool_call(valor: &Value) -> Option<ToolCall> {
     let func = valor.get("function")?;
     Some(ToolCall {
+        // O id pode faltar em respostas não-stream. Fica vazio aqui e recebe
+        // um valor único em `push_tool_call`.
         id: valor
             .get("id")
             .and_then(|i| i.as_str())
-            .unwrap_or("call_0")
+            .unwrap_or_default()
             .to_string(),
         name: func.get("name").and_then(|n| n.as_str())?.to_string(),
         arguments: argumentos_de_chamada(func),
     })
 }
 
+/// Acrescenta uma chamada garantindo `id` não vazio e único no lote.
+///
+/// Provedores compatíveis às vezes omitem `id`. Antes, todas as chamadas sem
+/// id viravam `call_0`; no turno seguinte, os resultados de ferramenta iam com
+/// `tool_call_id` duplicado e a API rejeitava o histórico.
+fn push_tool_call(destino: &mut Vec<ToolCall>, mut chamada: ToolCall) {
+    if chamada.id.trim().is_empty() {
+        chamada.id = format!("call_{}", destino.len());
+    }
+    if destino.iter().any(|c| c.id == chamada.id) {
+        let base = chamada.id.clone();
+        let mut n = 1usize;
+        loop {
+            let candidato = format!("{base}_{n}");
+            if !destino.iter().any(|c| c.id == candidato) {
+                chamada.id = candidato;
+                break;
+            }
+            n += 1;
+        }
+    }
+    destino.push(chamada);
+}
+
 fn parse_usage(valor: Option<&Value>) -> Option<Usage> {
     let v = valor?;
+    // Chunks intermediários do stream trazem `"usage": null`: não é informação
+    // e devolver zeros aqui sobrescreveria o consumo real do último chunk.
+    if v.is_null() {
+        return None;
+    }
     // Provedores compatíveis informam o raciocínio em `completion_tokens_details`.
     let detalhes = v.get("completion_tokens_details");
     let raciocinio = detalhes
@@ -597,7 +665,9 @@ impl Provider for OpenAiCompatProvider {
             })?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let corpo = resp.text().await.unwrap_or_default();
+            let corpo = texto_com_limite(resp, LIMITE_CORPO_RESPOSTA)
+                .await
+                .unwrap_or_default();
             return Err(classificar_status(status, &corpo, None));
         }
         let valor: Value = resp
@@ -798,6 +868,144 @@ mod tests {
             }
         }
         assert_eq!(conteudos, vec!["oi ", "mundo"]);
+    }
+
+    #[test]
+    fn tool_calls_sem_id_recebem_ids_unicos() {
+        // Antes, duas chamadas sem `id` viravam `call_0`; o histórico do turno
+        // seguinte levava `tool_call_id` duplicado e o provedor recusava.
+        let sem_id = json!({"function": {"name": "read_file", "arguments": "{}"}});
+        let mut chamadas = Vec::new();
+        for _ in 0..2 {
+            push_tool_call(
+                &mut chamadas,
+                parse_tool_call(&sem_id).expect("chamada válida"),
+            );
+        }
+        assert_eq!(chamadas[0].id, "call_0");
+        assert_eq!(chamadas[1].id, "call_1");
+
+        // Mesmo com id explícito repetido, o lote fica único.
+        let mut chamadas = Vec::new();
+        for _ in 0..2 {
+            push_tool_call(
+                &mut chamadas,
+                ToolCall {
+                    id: "call_0".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+            );
+        }
+        assert_ne!(chamadas[0].id, chamadas[1].id);
+    }
+
+    #[tokio::test]
+    async fn stream_preserva_utf8_dividido_entre_chunks() {
+        // Cada byte chega num chunk separado: um caractere multibyte é
+        // dividido ao meio e não pode virar U+FFFD.
+        let corpo = "data: {\"choices\":[{\"delta\":{\"content\":\"café ✓ 日本語\"}}]}\n\n\
+                     data: [DONE]\n\n";
+        let (base, _reqs) = servir_sse(corpo.to_string(), 1, 0).await;
+        let p = cliente(&base);
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect("UTF-8 fragmentado deveria ser remontado");
+        assert_eq!(saida.text, "café ✓ 日本語");
+    }
+
+    #[test]
+    fn usage_nulo_do_stream_nao_zera_o_consumo_real() {
+        // Chunks intermediários vêm com `"usage": null`; o último traz os
+        // números. `parse_usage` tem de ignorar o nulo em vez de devolver zeros.
+        assert!(parse_usage(Some(&json!(null))).is_none());
+        assert!(
+            parse_usage(Some(&json!({
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+            })))
+            .is_some_and(|u| u.prompt_tokens == 7 && u.completion_tokens == 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn texto_com_limite_recusa_corpo_gigante() {
+        // `resp.text()` alocaria o corpo inteiro: um endpoint corrompido com
+        // gigabytes derrubaria o Kestrel por memória.
+        let ouvinte = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta efemera");
+        let endereco = ouvinte.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut soquete, _)) = ouvinte.accept().await {
+                tokio::spawn(async move {
+                    let mut lido = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !lido.windows(4).any(|j| j == b"\r\n\r\n") {
+                        match soquete.read(&mut buf).await {
+                            Ok(0) => return,
+                            Ok(n) => lido.extend_from_slice(&buf[..n]),
+                            Err(_) => return,
+                        }
+                    }
+                    let _ = soquete
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 4096\r\n\r\n",
+                        )
+                        .await;
+                    let bloco = vec![b'a'; 2048];
+                    for _ in 0..2 {
+                        if soquete.write_all(&bloco).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = soquete.flush().await;
+                });
+            }
+        });
+        let cliente = reqwest::Client::new();
+        let resp = cliente
+            .get(format!("http://{endereco}/v1/models"))
+            .send()
+            .await
+            .expect("resposta");
+        let erro = texto_com_limite(resp, 1024)
+            .await
+            .expect_err("corpo acima do teto deveria ser recusado");
+        assert!(erro.to_string().contains("limite"), "{erro}");
+        // Com teto folgado, o mesmo corpo passa.
+        let resp = cliente
+            .get(format!("http://{endereco}/v1/models"))
+            .send()
+            .await
+            .expect("resposta");
+        let texto = texto_com_limite(resp, 8192).await.expect("corpo lido");
+        assert_eq!(texto.len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn linha_sse_gigante_e_rejeitada() {
+        // Sem teto, uma linha sem `\n` cresceria até consumir a memória.
+        let mut corpo = String::from("data: ");
+        corpo.push_str(&"a".repeat(MAX_LINHA_SSE + 1));
+        // Sem newline: o buffer nunca é drenado e o limite precisa parar a
+        // leitura antes do fim da conexão.
+        let (base, _reqs) = servir_sse(corpo, 64 * 1024, 0).await;
+        let p = cliente(&base);
+        let erro = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect_err("linha gigante deveria ser rejeitada");
+        assert!(erro.to_string().contains("limite"), "{erro}");
     }
 
     #[tokio::test]

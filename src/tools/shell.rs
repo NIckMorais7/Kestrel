@@ -12,10 +12,20 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{broadcast, watch};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{broadcast, mpsc, watch};
 
 const MAX_LINHAS_BUFFER: usize = 4000;
+/// Teto de bytes do histórico de saída de um processo. Sem ele, 4000 linhas
+/// de um comando verborrágico podiam ocupar centenas de megabytes.
+const MAX_BYTES_BUFFER: usize = 1_000_000;
+/// Uma linha sem `\n` (barra de progresso, binário) não pode crescer sem
+/// limite: o `BufReader::lines()` antigo alocava até o fim do stream.
+const MAX_BYTES_LINHA: usize = 64 * 1024;
+/// Processos terminados mantidos para consulta. Cada comando em primeiro
+/// plano cria um; sem poda a lista (e a saída guardada) crescia pela sessão
+/// inteira.
+const MAX_PROCESSOS_TERMINAIS: usize = 100;
 
 /// Processo gerenciado pelo Kestrel.
 struct Processo {
@@ -23,7 +33,14 @@ struct Processo {
     comando: String,
     cwd: PathBuf,
     iniciado_em: String,
-    pid: Option<u32>,
+    /// PID do filho. Vira `None` assim que `wait()` colhe o processo: depois
+    /// disso o número pode ser reutilizado pelo sistema e um SIGKILL tardio
+    /// mataria um processo alheio.
+    pid: Mutex<Option<u32>>,
+    /// Identificador da chamada de ferramenta que criou o processo. Permite
+    /// encerrar só os processos daquela chamada quando o tempo limite/cancelamento
+    /// descarta o future da ferramenta.
+    escopo: Option<String>,
     estado: watch::Sender<EstadoProcesso>,
     /// Receptor mantido vivo pelo próprio processo.
     ///
@@ -36,6 +53,7 @@ struct Processo {
     guarda_estado: watch::Receiver<EstadoProcesso>,
     codigo: Mutex<Option<i32>>,
     saida: Mutex<VecDeque<String>>,
+    saida_bytes: AtomicUsize,
     linhas: AtomicUsize,
     stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
     fluxo: broadcast::Sender<String>,
@@ -58,6 +76,87 @@ impl Processo {
     fn terminal(&self) -> bool {
         !matches!(*self.estado.borrow(), EstadoProcesso::Executando)
     }
+}
+
+/// Registra uma linha no histórico do processo, respeitando os tetos de
+/// linhas e de bytes.
+fn emitir_linha(processo: &Processo, bytes: &[u8], prefixo: bool) {
+    let texto = String::from_utf8_lossy(bytes).into_owned();
+    let texto = if prefixo {
+        format!("[stderr] {texto}")
+    } else {
+        texto
+    };
+    {
+        let mut buffer = processo.saida.lock().expect("lock da saída");
+        if buffer.len() >= MAX_LINHAS_BUFFER
+            && let Some(antiga) = buffer.pop_front()
+        {
+            processo
+                .saida_bytes
+                .fetch_sub(antiga.len().saturating_add(1), Ordering::Relaxed);
+        }
+        processo
+            .saida_bytes
+            .fetch_add(texto.len().saturating_add(1), Ordering::Relaxed);
+        buffer.push_back(texto.clone());
+        while processo.saida_bytes.load(Ordering::Relaxed) > MAX_BYTES_BUFFER && buffer.len() > 1 {
+            if let Some(antiga) = buffer.pop_front() {
+                processo
+                    .saida_bytes
+                    .fetch_sub(antiga.len().saturating_add(1), Ordering::Relaxed);
+            }
+        }
+    }
+    processo.linhas.fetch_add(1, Ordering::Relaxed);
+    let _ = processo.fluxo.send(texto);
+}
+
+/// Lê o stream em blocos e separa linhas, com teto por linha.
+///
+/// `BufReader::lines()` não impõe limite: um processo que imprime gigabytes
+/// sem `\n` fazia o Kestrel alocar tudo na memória antes de qualquer corte.
+fn acompanhar<R>(
+    processo: Arc<Processo>,
+    mut stream: R,
+    prefixo: bool,
+    fim: mpsc::UnboundedSender<()>,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut bloco = [0u8; 8192];
+        let mut pendente: Vec<u8> = Vec::new();
+        loop {
+            match stream.read(&mut bloco).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    pendente.extend_from_slice(&bloco[..n]);
+                    while let Some(pos) = pendente.iter().position(|b| *b == b'\n') {
+                        let mut linha: Vec<u8> = pendente.drain(..=pos).collect();
+                        if linha.last() == Some(&b'\n') {
+                            linha.pop();
+                        }
+                        if linha.last() == Some(&b'\r') {
+                            linha.pop();
+                        }
+                        emitir_linha(&processo, &linha, prefixo);
+                    }
+                    // Linha sem quebra maior que o teto: emite em pedaços.
+                    while pendente.len() > MAX_BYTES_LINHA {
+                        let resto = pendente.split_off(MAX_BYTES_LINHA);
+                        let linha = std::mem::replace(&mut pendente, resto);
+                        emitir_linha(&processo, &linha, prefixo);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if !pendente.is_empty() {
+            emitir_linha(&processo, &pendente, prefixo);
+        }
+        let _ = fim.send(());
+    });
 }
 
 /// Gerenciador de processos do Kestrel (persistente entre turnos).
@@ -88,12 +187,28 @@ impl ProcessManager {
         }
     }
 
-    /// Inicia um processo em segundo plano do ponto de vista da TUI.
+    /// Atalho usado pelos testes para iniciar sem escopo explícito.
+    #[cfg(test)]
     pub fn iniciar(
         &self,
         comando: &str,
         cwd: &Path,
         envs: &[(String, String)],
+    ) -> Result<String, ToolError> {
+        self.iniciar_com_escopo(comando, cwd, envs, None)
+    }
+
+    /// Inicia um processo associado à chamada de ferramenta `escopo`.
+    ///
+    /// O escopo permite que a limpeza de uma chamada (timeout/cancelamento)
+    /// encerre somente os processos que ela criou, sem tocar nos processos
+    /// paralelos de outras chamadas.
+    pub fn iniciar_com_escopo(
+        &self,
+        comando: &str,
+        cwd: &Path,
+        envs: &[(String, String)],
+        escopo: Option<&str>,
     ) -> Result<String, ToolError> {
         let id = format!("proc{}", self.contador.fetch_add(1, Ordering::Relaxed));
         let mut cmd = tokio::process::Command::new("sh");
@@ -131,53 +246,54 @@ impl ProcessManager {
             comando: comando.to_string(),
             cwd: cwd.to_path_buf(),
             iniciado_em: crate::util::now_rfc3339(),
-            pid,
+            pid: Mutex::new(pid),
+            escopo: escopo.map(|s| s.to_string()),
             estado: tx_estado,
             guarda_estado: rx_estado,
             codigo: Mutex::new(None),
             saida: Mutex::new(VecDeque::new()),
+            saida_bytes: AtomicUsize::new(0),
             linhas: AtomicUsize::new(0),
             stdin: tokio::sync::Mutex::new(stdin),
             fluxo: tx_fluxo,
             encerramento_solicitado: Mutex::new(None),
         });
 
-        // Tarefas de leitura de saída (stdout e stderr).
-        fn acompanhar<R>(processo: Arc<Processo>, stream: R, prefixo: bool)
-        where
-            R: tokio::io::AsyncRead + Unpin + Send + 'static,
-        {
-            tokio::spawn(async move {
-                let mut leitor = BufReader::new(stream).lines();
-                while let Ok(Some(linha)) = leitor.next_line().await {
-                    let texto = if prefixo {
-                        format!("[stderr] {linha}")
-                    } else {
-                        linha
-                    };
-                    {
-                        let mut buffer = processo.saida.lock().expect("lock da saída");
-                        if buffer.len() >= MAX_LINHAS_BUFFER {
-                            buffer.pop_front();
-                        }
-                        buffer.push_back(texto.clone());
-                    }
-                    processo.linhas.fetch_add(1, Ordering::Relaxed);
-                    let _ = processo.fluxo.send(texto);
-                }
-            });
-        }
+        // Tarefas de leitura de saída (stdout e stderr). Cada uma avisa o
+        // `wait` quando o pipe chega ao fim, para que a saída final seja
+        // capturada antes de o estado virar terminal.
+        let (tx_leitura, mut rx_leitura) = mpsc::unbounded_channel::<()>();
+        let mut leitores = 0;
         if let Some(stream) = stdout {
-            acompanhar(processo.clone(), stream, false);
+            leitores += 1;
+            acompanhar(processo.clone(), stream, false, tx_leitura.clone());
         }
         if let Some(stream) = stderr {
-            acompanhar(processo.clone(), stream, true);
+            leitores += 1;
+            acompanhar(processo.clone(), stream, true, tx_leitura.clone());
         }
+        drop(tx_leitura);
 
         // Tarefa que aguarda o término.
         let processo_espera = processo.clone();
         tokio::spawn(async move {
             let status = child.wait().await;
+            // O filho foi colhido: o PID já pode pertencer a outro processo.
+            // Zerar aqui impede que o SIGKILL atrasado atinja um PID reusado.
+            *processo_espera.pid.lock().expect("lock do pid") = None;
+            // Drena os pipes antes de anunciar o término. Sem isto, o
+            // `executar_comando` lia o snapshot de saída antes de as últimas
+            // linhas chegarem e o resultado perdia o fim da saída.
+            if leitores > 0 {
+                let drenar = async {
+                    for _ in 0..leitores {
+                        if rx_leitura.recv().await.is_none() {
+                            break;
+                        }
+                    }
+                };
+                let _ = tokio::time::timeout(Duration::from_millis(500), drenar).await;
+            }
             let solicitado = *processo_espera
                 .encerramento_solicitado
                 .lock()
@@ -196,10 +312,24 @@ impl ProcessManager {
             let _ = processo_espera.estado.send(estado);
         });
 
-        self.processos
-            .lock()
-            .expect("lock da lista de processos")
-            .push(processo);
+        // Poda processos terminais antigos antes de registrar o novo. Só os
+        // terminais saem: os ativos continuam disponíveis para interação.
+        {
+            let mut lista = self.processos.lock().expect("lock da lista de processos");
+            let terminais = lista.iter().filter(|p| p.terminal()).count();
+            if terminais >= MAX_PROCESSOS_TERMINAIS {
+                let mut remover = terminais - MAX_PROCESSOS_TERMINAIS + 1;
+                lista.retain(|p| {
+                    if remover > 0 && p.terminal() {
+                        remover -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            lista.push(processo);
+        }
         Ok(id)
     }
 
@@ -225,8 +355,8 @@ impl ProcessManager {
         self.buscar(id).map(|p| p.view())
     }
 
-    /// Ids dos processos ainda em execução (fotografia para comparar antes e
-    /// depois de uma chamada de ferramenta).
+    /// Ids dos processos ainda em execução (usado pelos testes de escopo).
+    #[cfg(test)]
     pub fn ids_ativas(&self) -> Vec<String> {
         self.processos
             .lock()
@@ -243,6 +373,23 @@ impl ProcessManager {
         for id in ids {
             self.encerrar(id).ok();
         }
+    }
+
+    /// Encerra os processos ativos criados pela chamada de ferramenta
+    /// `escopo`. Processos de outras chamadas paralelas ficam intactos.
+    pub fn encerrar_do_escopo(&self, escopo: &str) {
+        let ids: Vec<String> = self
+            .processos
+            .lock()
+            .expect("lock da lista")
+            .iter()
+            .filter(|p| {
+                p.escopo.as_deref() == Some(escopo)
+                    && *p.estado.borrow() == EstadoProcesso::Executando
+            })
+            .map(|p| p.id.clone())
+            .collect();
+        self.encerrar_varios(&ids);
     }
 
     pub fn saida(&self, id: &str, ultimas: usize) -> Option<String> {
@@ -290,6 +437,21 @@ impl ProcessManager {
                 Ok(estado) => Ok(estado),
                 Err(_) => {
                     self.encerrar_com_motivo(id, EstadoProcesso::Timeout)?;
+                    // Espera curta para o `wait` colher o filho e drenar a
+                    // saída final. O estado só vira terminal de verdade
+                    // depois disso (antes ele era anunciado cedo demais).
+                    let mut rx = processo.estado.subscribe();
+                    let confirmacao = async {
+                        loop {
+                            if *rx.borrow_and_update() != EstadoProcesso::Executando {
+                                return;
+                            }
+                            if rx.changed().await.is_err() {
+                                return;
+                            }
+                        }
+                    };
+                    let _ = tokio::time::timeout(Duration::from_secs(3), confirmacao).await;
                     Ok(EstadoProcesso::Timeout)
                 }
             },
@@ -318,7 +480,8 @@ impl ProcessManager {
                 *solicitado = Some(motivo);
             }
         }
-        if let Some(pid) = processo.pid {
+        let pid = *processo.pid.lock().expect("lock do pid");
+        if let Some(pid) = pid {
             #[cfg(unix)]
             unsafe {
                 // Sinal para o grupo de processos inteiro.
@@ -331,15 +494,24 @@ impl ProcessManager {
             }
         }
         if !processo.terminal() {
-            // Aguarda um instante e força, se necessário.
-            let _ = processo.estado.send(motivo);
-            if let Some(pid) = processo.pid {
+            // Não marcamos o estado como terminal aqui: ele só muda quando o
+            // `wait` confirma a morte. Anunciar antes fazia `aguardar` voltar
+            // com a saída incompleta e permitia que o SIGKILL atrasado
+            // atingisse um PID já reutilizado.
+            if let Some(pid) = pid {
+                let processo = processo.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(2000));
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
-                        libc::kill(pid as i32, libc::SIGKILL);
+                    // O `wait` zera o PID ao colher o filho; se isso já
+                    // aconteceu (ou o estado mudou), não há o que matar.
+                    let ainda_ativo = *processo.estado.borrow() == EstadoProcesso::Executando
+                        && *processo.pid.lock().expect("lock do pid") == Some(pid);
+                    if ainda_ativo {
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::kill(-(pid as i32), libc::SIGKILL);
+                            libc::kill(pid as i32, libc::SIGKILL);
+                        }
                     }
                 });
             }
@@ -424,18 +596,24 @@ pub async fn executar_comando(
     timeout: Option<Duration>,
 ) -> Result<(EstadoProcesso, Option<i32>, String, Duration), ToolError> {
     let inicio = std::time::Instant::now();
-    let id = ctx.processos.iniciar(comando, cwd, &[])?;
+    let id = ctx
+        .processos
+        .iniciar_com_escopo(comando, cwd, &[], ctx.escopo_processos())?;
     let mut fluxo = ctx.processos.inscrever(&id);
-    let mut saida_em_tempo_real = Vec::new();
+
+    // O future de espera é criado uma única vez: recriá-lo a cada linha de
+    // saída reiniciava o relógio do tempo limite. Um comando que imprime
+    // continuamente (um `tail -f`, um servidor verborrágico) nunca expirava.
+    let aguardar = ctx.processos.aguardar(&id, timeout);
+    tokio::pin!(aguardar);
 
     let resultado = loop {
-        let aguardar = ctx.processos.aguardar(&id, timeout);
         tokio::select! {
             _ = ctx.cancel.cancelled() => {
                 ctx.processos.encerrar(&id).ok();
                 break Err(ToolError::Cancelado);
             }
-            estado = aguardar => {
+            estado = &mut aguardar => {
                 match estado {
                     Ok(e) => break Ok(e),
                     Err(e) => break Err(e),
@@ -448,9 +626,8 @@ pub async fn executar_comando(
                 }
             } => {
                 if let Ok(l) = linha {
-                    saida_em_tempo_real.push(l.clone());
-                    if saida_em_tempo_real.len() > 200 { saida_em_tempo_real.remove(0); }
                     ctx.evento(AgentEvent::FerramentaSaida {
+                        id: ctx.chamada_id.clone(),
                         nome: "run_command".into(),
                         linha: crate::util::truncate(&crate::util::redact_secrets(&l), 300),
                     });
@@ -596,7 +773,9 @@ impl Tool for RunCommand {
             .unwrap_or_default();
 
         if background {
-            let id = ctx.processos.iniciar(&comando, &cwd, &envs)?;
+            let id =
+                ctx.processos
+                    .iniciar_com_escopo(&comando, &cwd, &envs, ctx.escopo_processos())?;
             // Dá um instante para o processo falhar imediatamente (ex.: comando inexistente).
             tokio::time::sleep(Duration::from_millis(400)).await;
             let view = ctx.processos.view(&id);
@@ -604,7 +783,7 @@ impl Tool for RunCommand {
                 .as_ref()
                 .map(|v| v.estado)
                 .unwrap_or(EstadoProcesso::Executando);
-            ctx.evento(AgentEvent::Processos {
+            ctx.evento(AgentEvent::ProcessosAtualizados {
                 lista: ctx.processos.listar(),
             });
             let acrescimo = match estado {
@@ -902,7 +1081,7 @@ impl Tool for ListProcesses {
 
     async fn executar(&self, _args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let lista = ctx.processos.listar();
-        ctx.evento(AgentEvent::Processos {
+        ctx.evento(AgentEvent::ProcessosAtualizados {
             lista: lista.clone(),
         });
         if lista.is_empty() {
@@ -1011,28 +1190,47 @@ impl Tool for ReadProcessOutput {
             .view(&id)
             .ok_or_else(|| ToolError::msg(format!("processo `{id}` não existe")))?
             .linhas;
-        let saida = ctx
-            .processos
-            .saida(&id, if filtro.is_some() { 4000 } else { ultimas })
-            .unwrap_or_default();
-        let saida = match filtro {
-            Some(f) => saida
-                .lines()
-                .filter(|l| l.contains(&f))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            None => saida,
+        let (saida, mostrando, casaram) = match filtro {
+            Some(f) => {
+                // O filtro precisa percorrer o histórico inteiro, mas o
+                // resultado continua limitado por `ultimas_linhas` (antes o
+                // parâmetro era ignorado quando havia filtro).
+                let todas = ctx
+                    .processos
+                    .saida(&id, MAX_LINHAS_BUFFER)
+                    .unwrap_or_default();
+                let mut filtradas: Vec<&str> = todas.lines().filter(|l| l.contains(&f)).collect();
+                let casaram = filtradas.len();
+                if filtradas.len() > ultimas {
+                    filtradas = filtradas[filtradas.len() - ultimas..].to_vec();
+                }
+                (filtradas.join("\n"), filtradas.len(), Some(casaram))
+            }
+            None => (
+                ctx.processos.saida(&id, ultimas).unwrap_or_default(),
+                ultimas,
+                None,
+            ),
         };
         if saida.trim().is_empty() {
+            let detalhe = match casaram {
+                Some(0) => format!("nenhuma das {total} linhas contém o filtro"),
+                _ => format!("{total} linhas no total"),
+            };
             return Ok(ToolOutput::texto(format!(
-                "O processo `{id}` ainda não produziu saída ({total} linhas no total)."
+                "O processo `{id}` ainda não produziu saída ({detalhe})."
             )));
         }
-        Ok(ToolOutput::texto(format!(
-            "Saída do processo `{id}` ({total} linhas no total; mostrando as últimas {}):\n{saida}",
-            ultimas
-        ))
-        .com_resumo(format!("leu saída de {id}")))
+        let cabecalho = match casaram {
+            Some(casaram) => format!(
+                "Saída do processo `{id}` ({total} linhas no total; {casaram} casam com o filtro; mostrando as últimas {mostrando})"
+            ),
+            None => format!(
+                "Saída do processo `{id}` ({total} linhas no total; mostrando as últimas {mostrando})"
+            ),
+        };
+        Ok(ToolOutput::texto(format!("{cabecalho}:\n{saida}"))
+            .com_resumo(format!("leu saída de {id}")))
     }
 }
 
@@ -1070,7 +1268,7 @@ impl Tool for KillProcess {
             .aguardar(&id, Some(Duration::from_secs(5)))
             .await;
         let view = ctx.processos.view(&id);
-        ctx.evento(AgentEvent::Processos {
+        ctx.evento(AgentEvent::ProcessosAtualizados {
             lista: ctx.processos.listar(),
         });
         let estado = view
@@ -1164,6 +1362,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Um comando que não para de imprimir não pode renovar o tempo limite a
+    /// cada linha: o future de espera precisa manter o mesmo prazo do início.
+    #[tokio::test]
+    async fn saida_continua_nao_renova_o_tempo_limite() {
+        let dir = std::env::temp_dir().join(format!("kestrel-chatty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = super::super::git::tests::contexto(&dir);
+        let comando = "while true; do echo tick; sleep 0.02; done";
+        let externo = tokio::time::timeout(
+            Duration::from_secs(5),
+            executar_comando(&ctx, comando, &dir, Some(Duration::from_millis(500))),
+        )
+        .await
+        .expect("o tempo limite interno não foi respeitado")
+        .unwrap();
+        assert_eq!(externo.0, EstadoProcesso::Timeout);
+        assert!(
+            ctx.processos.ids_ativas().is_empty(),
+            "o processo continuou ativo após o tempo limite"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn executa_comando_e_captura_saida() {
         let pm = ProcessManager::new();
@@ -1232,6 +1453,113 @@ mod tests {
         assert_eq!(estado, EstadoProcesso::Concluido);
         let saida = pm.saida(&id, 10).unwrap();
         assert!(saida.contains("recebido:abc"), "saída: {saida}");
+    }
+
+    /// A limpeza de uma chamada (timeout/cancelamento) não pode matar os
+    /// processos iniciados por outra chamada paralela.
+    #[tokio::test]
+    async fn limpeza_por_escopo_preserva_processos_paralelos() {
+        let pm = ProcessManager::new();
+        let a = pm
+            .iniciar_com_escopo("sleep 30", Path::new("/tmp"), &[], Some("escopo-a"))
+            .unwrap();
+        let b = pm
+            .iniciar_com_escopo("sleep 30", Path::new("/tmp"), &[], Some("escopo-b"))
+            .unwrap();
+        pm.encerrar_do_escopo("escopo-a");
+        let estado_a = pm.aguardar(&a, Some(Duration::from_secs(5))).await.unwrap();
+        assert_eq!(estado_a, EstadoProcesso::Cancelado);
+        assert_eq!(
+            pm.view(&b).unwrap().estado,
+            EstadoProcesso::Executando,
+            "o processo de outro escopo foi encerrado junto"
+        );
+        pm.encerrar(&b).unwrap();
+        let _ = pm.aguardar(&b, Some(Duration::from_secs(5))).await;
+    }
+
+    /// Depois que o filho é colhido, o PID não pode continuar guardado: um
+    /// SIGKILL atrasado poderia atingir um processo que reutilizou o número.
+    #[tokio::test]
+    async fn pid_e_limpo_quando_o_processo_termina() {
+        let pm = ProcessManager::new();
+        let id = pm.iniciar("true", Path::new("/tmp"), &[]).unwrap();
+        let estado = pm
+            .aguardar(&id, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert_eq!(estado, EstadoProcesso::Concluido);
+        let processo = pm.buscar(&id).unwrap();
+        assert_eq!(
+            *processo.pid.lock().expect("pid"),
+            None,
+            "o PID continuou registrado após o término"
+        );
+    }
+
+    /// Uma linha sem quebra não pode ser acumulada inteira na memória: ela é
+    /// emitida em pedaços de no máximo `MAX_BYTES_LINHA`.
+    #[tokio::test]
+    async fn linha_sem_quebra_e_fatiada() {
+        let pm = ProcessManager::new();
+        let id = pm
+            .iniciar(
+                "head -c 200000 /dev/zero | tr '\\0' x",
+                Path::new("/tmp"),
+                &[],
+            )
+            .unwrap();
+        let estado = pm
+            .aguardar(&id, Some(Duration::from_secs(10)))
+            .await
+            .unwrap();
+        assert_eq!(estado, EstadoProcesso::Concluido);
+        let processo = pm.buscar(&id).unwrap();
+        assert!(
+            processo.linhas.load(Ordering::Relaxed) >= 3,
+            "a linha gigante não foi fatiada"
+        );
+        let saida = pm.saida(&id, 100).unwrap();
+        for linha in saida.lines() {
+            assert!(
+                linha.len() <= MAX_BYTES_LINHA,
+                "linha com {} bytes excedeu o teto",
+                linha.len()
+            );
+        }
+    }
+
+    /// O filtro de `read_process_output` percorre o histórico inteiro, mas o
+    /// resultado continua limitado por `ultimas_linhas`.
+    #[tokio::test]
+    async fn leitura_com_filtro_respeita_ultimas_linhas() {
+        use crate::tools::shell::ReadProcessOutput;
+        let dir = std::env::temp_dir().join(format!("kestrel-filtro-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = super::super::git::tests::contexto(&dir);
+        let id = ctx
+            .processos
+            .iniciar("printf 'erro 1\\nok\\nerro 2\\nerro 3\\n'", &dir, &[])
+            .unwrap();
+        ctx.processos
+            .aguardar(&id, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        let saida = ReadProcessOutput
+            .executar(
+                serde_json::json!({
+                    "id": id,
+                    "ultimas_linhas": 2,
+                    "filtro": "erro"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(saida.conteudo.contains("erro 2"), "{}", saida.conteudo);
+        assert!(saida.conteudo.contains("erro 3"), "{}", saida.conteudo);
+        assert!(!saida.conteudo.contains("erro 1"), "{}", saida.conteudo);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

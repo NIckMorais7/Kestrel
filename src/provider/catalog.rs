@@ -141,6 +141,15 @@ pub fn merge_discovered(existente: &[ModelEntry], descobertos: Vec<ModelEntry>) 
                 if anterior.supports_reasoning != Capability::Desconhecido {
                     mesclado.supports_reasoning = anterior.supports_reasoning;
                 }
+                // Streaming e visão também são escolhas manuais: sobrescrevê-las
+                // com o padrão da descoberta fazia a configuração do usuário
+                // desaparecer a cada atualização do catálogo.
+                if anterior.supports_streaming != Capability::Desconhecido {
+                    mesclado.supports_streaming = anterior.supports_streaming;
+                }
+                if anterior.supports_vision != Capability::Desconhecido {
+                    mesclado.supports_vision = anterior.supports_vision;
+                }
                 mesclado.display_name = anterior.display_name.clone();
                 if anterior.notes.is_some() {
                     mesclado.notes = anterior.notes.clone();
@@ -240,6 +249,19 @@ mod tests {
         assert_eq!(alvo.display_name.as_deref(), Some("Meu Modelo"));
         assert_eq!(alvo.context_window, Some(200_000));
         assert_eq!(mesclado.len(), 2);
+    }
+
+    #[test]
+    fn mesclagem_preserva_streaming_e_visao_manuais() {
+        let mut manual = ModelEntry::new("x/y");
+        manual.source = ModelSource::Manual;
+        manual.supports_streaming = Capability::Nao;
+        manual.supports_vision = Capability::Sim;
+        let descoberto = vec![ModelEntry::new("x/y")];
+        let mesclado = merge_discovered(&[manual], descoberto);
+        let alvo = mesclado.iter().find(|m| m.id == "x/y").unwrap();
+        assert_eq!(alvo.supports_streaming, Capability::Nao);
+        assert_eq!(alvo.supports_vision, Capability::Sim);
     }
 
     #[test]

@@ -152,14 +152,19 @@ pub enum AgentEvent {
         conteudo: String,
     },
     FerramentaIniciada {
+        /// Identificador único da chamada do modelo (permite casar início e
+        /// fim mesmo com ferramentas de mesmo nome rodando em paralelo).
+        id: Option<String>,
         nome: String,
         detalhe: String,
     },
     FerramentaSaida {
+        id: Option<String>,
         nome: String,
         linha: String,
     },
     FerramentaConcluida {
+        id: Option<String>,
         nome: String,
         sucesso: bool,
         resumo: String,
@@ -215,12 +220,21 @@ pub enum AgentEvent {
     SessaoAtiva {
         id: String,
         titulo: String,
+        /// Diretório do projeto da sessão. Retomar uma sessão de outro
+        /// projeto precisa trocar o diretório de trabalho junto.
+        workdir: String,
     },
     ModeloAtual {
         modelo: String,
         esforco: Option<String>,
     },
     Processos {
+        lista: Vec<ProcessoView>,
+    },
+    /// Atualiza a fotografia dos processos sem abrir o seletor na interface.
+    /// Ferramentas em segundo plano emitem este evento; `Processos` é
+    /// reservado ao comando explícito `/processes`.
+    ProcessosAtualizados {
         lista: Vec<ProcessoView>,
     },
     Encerrado,

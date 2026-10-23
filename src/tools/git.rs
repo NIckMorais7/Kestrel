@@ -366,17 +366,20 @@ impl Tool for GitStage {
                     "informe `caminhos` ou `tudo: true`".into(),
                 ));
             }
-            for c in caminhos {
+            for c in &caminhos {
                 // Confere que o caminho existe para dar erro claro.
-                let resolvido = resolver_caminho(ctx, &c);
+                let resolvido = resolver_caminho(ctx, c);
                 if !resolvido.exists() {
                     return Err(ToolError::msg(format!(
                         "o caminho {c} não existe no projeto"
                     )));
                 }
-                cmd.push("--".into());
-                cmd.push(c);
             }
+            // O `--` separa opções de pathspecs e vai **uma única vez** antes
+            // da lista: repeti-lo entre os caminhos fazia o Git tratar o
+            // segundo `--` como um arquivo literal.
+            cmd.push("--".into());
+            cmd.extend(caminhos);
         }
         let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
         let (ok, saida) = git(ctx, &refs).await?;
@@ -565,9 +568,13 @@ impl Tool for GitBranch {
             }
             "criar" | "trocar" => {
                 let nome = arg_str(&args, "nome")?;
-                if nome.trim().is_empty() || nome.contains(char::is_whitespace) {
+                if nome.trim().is_empty()
+                    || nome.contains(char::is_whitespace)
+                    || nome.starts_with('-')
+                {
                     return Err(ToolError::Argumentos(
-                        "o nome da branch não pode ser vazio nem conter espaços".into(),
+                        "o nome da branch não pode ser vazio, conter espaços nem começar com `-`"
+                            .into(),
                     ));
                 }
                 let sub = "switch";
@@ -658,9 +665,10 @@ pub(crate) mod tests {
             comps_dir: dir.join("comps"),
             projeto: Arc::new(ProjectInfo::default()),
             web: WebConfig::default(),
-            http: reqwest::Client::new(),
             max_saida: 20_000,
             subagente: None,
+            escopo_processos: String::new(),
+            chamada_id: None,
         }
     }
 
@@ -755,6 +763,46 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(saida.conteudo.contains("a.txt"), "{}", saida.conteudo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git add -- a -- b` trata o segundo `--` como pathspec e não prepara
+    /// o segundo arquivo.
+    #[tokio::test]
+    async fn stage_de_varios_caminhos_funciona() {
+        let dir = repo_temporario().await;
+        std::fs::write(dir.join("a.txt"), "1").unwrap();
+        std::fs::write(dir.join("b.txt"), "2").unwrap();
+        let ctx = contexto(&dir);
+        GitStage
+            .executar(json!({"caminhos": ["a.txt", "b.txt"]}), &ctx)
+            .await
+            .unwrap();
+        let saida = tokio::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&dir)
+            .output()
+            .await
+            .unwrap();
+        let nomes = String::from_utf8_lossy(&saida.stdout);
+        assert!(nomes.contains("a.txt"), "{nomes}");
+        assert!(nomes.contains("b.txt"), "{nomes}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nome começando com `-` era interpretado como opção do `git switch`
+    /// (`--detach` desanexava em vez de trocar de branch).
+    #[tokio::test]
+    async fn branch_recusa_nome_que_parece_flag() {
+        let dir = repo_temporario().await;
+        let ctx = contexto(&dir);
+        for nome in ["--detach", "-c", "-"] {
+            let erro = GitBranch
+                .executar(json!({"acao": "trocar", "nome": nome}), &ctx)
+                .await
+                .unwrap_err();
+            assert!(erro.to_string().contains("começar com"), "{nome}: {erro}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -44,11 +44,24 @@ struct Deteccao {
 }
 
 fn ler_limitado(path: &Path, max: usize) -> Option<String> {
-    let texto = std::fs::read_to_string(path).ok()?;
+    use std::io::Read;
+    if max == 0 {
+        return Some(String::new());
+    }
+    // Lê no máximo 4 bytes por caractere desejado (o pior caso do UTF-8).
+    // Antes o arquivo inteiro era carregado só para depois truncar: um README
+    // gigante ou um `package.json` gerado consumia memória sem necessidade.
+    let arquivo = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    arquivo
+        .take(max.saturating_mul(4).saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let texto = String::from_utf8_lossy(&bytes);
     if texto.chars().count() > max {
         Some(crate::util::truncate(&texto, max))
     } else {
-        Some(texto)
+        Some(texto.into_owned())
     }
 }
 
@@ -151,11 +164,14 @@ fn detectar_por_arquivos(root: &Path) -> Deteccao {
         if let Some(texto) = ler_limitado(&root.join("package.json"), 60_000)
             && let Ok(valor) = serde_json::from_str::<serde_json::Value>(&texto)
         {
-            let deps = valor
-                .get("dependencies")
-                .and_then(|d| d.as_object())
-                .map(|o| o.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
+            // Ferramentas de build/teste (vite, jest, vitest, playwright)
+            // costumam viver em `devDependencies`; olhar só `dependencies`
+            // escondia justamente as tecnologias mais relevantes.
+            let deps: Vec<String> = ["dependencies", "devDependencies"]
+                .iter()
+                .filter_map(|chave| valor.get(*chave).and_then(|d| d.as_object()))
+                .flat_map(|o| o.keys().cloned())
+                .collect();
             for marco in [
                 "react",
                 "next",
@@ -393,14 +409,28 @@ mod tests {
         let dir = projeto_temp();
         std::fs::write(
             dir.join("package.json"),
-            r#"{"dependencies":{"react":"18","express":"4"},"scripts":{"test":"jest","build":"vite build"}}"#,
+            r#"{"dependencies":{"react":"18","express":"4"},"devDependencies":{"vite":"5","vitest":"1"},"scripts":{"test":"jest","build":"vite build"}}"#,
         )
         .unwrap();
         let info = analyze(&dir);
         assert!(info.languages.iter().any(|l| l.contains("JavaScript")));
         assert!(info.frameworks.contains(&"react".to_string()));
+        // `vite`/`vitest` só aparecem em devDependencies.
+        assert!(info.frameworks.contains(&"vite".to_string()));
+        assert!(info.frameworks.contains(&"vitest".to_string()));
         assert_eq!(info.test_command.as_deref(), Some("npm test"));
         assert_eq!(info.build_command.as_deref(), Some("npm run build"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leitura_limitada_respeita_caracteres_multibyte() {
+        let dir = projeto_temp();
+        let conteudo = "á".repeat(100);
+        std::fs::write(dir.join("nota.txt"), &conteudo).unwrap();
+        let lido = ler_limitado(&dir.join("nota.txt"), 10).unwrap();
+        assert!(lido.chars().count() <= 10, "veio {lido:?}");
+        assert!(lido.ends_with('…'));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

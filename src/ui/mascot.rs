@@ -1,8 +1,10 @@
 //! Mascote oficial do Kestrel: o Pip.
 //!
 //! O PNG original (`assets/pip.png`) é desenhado de verdade no terminal com
-//! `ratatui-image`: Sixel, Kitty ou iTerm2 quando o terminal oferece um desses
-//! protocolos; halfblocks do próprio `ratatui-image` quando não oferece.
+//! `ratatui-image`, usando o protocolo gráfico do terminal quando disponível
+//! (Sixel/Kitty/iTerm2) e halfblocks apenas como último recurso. O PNG é
+//! redimensionado uma única vez para a resolução de pixels de 6×2 e o quadro é
+//! codificado já nessa resolução, sem segundo resize.
 //!
 //! O espaço é fixo: **6 colunas × 2 linhas**. A animação não muda a altura da
 //! caixa — ela desloca a imagem dentro dela. O PNG é recortado na caixa opaca,
@@ -156,8 +158,12 @@ impl PipGrafico {
         let util_altura = altura.saturating_sub(2 * MARGEM).max(1);
         let escala = (util_largura as f32 / CAIXA_LARGURA as f32)
             .min(util_altura as f32 / CAIXA_ALTURA as f32);
-        let redimensionada_largura = (CAIXA_LARGURA as f32 * escala).round().max(1.0) as u32;
-        let redimensionada_altura = (CAIXA_ALTURA as f32 * escala).round().max(1.0) as u32;
+        let redimensionada_largura = ((CAIXA_LARGURA as f32 * escala).round().max(1.0) as u32)
+            .min(largura)
+            .max(1);
+        let redimensionada_altura = ((CAIXA_ALTURA as f32 * escala).round().max(1.0) as u32)
+            .min(altura)
+            .max(1);
         let redimensionada = imageops::resize(
             &recorte,
             redimensionada_largura,
@@ -167,7 +173,8 @@ impl PipGrafico {
 
         let deslocamento_x = ((largura - redimensionada_largura) / 2) as i64;
         let deslocamento_y = ((altura - redimensionada_altura) / 2) as i64;
-        let mut base = RgbaImage::from_pixel(largura, altura, Rgba([0, 0, 0, 0]));
+        let fundo = cor_de_fundo();
+        let mut base = RgbaImage::from_pixel(largura, altura, fundo);
         for y in 0..redimensionada_altura {
             for x in 0..redimensionada_largura {
                 base.put_pixel(
@@ -236,11 +243,14 @@ impl PipGrafico {
 }
 
 fn codificar(picker: &Picker, imagem: &RgbaImage) -> anyhow::Result<Protocol> {
+    // A imagem já foi redimensionada para a resolução de pixels da área
+    // (`new_protocol` receberia 6×2 células). `Fit(None)` evita um segundo
+    // reescalonamento, que era o que deixava o Pip borrado/pixelado.
     picker
         .new_protocol(
             DynamicImage::ImageRgba8(imagem.clone()),
             Size::new(COLUNAS, LINHAS),
-            Resize::Fit(Some(FilterType::Nearest)),
+            Resize::Fit(None),
         )
         .map_err(|e| anyhow::anyhow!("falha ao codificar o Pip: {e}"))
 }
@@ -285,7 +295,9 @@ fn olhos_fechados(base: &RgbaImage, escala: f32, ox: i64, oy: i64) -> RgbaImage 
 /// transparência (o fundo do status aparece atrás).
 fn deslocar(base: &RgbaImage, dx: i8, dy: i8) -> RgbaImage {
     let (largura, altura) = base.dimensions();
-    let mut saida = RgbaImage::from_pixel(largura, altura, Rgba([0, 0, 0, 0]));
+    // Fundo opaco no quadro inteiro: sem transparência sobrando onde a silhueta
+    // passou antes, o que em protocolos gráficos causava “Pip duplicado”.
+    let mut saida = RgbaImage::from_pixel(largura, altura, cor_de_fundo());
     for y in 0..i64::from(altura) {
         for x in 0..i64::from(largura) {
             let origem_x = x - i64::from(dx);

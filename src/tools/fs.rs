@@ -63,6 +63,36 @@ fn ler_texto(path: &Path) -> Result<String, ToolError> {
     })
 }
 
+/// Lê o conteúdo anterior de um arquivo que será substituído por inteiro.
+///
+/// Arquivos binários ou fora do UTF-8 não podem ser reescritos por
+/// ferramentas de texto: tratá-los como vazio apagava o original e gravava um
+/// diff falso (o `/undo` não teria como restaurá-lo).
+fn ler_anterior_para_substituir(path: &Path) -> Result<String, ToolError> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            if parece_binario(&bytes) {
+                return Err(ToolError::msg(format!(
+                    "{} parece ser um arquivo binário; as ferramentas de texto não podem reescrevê-lo. \
+                     Use run_command para manipulá-lo.",
+                    path.display()
+                )));
+            }
+            String::from_utf8(bytes).map_err(|e| {
+                ToolError::msg(format!(
+                    "{} não está em UTF-8 válido: {e}. As ferramentas de texto não podem reescrevê-lo.",
+                    path.display()
+                ))
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(ToolError::msg(format!(
+            "não foi possível ler o conteúdo atual de {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 /// Escrita atômica: grava em arquivo temporário e renomeia.
 ///
 /// As permissões do arquivo existente são copiadas para o temporário antes do
@@ -279,6 +309,11 @@ fn aplicar_trecho(
     novo: &str,
     todas: bool,
 ) -> Result<String, ToolError> {
+    if alvo.is_empty() {
+        return Err(ToolError::Argumentos(
+            "modo `trecho` exige um `alvo` não vazio".into(),
+        ));
+    }
     let ocorrencias = conteudo.matches(alvo).count();
     if ocorrencias == 0 {
         let dica = if conteudo.matches(alvo.trim()).count() > 0 {
@@ -380,7 +415,7 @@ impl Tool for ListFiles {
             )));
         }
         let recursivo = arg_bool(&args, "recursive", false);
-        let max_entradas = arg_u64(&args, "max_entries").unwrap_or(300) as usize;
+        let max_entradas = arg_u64(&args, "max_entries").unwrap_or(300).max(1) as usize;
         let glob = arg_str_opt(&args, "glob");
         let max_depth = arg_u64(&args, "max_depth").map(|d| d as usize);
 
@@ -498,17 +533,36 @@ impl Tool for ReadFile {
             )));
         }
         let conteudo = ler_texto(&caminho)?;
+        // A comparação precisa acontecer *antes* de registrar o conteúdo lido:
+        // depois, o hash registrado já é o atual e o aviso nunca aparecia.
+        let externo = ctx.arquivos.mudou_desde_registro(&caminho, &conteudo);
         ctx.arquivos.registrar(&caminho, &conteudo);
         let linhas: Vec<&str> = conteudo.lines().collect();
         let total = linhas.len();
         let inicio = arg_u64(&args, "start_line").unwrap_or(1).max(1) as usize;
         let max_lines = arg_u64(&args, "max_lines").unwrap_or(400) as usize;
+        if max_lines == 0 {
+            return Err(ToolError::Argumentos(
+                "max_lines precisa ser maior que zero".into(),
+            ));
+        }
         let fim = arg_u64(&args, "end_line")
             .map(|f| f as usize)
-            .unwrap_or(inicio + max_lines - 1)
+            // `saturating_*`: max_lines enorme não pode estourar o usize.
+            .unwrap_or(inicio.saturating_add(max_lines).saturating_sub(1))
             .min(total.max(inicio));
         let sem_numeros = arg_bool(&args, "sem_numeros", false);
         if inicio > total {
+            // Arquivo vazio com o início padrão não é erro: é uma leitura sem
+            // linhas. (Antes respondia "start_line=1 além do fim".)
+            if total == 0 && inicio == 1 {
+                let aviso = if externo {
+                    "\n[atenção: o arquivo mudou desde a última interação do Kestrel com ele]"
+                } else {
+                    ""
+                };
+                return Ok(ToolOutput::texto(aviso).com_resumo("0 linhas lidas de 0"));
+            }
             return Err(ToolError::msg(format!(
                 "start_line={inicio} além do fim do arquivo ({total} linhas)"
             )));
@@ -534,7 +588,7 @@ impl Tool for ReadFile {
         } else {
             String::new()
         };
-        let externo = if ctx.arquivos.mudou_desde_registro(&caminho, &conteudo) {
+        let externo = if externo {
             "\n[atenção: o arquivo mudou desde a última interação do Kestrel com ele]"
         } else {
             ""
@@ -734,7 +788,7 @@ impl Tool for WriteFile {
         let _lock = ctx.arquivos.lock_de(&caminho);
         let guarda = _lock.lock().await;
 
-        let anterior = std::fs::read_to_string(&caminho).unwrap_or_default();
+        let anterior = ler_anterior_para_substituir(&caminho)?;
         let existia = caminho.exists();
         if !existia
             && !arg_bool(&args, "create_dirs", false)
@@ -826,7 +880,7 @@ impl Tool for CreateFile {
                 caminho.display()
             )));
         }
-        let anterior = std::fs::read_to_string(&caminho).unwrap_or_default();
+        let anterior = ler_anterior_para_substituir(&caminho)?;
         if let Some(pai) = caminho.parent() {
             std::fs::create_dir_all(pai)
                 .map_err(|e| ToolError::msg(format!("falha ao criar {}: {e}", pai.display())))?;
@@ -925,6 +979,11 @@ impl Tool for EditFile {
             }
             "bloco" => {
                 let identificador = arg_str(&args, "identificador")?;
+                if identificador.trim().is_empty() {
+                    return Err(ToolError::Argumentos(
+                        "modo `bloco` exige um `identificador` não vazio".into(),
+                    ));
+                }
                 let novo = arg_str(&args, "novo")?;
                 let (inicio, fim) = localizar_bloco(&atual, &identificador).ok_or_else(|| {
                     ToolError::msg(format!(
@@ -1035,9 +1094,17 @@ impl Tool for DeleteFile {
             || ctx.roots.contains(&caminho)
             || literal == ctx.workdir
             || ctx.roots.contains(&literal)
+            // Remover um ancestral apaga o projeto junto: `delete_file ..`
+            // passava porque só a igualdade com a raiz era comparada.
+            || ctx
+                .roots
+                .iter()
+                .any(|r| r.starts_with(&caminho) || r.starts_with(&literal))
+            || ctx.workdir.starts_with(&caminho)
+            || ctx.workdir.starts_with(&literal)
         {
             return Err(ToolError::msg(
-                "recusando remover a raiz do projeto ou do espaço de trabalho",
+                "recusando remover a raiz do projeto, do espaço de trabalho ou um ancestral dela",
             ));
         }
         let lock = ctx.arquivos.lock_de(&literal);
@@ -1217,6 +1284,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Substituir um binário por texto não pode tratar o conteúdo anterior
+    /// como vazio: isso apagava o original e gravava um diff falso.
+    #[tokio::test]
+    async fn write_file_recusa_sobrescrever_binario() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-fs-bin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("binario.dat");
+        let original = b"inicio\0fim";
+        std::fs::write(&alvo, original).unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        let erro = WriteFile
+            .executar(
+                serde_json::json!({"path": "binario.dat", "content": "texto"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(erro.to_string().contains("binário"), "{erro}");
+        assert_eq!(
+            std::fs::read(&alvo).unwrap(),
+            original,
+            "o binário original foi alterado"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn leitura_recusa_arquivo_gigante() {
         let dir = std::env::temp_dir().join(format!("kestrel-fs-big-{}", uuid::Uuid::new_v4()));
@@ -1274,5 +1368,115 @@ mod tests {
             .unwrap();
         assert_eq!(alteracao.diff, DIFF_TRUNCADO);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O aviso de alteração externa precisa ser calculado antes de registrar o
+    /// conteúdo lido; registrando primeiro, o hash sempre batia e o aviso
+    /// nunca aparecia.
+    #[tokio::test]
+    async fn read_file_avisa_mudanca_externa() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-fs-ext-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("a.txt");
+        std::fs::write(&alvo, "antes\n").unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        let args = serde_json::json!({"path": alvo.display().to_string()});
+        ReadFile.executar(args.clone(), &ctx).await.unwrap();
+        std::fs::write(&alvo, "depois\n").unwrap();
+        let saida = ReadFile.executar(args, &ctx).await.unwrap();
+        assert!(
+            saida.conteudo.contains("mudou desde a última interação"),
+            "o aviso de mudança externa não apareceu: {}",
+            saida.conteudo
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `max_lines` zero era aceito e gerava intervalo invertido; um valor
+    /// enorme podia estourar a soma de `usize`.
+    #[tokio::test]
+    async fn read_file_valida_max_lines() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-fs-max-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("a.txt");
+        std::fs::write(&alvo, "1\n2\n3\n").unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        let zero = serde_json::json!({
+            "path": alvo.display().to_string(),
+            "max_lines": 0,
+        });
+        assert!(ReadFile.executar(zero, &ctx).await.is_err());
+        let enorme = serde_json::json!({
+            "path": alvo.display().to_string(),
+            "max_lines": u64::MAX,
+        });
+        let saida = ReadFile.executar(enorme, &ctx).await.unwrap();
+        assert!(saida.conteudo.contains("\t3"), "{}", saida.conteudo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Arquivo vazio com o início padrão é leitura válida de zero linhas.
+    #[tokio::test]
+    async fn read_file_de_arquivo_vazio_nao_e_erro() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-fs-vazio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("vazio.txt");
+        std::fs::write(&alvo, "").unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        let args = serde_json::json!({"path": alvo.display().to_string()});
+        let saida = ReadFile.executar(args, &ctx).await.unwrap();
+        assert_eq!(saida.conteudo, "");
+        assert!(saida.resumo.contains("0 linhas"), "{}", saida.resumo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `alvo` vazio fazia `str::replace("")` inserir o texto entre todos os
+    /// caracteres, corrompendo o arquivo.
+    #[test]
+    fn trecho_vazio_e_recusado() {
+        assert!(aplicar_trecho("abc", "", "x", true).is_err());
+        assert!(aplicar_trecho("abc", "", "x", false).is_err());
+    }
+
+    /// `identificador` vazio localizava a primeira linha e substituía um bloco
+    /// arbitrário.
+    #[tokio::test]
+    async fn modo_bloco_exige_identificador() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-fs-bloco-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("a.rs");
+        std::fs::write(&alvo, "fn a() {}\n").unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        let args = serde_json::json!({
+            "path": alvo.display().to_string(),
+            "mode": "bloco",
+            "identificador": "  ",
+            "novo": "x",
+        });
+        let erro = EditFile.executar(args, &ctx).await.unwrap_err();
+        assert!(erro.to_string().contains("identificador"), "{erro}");
+        assert_eq!(std::fs::read_to_string(&alvo).unwrap(), "fn a() {}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Remover um ancestral apagaria o projeto inteiro; só a igualdade com a
+    /// raiz era recusada.
+    #[tokio::test]
+    async fn delete_file_recusa_ancestral_do_projeto() {
+        use crate::tools::Tool;
+        let base = std::env::temp_dir().join(format!("kestrel-fs-pai-{}", uuid::Uuid::new_v4()));
+        let projeto = base.join("projeto");
+        std::fs::create_dir_all(&projeto).unwrap();
+        let ctx = crate::tools::git::tests::contexto(&projeto);
+        let args = serde_json::json!({"path": "..", "recursive": true});
+        let erro = DeleteFile.executar(args, &ctx).await.unwrap_err();
+        assert!(erro.to_string().contains("ancestral"), "{erro}");
+        assert!(projeto.exists(), "o projeto não pode ser removido");
+        assert!(base.exists(), "o ancestral não pode ser removido");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

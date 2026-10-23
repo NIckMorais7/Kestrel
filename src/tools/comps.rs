@@ -145,9 +145,10 @@ mod testes {
             comps_dir: dir.join("comps"),
             projeto: Arc::new(ProjectInfo::default()),
             web: WebConfig::default(),
-            http: reqwest::Client::new(),
             max_saida: 10_000,
             subagente: None,
+            escopo_processos: String::new(),
+            chamada_id: None,
         }
     }
 

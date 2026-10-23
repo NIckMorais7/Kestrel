@@ -167,6 +167,51 @@ impl Tool for UpdatePlan {
             t.session_id = ctx.session_id.clone();
         }
 
+        // Valida tudo **antes** de persistir: salvar o plano e só depois
+        // descobrir uma dependência inválida deixava objetivo/passos novos no
+        // banco sem as subtarefas correspondentes (estado meio atualizado).
+        let mut vistos = std::collections::HashSet::new();
+        for t in &tarefas {
+            if t.id.trim().is_empty() {
+                return Err(ToolError::Argumentos(
+                    "toda subtarefa precisa de um `id` não vazio".into(),
+                ));
+            }
+            if !vistos.insert(t.id.as_str()) {
+                return Err(ToolError::Argumentos(format!(
+                    "o id de subtarefa `{}` aparece mais de uma vez; os ids precisam ser únicos",
+                    t.id
+                )));
+            }
+        }
+
+        // Valida dependências: todas devem existir entre as subtarefas informadas
+        // ou já existir no banco.
+        let existentes: Vec<String> = ctx
+            .store
+            .tasks(&ctx.session_id)?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        let ids_atuais: Vec<String> = tarefas.iter().map(|t| t.id.clone()).collect();
+        for t in &tarefas {
+            for dep in &t.depends_on {
+                if dep == &t.id {
+                    return Err(ToolError::Argumentos(format!(
+                        "a subtarefa `{}` não pode depender de si mesma",
+                        t.id
+                    )));
+                }
+                if !ids_atuais.contains(dep) && !existentes.contains(dep) {
+                    return Err(ToolError::Argumentos(format!(
+                        "a subtarefa `{}` depende de `{dep}`, que não existe. \
+                         Defina a dependência com um id válido.",
+                        t.id
+                    )));
+                }
+            }
+        }
+
         let passos_json = serde_json::to_string(
             &passos
                 .iter()
@@ -185,27 +230,6 @@ impl Tool for UpdatePlan {
         ctx.store
             .update_session_objective(&ctx.session_id, &objetivo)
             .ok();
-
-        // Valida dependências: todas devem existir entre as subtarefas informadas
-        // ou já existir no banco.
-        let existentes: Vec<String> = ctx
-            .store
-            .tasks(&ctx.session_id)?
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
-        let ids_atuais: Vec<String> = tarefas.iter().map(|t| t.id.clone()).collect();
-        for t in &tarefas {
-            for dep in &t.depends_on {
-                if !ids_atuais.contains(dep) && !existentes.contains(dep) {
-                    return Err(ToolError::Argumentos(format!(
-                        "a subtarefa `{}` depende de `{dep}`, que não existe. \
-                         Defina a dependência com um id válido.",
-                        t.id
-                    )));
-                }
-            }
-        }
 
         for t in &tarefas {
             ctx.store.upsert_task(t)?;
@@ -307,10 +331,12 @@ impl Tool for TaskStatus {
                 .depends_on
                 .iter()
                 .filter(|d| {
+                    // Dependência inexistente não está concluída: tratá-la
+                    // como satisfeita liberava a tarefa com um grafo quebrado.
                     por_id
                         .get(d.as_str())
                         .map(|dep| StatusPasso::parse(&dep.status) != StatusPasso::Concluido)
-                        .unwrap_or(false)
+                        .unwrap_or(true)
                 })
                 .collect();
             if somente_prontas && !pendentes.is_empty() {
@@ -388,5 +414,62 @@ mod tests {
         let tarefas = tarefas_de(&valor);
         assert_eq!(tarefas[0].title, "x");
         assert_eq!(tarefas[0].depends_on, vec!["y".to_string()]);
+    }
+
+    fn contexto() -> ToolContext {
+        crate::tools::git::tests::contexto(&std::env::temp_dir())
+    }
+
+    /// Uma dependência inválida precisa falhar **antes** de gravar o plano:
+    /// antes, objetivo/passos ficavam no banco e as subtarefas não.
+    #[tokio::test]
+    async fn plano_invalido_nao_deixa_estado_parcial() {
+        let ctx = contexto();
+        let erro = UpdatePlan
+            .executar(
+                json!({
+                    "objetivo": "objetivo novo",
+                    "passos": [{"titulo": "etapa"}],
+                    "subtarefas": [{"id": "b", "titulo": "b", "depende_de": ["nao-existe"]}]
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("dependência inexistente deveria falhar");
+        assert!(erro.to_string().contains("não existe"), "{erro}");
+        assert!(ctx.store.latest_plan(&ctx.session_id).unwrap().is_none());
+        assert!(ctx.store.tasks(&ctx.session_id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn plano_rejeita_ids_duplicados_e_autodependencia() {
+        let ctx = contexto();
+        let erro = UpdatePlan
+            .executar(
+                json!({
+                    "objetivo": "x",
+                    "subtarefas": [
+                        {"id": "a", "titulo": "a"},
+                        {"id": "a", "titulo": "outra"}
+                    ]
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("ids duplicados deveriam falhar");
+        assert!(erro.to_string().contains("mais de uma vez"), "{erro}");
+
+        let erro = UpdatePlan
+            .executar(
+                json!({
+                    "objetivo": "x",
+                    "subtarefas": [{"id": "a", "titulo": "a", "depende_de": ["a"]}]
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("autodependência deveria falhar");
+        assert!(erro.to_string().contains("si mesma"), "{erro}");
+        assert!(ctx.store.latest_plan(&ctx.session_id).unwrap().is_none());
     }
 }

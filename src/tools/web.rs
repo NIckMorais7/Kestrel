@@ -15,9 +15,21 @@ use serde_json::{Value, json};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 /// Tamanho máximo de corpo lido por `fetch_url` (o restante é descartado).
 const LIMITE_CORPO_FETCH: usize = 8 * 1024 * 1024;
+
+/// Tamanho máximo de corpo lido de mecanismos de busca.
+///
+/// Antes `resposta.text()`/`.json()` carregavam tudo: um SearxNG mal
+/// configurado (ou um servidor hostil) podia devolver gigabytes e esgotar a
+/// memória do Kestrel.
+const LIMITE_CORPO_BUSCA: usize = 4 * 1024 * 1024;
+
+/// Quantos redirecionamentos seguimos manualmente antes de desistir.
+const MAX_REDIRECIONAMENTOS: usize = 8;
 
 /// Endereços que nunca devem ser acessados pelas ferramentas web.
 ///
@@ -36,6 +48,11 @@ fn ip_interno(ip: IpAddr) -> bool {
                 || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
         }
         IpAddr::V6(v6) => {
+            // Endereços IPv4 mapeados (`::ffff:169.254.169.254`) passavam
+            // direto pela checagem e alcançavam o metadata da nuvem.
+            if let Some(v4) = v6.to_ipv4() {
+                return ip_interno(IpAddr::V4(v4));
+            }
             v6.is_unspecified()
                 || v6.is_multicast()
                 // Link-local fe80::/10.
@@ -82,6 +99,55 @@ async fn validar_url_externa(url: &str) -> Result<reqwest::Url, ToolError> {
         }
     }
     Ok(parsed)
+}
+
+/// Cliente HTTP das ferramentas web com redirecionamento **manual**: o
+/// automático do reqwest seguia um `Location` para `169.254.169.254` sem
+/// passar pela validação de SSRF.
+fn cliente_web(ctx: &ToolContext) -> Result<reqwest::Client, ToolError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(ctx.web.request_timeout_secs.max(10)))
+        .user_agent(ctx.web.user_agent.clone())
+        .build()
+        .map_err(|e| ToolError::msg(format!("falha ao preparar o cliente HTTP: {e}")))
+}
+
+/// Faz um GET validando cada salto de redirecionamento.
+async fn get_com_redirecionamentos(
+    cliente: &reqwest::Client,
+    url_inicial: &str,
+    accept: Option<&str>,
+) -> Result<(reqwest::Url, reqwest::Response), ToolError> {
+    let mut url = validar_url_externa(url_inicial).await?;
+    for _ in 0..=MAX_REDIRECIONAMENTOS {
+        let mut pedido = cliente.get(url.clone());
+        if let Some(accept) = accept {
+            pedido = pedido.header("Accept", accept);
+        }
+        let resposta = pedido
+            .send()
+            .await
+            .map_err(|e| ToolError::msg(format!("falha ao abrir {url}: {e}")))?;
+        if !resposta.status().is_redirection() {
+            return Ok((url, resposta));
+        }
+        let Some(local) = resposta
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return Ok((url, resposta));
+        };
+        let proxima = url
+            .join(local)
+            .map_err(|e| ToolError::msg(format!("redirecionamento inválido de {url}: {e}")))?;
+        url = validar_url_externa(proxima.as_str()).await?;
+    }
+    Err(ToolError::msg(format!(
+        "a URL {url_inicial} redirecionou mais de {MAX_REDIRECIONAMENTOS} vezes"
+    )))
 }
 
 /// Navegadores conhecidos, na ordem de preferência.
@@ -200,8 +266,8 @@ async fn buscar_duckduckgo(
     idioma: &str,
     max: usize,
 ) -> Result<ToolOutput, ToolError> {
-    let resposta = ctx
-        .http
+    let cliente = cliente_web(ctx)?;
+    let resposta = cliente
         .post("https://html.duckduckgo.com/html/")
         .header("Accept", "text/html")
         .form(&[("q", consulta), ("kl", idioma)])
@@ -218,7 +284,9 @@ async fn buscar_duckduckgo(
             resposta.status()
         )));
     }
-    let corpo = resposta.text().await.unwrap_or_default();
+    let corpo = ler_corpo_limitado(resposta, LIMITE_CORPO_BUSCA)
+        .await
+        .map_err(|e| ToolError::msg(format!("falha ao ler a resposta da pesquisa: {e}")))?;
     let r = regexes();
     let titulos: Vec<(String, String)> = r
         .ddg_resultado
@@ -272,8 +340,8 @@ async fn buscar_searx(
     max: usize,
 ) -> Result<ToolOutput, ToolError> {
     let url = format!("{}/search", base.trim_end_matches('/'));
-    let resposta = ctx
-        .http
+    let cliente = cliente_web(ctx)?;
+    let resposta = cliente
         .get(&url)
         .query(&[("q", consulta), ("format", "json")])
         .send()
@@ -285,9 +353,10 @@ async fn buscar_searx(
             resposta.status()
         )));
     }
-    let valor: Value = resposta
-        .json()
+    let corpo = ler_corpo_limitado(resposta, LIMITE_CORPO_BUSCA)
         .await
+        .map_err(|e| ToolError::msg(format!("falha ao ler a resposta do SearxNG: {e}")))?;
+    let valor: Value = serde_json::from_str(&corpo)
         .map_err(|e| ToolError::msg(format!("resposta inválida do SearxNG: {e}")))?;
     let mut linhas = Vec::new();
     if let Some(resultados) = valor.get("results").and_then(|r| r.as_array()) {
@@ -345,8 +414,7 @@ impl Tool for FetchUrl {
     }
 
     async fn executar(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let url = arg_str(&args, "url")?;
-        let url = validar_url_externa(&url).await?;
+        let url_bruta = arg_str(&args, "url")?;
         let max = arg_u64(&args, "max_caracteres").unwrap_or(20_000) as usize;
         let formato = arg_str_opt(&args, "formato").unwrap_or_else(|| "texto".into());
         let incluir_links = args
@@ -354,16 +422,15 @@ impl Tool for FetchUrl {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let resposta = ctx
-            .http
-            .get(url.clone())
-            .header(
-                "Accept",
+        let cliente = cliente_web(ctx)?;
+        let (url, resposta) = get_com_redirecionamentos(
+            &cliente,
+            &url_bruta,
+            Some(
                 "text/html,application/xhtml+xml,application/json;q=0.9,text/plain;q=0.8,*/*;q=0.5",
-            )
-            .send()
-            .await
-            .map_err(|e| ToolError::msg(format!("falha ao abrir {url}: {e}")))?;
+            ),
+        )
+        .await?;
         let status = resposta.status();
         let tipo = resposta
             .headers()
@@ -501,8 +568,7 @@ impl Tool for DownloadFile {
     }
 
     async fn executar(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let url = arg_str(&args, "url")?;
-        let url = validar_url_externa(&url).await?;
+        let url_bruta = arg_str(&args, "url")?;
         let destino = resolver_caminho(ctx, &arg_str(&args, "caminho")?);
         // O pedido do modelo não pode furar o limite da configuração (antes
         // `max_bytes` era honrado sem teto e enchia o disco).
@@ -510,12 +576,8 @@ impl Tool for DownloadFile {
             .unwrap_or(ctx.web.max_download_bytes)
             .min(ctx.web.max_download_bytes);
 
-        let resposta = ctx
-            .http
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|e| ToolError::msg(format!("falha ao baixar {url}: {e}")))?;
+        let cliente = cliente_web(ctx)?;
+        let (url, resposta) = get_com_redirecionamentos(&cliente, &url_bruta, None).await?;
         if !resposta.status().is_success() {
             return Err(ToolError::msg(format!(
                 "{url} respondeu HTTP {}",
@@ -671,6 +733,21 @@ impl Tool for BrowserRender {
             ))
         })?;
 
+        // Pré-valida os redirecionamentos HTTP estáticos: o navegador seguiria
+        // um `Location` para um endereço interno sem passar pela checagem de
+        // SSRF. Redirecionamentos dinâmicos (JS/meta refresh) continuam sendo
+        // uma limitação do navegador headless — por isso o Kestrel não executa
+        // o conteúdo baixado e mantém a sandbox padrão do navegador.
+        let cliente = cliente_web(ctx)?;
+        let (url_final, preflight) = get_com_redirecionamentos(
+            &cliente,
+            url.as_str(),
+            Some("text/html,application/xhtml+xml,*/*;q=0.5"),
+        )
+        .await?;
+        drop(preflight);
+        let url = url_final;
+
         let espera_texto = espera.to_string();
         let mut comando = tokio::process::Command::new(&navegador);
         comando
@@ -686,18 +763,52 @@ impl Tool for BrowserRender {
                 "--dump-dom",
                 url.as_str(),
             ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let saida = comando.output().await.map_err(|e| {
+        let mut filho = comando.spawn().map_err(|e| {
             ToolError::msg(format!("falha ao executar {}: {e}", navegador.display()))
         })?;
-        if !saida.status.success() {
+        let stdout = filho
+            .stdout
+            .take()
+            .ok_or_else(|| ToolError::msg("não foi possível capturar a saída do navegador"))?;
+        let stderr = filho
+            .stderr
+            .take()
+            .ok_or_else(|| ToolError::msg("não foi possível capturar os erros do navegador"))?;
+        // O DOM de uma página hostil podia crescer sem limite na memória.
+        const LIMITE_DOM: usize = 8 * 1024 * 1024;
+        let mut dom_bytes = Vec::new();
+        let mut erro_bytes = Vec::new();
+        let mut stdout_limitado = stdout.take(LIMITE_DOM as u64 + 1);
+        let mut stderr_limitado = stderr.take(64 * 1024);
+        let (leitura_saida, leitura_erro) = tokio::join!(
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout_limitado, &mut dom_bytes),
+            tokio::io::AsyncReadExt::read_to_end(&mut stderr_limitado, &mut erro_bytes),
+        );
+        leitura_saida
+            .map_err(|e| ToolError::msg(format!("falha ao ler a saída do navegador: {e}")))?;
+        leitura_erro
+            .map_err(|e| ToolError::msg(format!("falha ao ler os erros do navegador: {e}")))?;
+        let status = filho
+            .wait()
+            .await
+            .map_err(|e| ToolError::msg(format!("falha ao aguardar o navegador: {e}")))?;
+        if dom_bytes.len() > LIMITE_DOM {
             return Err(ToolError::msg(format!(
-                "o navegador terminou com código {:?}: {}",
-                saida.status.code(),
-                crate::util::truncate(&String::from_utf8_lossy(&saida.stderr), 400)
+                "o navegador produziu um DOM maior que o limite de {}",
+                crate::util::human_bytes(LIMITE_DOM as u64)
             )));
         }
-        let dom = String::from_utf8_lossy(&saida.stdout).to_string();
+        if !status.success() {
+            return Err(ToolError::msg(format!(
+                "o navegador terminou com código {:?}: {}",
+                status.code(),
+                crate::util::truncate(&String::from_utf8_lossy(&erro_bytes), 400)
+            )));
+        }
+        let dom = String::from_utf8_lossy(&dom_bytes).to_string();
         if dom.trim().is_empty() {
             return Err(ToolError::msg(
                 "o navegador não devolveu conteúdo; tente aumentar `espera_ms` ou use fetch_url",
@@ -763,11 +874,52 @@ mod tests {
     #[test]
     fn ip_interno_cobre_metadados_de_nuvem() {
         use std::net::IpAddr;
-        for ip in ["169.254.169.254", "100.100.100.200", "0.0.0.0", "fe80::1"] {
+        for ip in [
+            "169.254.169.254",
+            "100.100.100.200",
+            "0.0.0.0",
+            "fe80::1",
+            "::ffff:169.254.169.254",
+            "::ffff:100.100.100.200",
+            "::ffff:0.0.0.0",
+        ] {
             assert!(ip_interno(ip.parse::<IpAddr>().unwrap()), "{ip}");
         }
         for ip in ["127.0.0.1", "192.168.1.10", "10.0.0.1", "8.8.8.8", "::1"] {
             assert!(!ip_interno(ip.parse::<IpAddr>().unwrap()), "{ip}");
+        }
+    }
+
+    /// O reqwest seguia redirecionamentos sozinho e a validação de SSRF só
+    /// cobria a URL inicial. Cada salto precisa passar por `validar_url_externa`.
+    #[tokio::test]
+    async fn redirecionamento_para_metadados_e_bloqueado() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endereco = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0u8; 1024];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        let cliente = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let url = format!("http://{endereco}/");
+        let resultado = get_com_redirecionamentos(&cliente, &url, None).await;
+        match resultado {
+            Ok(_) => panic!("o redirecionamento para metadados deveria ser bloqueado"),
+            Err(erro) => assert!(
+                erro.to_string().contains("interno"),
+                "erro inesperado: {erro}"
+            ),
         }
     }
 }

@@ -34,6 +34,7 @@ pub enum Bloco {
     Raciocinio(String),
     Assistente(String),
     Ferramenta {
+        id: Option<String>,
         nome: String,
         detalhe: String,
         rodando: bool,
@@ -43,6 +44,7 @@ pub enum Bloco {
         remocoes: usize,
     },
     Saida {
+        id: Option<String>,
         nome: String,
         linhas: Vec<String>,
     },
@@ -125,10 +127,7 @@ impl Bloco {
             Bloco::Assistente(texto) => {
                 let mut linhas = vec![
                     Line::default(),
-                    Line::from(vec![
-                        Span::styled("◆ ", theme::titulo()),
-                        Span::styled("Kestrel", theme::rotulo()),
-                    ]),
+                    Line::from(Span::styled("Kestrel", theme::rotulo())),
                 ];
                 linhas.extend(markdown::renderizar(texto));
                 linhas
@@ -141,6 +140,7 @@ impl Bloco {
                 resumo,
                 adicoes,
                 remocoes,
+                ..
             } => {
                 let (marcador, estilo_marcador) = if *rodando {
                     ("┊", theme::em_execucao())
@@ -488,6 +488,8 @@ pub struct App {
     /// PNG do Pip já codificado no protocolo gráfico do terminal. `None`
     /// quando o mascote está desligado ou o terminal não pôde ser consultado.
     pub pip_grafico: Option<PipGrafico>,
+    /// Ícone do Kestrel já codificado nas versões clara/escura.
+    pub icone: Option<crate::ui::icone::IconeKestrel>,
     pip_piscada_ate: u64,
     pip_proxima_piscada: u64,
     pip_sorteio: u64,
@@ -555,6 +557,7 @@ impl App {
             modo,
             pip: AnimacaoPip::default(),
             pip_grafico: None,
+            icone: None,
             pip_piscada_ate: 0,
             pip_proxima_piscada: 20,
             pip_sorteio: 0x9E37_79B9_7F4A_7C15,
@@ -621,7 +624,7 @@ impl App {
 
     fn definir_estado(&mut self, estado: EstadoMascote, texto: impl Into<String>) {
         self.estado = estado;
-        self.estado_texto = texto.into();
+        self.estado_texto = com_maiuscula(texto.into());
         self.estado_expira = None;
     }
 
@@ -780,6 +783,9 @@ impl App {
             }
             "/effort" | "/esforco" => {
                 if argumento.is_empty() {
+                    // `/effort` altera só o esforço: um modelo escolhido e
+                    // depois cancelado não pode ser aplicado por engano aqui.
+                    self.modelo_pendente = None;
                     let niveis = self.config.supported_efforts();
                     self.abrir_seletor_esforco(niveis);
                 } else {
@@ -823,19 +829,7 @@ impl App {
                         return;
                     }
                 };
-                self.mostrar_raciocinio = novo;
-                self.config.ui.show_reasoning = novo;
-                // Salva sempre: desligar também é uma preferência, e Voltar ao
-                // padrão depois exigiria religar à mão.
-                if let Err(e) = self.config.save(&self.paths) {
-                    self.avisar(format!(
-                        "não foi possível salvar a preferência de raciocínio: {e}"
-                    ));
-                }
-                // A escolha vale para o agente: com o raciocínio oculto ele
-                // deixa de enviar os deltas de pensamento para a interface.
-                let _ = self.cmd_tx.send(UiCommand::DefinirRaciocinio(novo));
-                self.construir_tudo();
+                self.definir_raciocinio(novo);
                 let estado = if novo { "visível" } else { "oculto" };
                 self.avisar(format!(
                     "raciocínio do modelo: {estado}. Quando oculto, o pensamento não aparece \
@@ -996,8 +990,8 @@ impl App {
                 let contexto = if self.contexto.1 > 0 {
                     format!(
                         "{} de {} tokens ({}%)",
-                        self.contexto.0,
-                        self.contexto.1,
+                        crate::util::formatar_tokens(self.contexto.0 as u64),
+                        crate::util::formatar_tokens(self.contexto.1 as u64),
                         (self.contexto.0 as f32 / self.contexto.1.max(1) as f32 * 100.0).round()
                     )
                 } else {
@@ -1522,6 +1516,27 @@ impl App {
         self.acompanhar_fim();
     }
 
+    /// Aplica a preferência de exibição do raciocínio e propaga ao agente.
+    ///
+    /// `/thinking` e F2 precisam do mesmo efeito. Antes, F2 só trocava o
+    /// booleano local: o agente continuava enviando os deltas (trabalho e
+    /// tráfego desperdiçados) e a escolha não era salva para a próxima sessão.
+    fn definir_raciocinio(&mut self, novo: bool) {
+        self.mostrar_raciocinio = novo;
+        self.config.ui.show_reasoning = novo;
+        // Salva sempre: desligar também é uma preferência, e voltar ao padrão
+        // depois exigiria religar à mão.
+        if let Err(e) = self.config.save(&self.paths) {
+            self.avisar(format!(
+                "não foi possível salvar a preferência de raciocínio: {e}"
+            ));
+        }
+        // A escolha vale para o agente: com o raciocínio oculto ele deixa de
+        // enviar os deltas de pensamento para a interface.
+        let _ = self.cmd_tx.send(UiCommand::DefinirRaciocinio(novo));
+        self.construir_tudo();
+    }
+
     fn abrir_seletor_modelos(&mut self, filtro: String) {
         let atual = self.config.provider.model.clone();
         let mut itens: Vec<ItemSeletor> = self
@@ -1737,24 +1752,10 @@ impl App {
             self.avisar("nenhum processo gerenciado no momento.".into());
             return;
         }
-        let itens = lista
-            .into_iter()
-            .map(|p| ItemSeletor {
-                titulo: format!("{} — {}", p.id, crate::util::truncate(&p.comando, 60)),
-                detalhe: format!(
-                    "estado: {} · cwd: {} · linhas de saída: {} · iniciado em: {}",
-                    p.estado.label(),
-                    p.cwd,
-                    p.linhas,
-                    p.iniciado_em
-                ),
-                valor: ValorSeletor::Nada,
-            })
-            .collect();
         self.modal = Some(Modal::Processos(Seletor::novo(
             "Processos",
             "esc fecha",
-            itens,
+            itens_processos(&lista),
         )));
     }
 
@@ -1815,10 +1816,7 @@ impl App {
                 }
                 if let Some(Bloco::Assistente(texto)) = self.blocos.last_mut() {
                     texto.push_str(&delta);
-                    if texto.chars().count() > 400_000 {
-                        let excesso = texto.chars().count() - 400_000;
-                        *texto = texto.chars().skip(excesso).collect();
-                    }
+                    limitar_texto(texto);
                 }
                 self.definir_estado(EstadoMascote::Trabalhando, "escrevendo");
                 self.atualizar_ultimo();
@@ -1838,6 +1836,7 @@ impl App {
                 }
                 if let Some(Bloco::Raciocinio(texto)) = self.blocos.last_mut() {
                     texto.push_str(&delta);
+                    limitar_texto(texto);
                 }
                 self.definir_estado(EstadoMascote::Pensando, "raciocinando");
                 self.atualizar_ultimo();
@@ -1854,8 +1853,9 @@ impl App {
                 }
                 self.acompanhar_fim();
             }
-            AgentEvent::FerramentaIniciada { nome, detalhe } => {
+            AgentEvent::FerramentaIniciada { id, nome, detalhe } => {
                 self.empurrar_bloco(Bloco::Ferramenta {
+                    id,
                     nome,
                     detalhe,
                     rodando: true,
@@ -1867,58 +1867,60 @@ impl App {
                 self.definir_estado(EstadoMascote::Ferramentas, "executando ferramenta");
                 self.acompanhar_fim();
             }
-            AgentEvent::FerramentaSaida { nome, linha } => {
+            AgentEvent::FerramentaSaida { id, nome, linha } => {
                 let limpar = crate::util::strip_ansi(&linha);
                 if limpar.trim().is_empty() {
                     return;
                 }
-                // Linhas de saída ficam agrupadas por ferramenta; saídas de
-                // ferramentas diferentes não se misturam no mesmo bloco.
-                let destino = match self.blocos.last_mut() {
-                    Some(Bloco::Saida { nome: n, linhas }) if *n == nome => Some(linhas),
-                    _ => {
-                        self.empurrar_bloco(Bloco::Saida {
-                            nome: nome.clone(),
-                            linhas: Vec::new(),
-                        });
-                        match self.blocos.last_mut() {
-                            Some(Bloco::Saida { linhas, .. }) => Some(linhas),
-                            _ => None,
-                        }
-                    }
+                // Linhas de saída ficam agrupadas por ferramenta; chamadas
+                // paralelas de mesmo nome não se misturam porque o id da
+                // chamada desempata.
+                let existente = if id.is_some() {
+                    self.blocos
+                        .iter()
+                        .rposition(|b| matches!(b, Bloco::Saida { id: bid, .. } if bid == &id))
+                } else {
+                    self.blocos
+                        .last()
+                        .filter(
+                            |b| matches!(b, Bloco::Saida { id: None, nome: n, .. } if n == &nome),
+                        )
+                        .map(|_| self.blocos.len() - 1)
                 };
-                if let Some(linhas) = destino {
-                    linhas.push(crate::util::truncate(&limpar, 400));
-                    if linhas.len() > 300 {
-                        let remover = linhas.len() - 300;
-                        linhas.drain(..remover);
+                match existente {
+                    Some(i) => {
+                        if let Some(Bloco::Saida { linhas, .. }) = self.blocos.get_mut(i) {
+                            linhas.push(crate::util::truncate(&limpar, 400));
+                            if linhas.len() > 300 {
+                                let remover = linhas.len() - 300;
+                                linhas.drain(..remover);
+                            }
+                        }
+                        // O bloco pode não ser o último (saídas paralelas se
+                        // intercalam): reconstruir só o último deixaria a nova
+                        // linha invisível até o próximo evento.
+                        self.reconstruir_do(i);
+                    }
+                    None => {
+                        self.empurrar_bloco(Bloco::Saida {
+                            id,
+                            nome,
+                            linhas: vec![crate::util::truncate(&limpar, 400)],
+                        });
                     }
                 }
-                self.atualizar_ultimo();
                 // Evento do agente: so arrasta para o fim quem ja estava la.
                 self.acompanhar_fim();
             }
             AgentEvent::FerramentaConcluida {
+                id,
                 nome,
                 sucesso,
                 resumo,
                 adicoes,
                 remocoes,
             } => {
-                // Encontra a primeira ferramenta em execução com o mesmo nome.
-                let mut encontrado = None;
-                for (i, bloco) in self.blocos.iter().enumerate() {
-                    if let Bloco::Ferramenta {
-                        nome: n,
-                        rodando: true,
-                        ..
-                    } = bloco
-                        && *n == nome
-                    {
-                        encontrado = Some(i);
-                        break;
-                    }
-                }
+                let encontrado = self.localizar_ferramenta(id.as_deref(), &nome);
                 if let Some(i) = encontrado {
                     if let Bloco::Ferramenta {
                         rodando,
@@ -2051,9 +2053,13 @@ impl App {
                         self.estado = EstadoMascote::Pensando;
                     }
                 }
-                self.estado_texto = mensagem;
+                self.estado_texto = com_maiuscula(mensagem);
             }
-            AgentEvent::SessaoAtiva { id, titulo } => {
+            AgentEvent::SessaoAtiva {
+                id,
+                titulo,
+                workdir,
+            } => {
                 let sessao_mudou = !self.sessao_id.is_empty() && self.sessao_id != id;
                 if sessao_mudou {
                     self.limpar_conversa();
@@ -2062,10 +2068,19 @@ impl App {
                 }
                 self.sessao_id = id;
                 self.sessao_titulo = titulo;
-                // Reanalisa o projeto e as skills: o estado real manda.
-                let workdir = self.config.workdir();
-                self.projeto = Arc::new(project::analyze(&workdir));
-                self.skills = Arc::new(SkillRegistry::discover(&self.paths, &workdir));
+                // O workdir do evento é a fonte da verdade: retomar uma sessão
+                // de outro projeto precisa alinhar a interface ao diretório em
+                // que o agente realmente está trabalhando.
+                let caminho = crate::util::expand_tilde(&workdir);
+                let caminho = std::fs::canonicalize(&caminho).unwrap_or(caminho);
+                let atual = std::fs::canonicalize(self.config.workdir())
+                    .unwrap_or_else(|_| self.config.workdir());
+                if caminho != atual {
+                    self.config.agent.workdir = Some(caminho.clone());
+                    self.config.agent.pin_workdir = true;
+                }
+                self.projeto = Arc::new(project::analyze(&caminho));
+                self.skills = Arc::new(SkillRegistry::discover(&self.paths, &caminho));
                 // Carrega plano e tarefas persistidos da sessão; ao retomar uma
                 // sessão existente, o estado atual aparece na conversa.
                 let mut plano_carregado: Option<(String, Vec<PlanoPasso>)> = None;
@@ -2136,6 +2151,21 @@ impl App {
             AgentEvent::Processos { lista } => {
                 self.abrir_processos(lista);
             }
+            AgentEvent::ProcessosAtualizados { lista } => {
+                // Ferramentas em segundo plano atualizam o estado sem abrir
+                // um modal por cima do que o usuário está fazendo. Se o modal
+                // de processos já está aberto, ele é atualizado no lugar.
+                self.processos = lista.clone();
+                if matches!(self.modal, Some(Modal::Processos(_))) {
+                    if lista.is_empty() {
+                        self.fechar_modal();
+                        self.avisar("nenhum processo gerenciado no momento.".into());
+                    } else if let Some(Modal::Processos(seletor)) = &mut self.modal {
+                        seletor.itens = itens_processos(&lista);
+                        seletor.ajustar_selecao();
+                    }
+                }
+            }
             AgentEvent::Encerrado => {
                 self.saindo = true;
                 self.encerrado = true;
@@ -2143,6 +2173,47 @@ impl App {
                 self.estado = EstadoMascote::Ocioso;
             }
         }
+    }
+
+    /// Localiza o bloco de ferramenta que corresponde a uma conclusão.
+    ///
+    /// O id da chamada é a chave preferida; o nome é só o fallback para
+    /// eventos de subagente, que não carregam id.
+    fn localizar_ferramenta(&self, id: Option<&str>, nome: &str) -> Option<usize> {
+        if let Some(id) = id
+            && let Some(i) = self.blocos.iter().rposition(|b| {
+                matches!(
+                    b,
+                    Bloco::Ferramenta {
+                        id: Some(bid),
+                        rodando: true,
+                        ..
+                    } if bid == id
+                )
+            })
+        {
+            return Some(i);
+        }
+        self.blocos.iter().rposition(|b| {
+            matches!(
+                b,
+                Bloco::Ferramenta {
+                    nome: n,
+                    rodando: true,
+                    ..
+                } if n == nome
+            )
+        })
+    }
+
+    /// Fecha o modal atual. Cancelar a escolha de esforço também cancela a
+    /// troca de modelo que a originou; senão o modelo ficaria "pendente" e um
+    /// `/effort` posterior o aplicaria sem o usuário saber.
+    fn fechar_modal(&mut self) {
+        if matches!(self.modal, Some(Modal::Esforco(_))) {
+            self.modelo_pendente = None;
+        }
+        self.modal = None;
     }
 
     fn proximo_confirmacao(&mut self) {
@@ -2248,7 +2319,10 @@ impl App {
                 if matches!(self.modal, Some(Modal::Confirmacao(_))) {
                     self.responder_confirmacao(Confirmacao::Negar);
                 } else {
-                    self.modal = None;
+                    self.fechar_modal();
+                    // Havia confirmações na fila: a próxima deve aparecer
+                    // imediatamente, sem esperar outro evento.
+                    self.proximo_confirmacao();
                 }
                 if self.turno_ativo {
                     let _ = self.cmd_tx.send(UiCommand::Interromper);
@@ -2372,8 +2446,7 @@ impl App {
                 });
             }
             KeyCode::F(2) => {
-                self.mostrar_raciocinio = !self.mostrar_raciocinio;
-                self.construir_tudo();
+                self.definir_raciocinio(!self.mostrar_raciocinio);
                 let estado = if self.mostrar_raciocinio {
                     "visível"
                 } else {
@@ -2546,7 +2619,7 @@ impl App {
         };
         match reacao {
             Reacao::Nada => {}
-            Reacao::Fechar => self.modal = None,
+            Reacao::Fechar => self.fechar_modal(),
             Reacao::Confirmar(resposta) => self.responder_confirmacao(resposta),
             Reacao::SalvarComp => self.salvar_comp_modal(),
             Reacao::RemoverComp => self.remover_comp_confirmado(),
@@ -2626,6 +2699,51 @@ impl App {
             let _ = std::fs::write(self.paths.history_file(), texto);
         }
     }
+}
+
+/// Primeira letra em maiúscula, preservando o resto (inclusive acentos).
+/// Teto de memória dos blocos de texto em streaming.
+const TETO_TEXTO: usize = 400_000;
+
+/// Mantém o texto dentro do teto, descartando o **começo** (o mais antigo).
+///
+/// A verificação barata é por bytes — `len()` é O(1). Contar caracteres a cada
+/// delta varria o texto inteiro e, numa resposta longa, custava mais que a
+/// própria renderização. O corte por caracteres só acontece quando o teto é de
+/// fato ultrapassado, para nunca cortar no meio de um caractere multibyte.
+fn limitar_texto(texto: &mut String) {
+    if texto.len() <= TETO_TEXTO {
+        return;
+    }
+    let excesso = texto.chars().count().saturating_sub(TETO_TEXTO);
+    if excesso > 0 {
+        *texto = texto.chars().skip(excesso).collect();
+    }
+}
+
+fn com_maiuscula(texto: String) -> String {
+    let mut caracteres = texto.chars();
+    match caracteres.next() {
+        Some(primeira) => primeira.to_uppercase().collect::<String>() + caracteres.as_str(),
+        None => texto,
+    }
+}
+
+fn itens_processos(lista: &[ProcessoView]) -> Vec<ItemSeletor> {
+    lista
+        .iter()
+        .map(|p| ItemSeletor {
+            titulo: format!("{} — {}", p.id, crate::util::truncate(&p.comando, 60)),
+            detalhe: format!(
+                "estado: {} · cwd: {} · linhas de saída: {} · iniciado em: {}",
+                p.estado.label(),
+                p.cwd,
+                p.linhas,
+                p.iniciado_em
+            ),
+            valor: ValorSeletor::Nada,
+        })
+        .collect()
 }
 
 fn seletor_permissoes(atual: PermissionLevel) -> Seletor {
@@ -2719,6 +2837,7 @@ pub async fn executar(
     paths: Paths,
     store: Store,
     pip_grafico: Option<PipGrafico>,
+    icone: Option<crate::ui::icone::IconeKestrel>,
 ) -> anyhow::Result<()> {
     let handle: AgenteHandle = iniciar(config.clone(), paths.clone(), store.clone())?;
     let AgenteHandle {
@@ -2729,6 +2848,7 @@ pub async fn executar(
     let skills = Arc::new(SkillRegistry::discover(&paths, &config.workdir()));
     let mut app = App::novo(config, paths, store, cmd_tx, projeto, skills);
     app.pip_grafico = pip_grafico;
+    app.icone = icone;
     let mut eventos_terminal = ui::canal_terminal();
     // Cadência adaptativa: ágil durante um turno (spinner), espaçada quando
     // ocioso (respiração/piscada). O desenho é pulado quando nada mudou.
@@ -2839,6 +2959,41 @@ mod tests {
             UiCommand::EnviarMensagem(t) => assert_eq!(t, "corrija o bug"),
             outro => panic!("comando inesperado: {outro:?}"),
         }
+    }
+
+    /// F2 e `/thinking` precisam ter o mesmo efeito: persistir a preferência
+    /// e avisar o agente para parar de enviar deltas de raciocínio.
+    #[test]
+    fn f2_e_thinking_propagam_e_persistem_a_escolha() {
+        let dir = std::env::temp_dir().join(format!("kestrel-thinking-{}", uuid::Uuid::new_v4()));
+        let (mut app, mut rx) = app_de_teste();
+        app.paths = Paths::with_root(&dir);
+
+        app.entrada.definir_texto("/thinking off".into());
+        app.enviar_entrada();
+        assert!(!app.mostrar_raciocinio);
+        assert!(!app.config.ui.show_reasoning);
+        let mut viu = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if matches!(cmd, UiCommand::DefinirRaciocinio(false)) {
+                viu = true;
+            }
+        }
+        assert!(viu, "o agente não foi avisado sobre /thinking off");
+
+        // F2 liga de volta e também propaga.
+        app.tratar_tecla(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert!(app.mostrar_raciocinio);
+        assert!(app.config.ui.show_reasoning);
+        let mut viu = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if matches!(cmd, UiCommand::DefinirRaciocinio(true)) {
+                viu = true;
+            }
+        }
+        assert!(viu, "o agente não foi avisado sobre o F2");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3064,10 +3219,12 @@ mod tests {
     fn ferramenta_concluida_atualiza_bloco_com_diff_real() {
         let (mut app, _rx) = app_de_teste();
         app.tratar_evento(AgentEvent::FerramentaIniciada {
+            id: Some("call-1".into()),
             nome: "edit_file".into(),
             detalhe: "src/main.rs".into(),
         });
         app.tratar_evento(AgentEvent::FerramentaConcluida {
+            id: Some("call-1".into()),
             nome: "edit_file".into(),
             sucesso: true,
             resumo: "3 linhas alteradas".into(),
@@ -3088,6 +3245,126 @@ mod tests {
             }
             _ => panic!("esperava bloco de ferramenta"),
         }
+    }
+
+    /// Duas chamadas de mesmo nome em paralelo precisam casar início e fim
+    /// pelo id; antes a conclusão sempre marcava o primeiro bloco e o segundo
+    /// ficava girando para sempre.
+    #[test]
+    fn conclusao_de_ferramenta_casa_pelo_id() {
+        let (mut app, _rx) = app_de_teste();
+        for (id, detalhe) in [("c1", "a.rs"), ("c2", "b.rs")] {
+            app.tratar_evento(AgentEvent::FerramentaIniciada {
+                id: Some(id.into()),
+                nome: "read_file".into(),
+                detalhe: detalhe.into(),
+            });
+        }
+        app.tratar_evento(AgentEvent::FerramentaConcluida {
+            id: Some("c2".into()),
+            nome: "read_file".into(),
+            sucesso: true,
+            resumo: "b.rs lido".into(),
+            adicoes: 0,
+            remocoes: 0,
+        });
+        let blocos: Vec<(&str, bool, Option<&str>)> = app
+            .blocos
+            .iter()
+            .filter_map(|b| match b {
+                Bloco::Ferramenta {
+                    detalhe,
+                    rodando,
+                    resumo,
+                    ..
+                } => Some((detalhe.as_str(), *rodando, resumo.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blocos.len(), 2);
+        assert_eq!(blocos[0], ("a.rs", true, None));
+        assert_eq!(blocos[1], ("b.rs", false, Some("b.rs lido")));
+    }
+
+    /// Se o modal de processos está aberto, um evento automático atualiza a
+    /// lista no lugar em vez de deixar o modal mostrando dados velhos.
+    #[test]
+    fn processos_atualizados_refrescam_modal_aberto() {
+        use crate::events::EstadoProcesso;
+        let (mut app, _rx) = app_de_teste();
+        let processo = |id: &str| ProcessoView {
+            id: id.into(),
+            comando: "sleep 1".into(),
+            cwd: "/tmp".into(),
+            estado: EstadoProcesso::Executando,
+            codigo_saida: None,
+            iniciado_em: "agora".into(),
+            linhas: 0,
+        };
+        app.tratar_evento(AgentEvent::Processos {
+            lista: vec![processo("proc1")],
+        });
+        assert!(matches!(app.modal, Some(Modal::Processos(_))));
+        app.tratar_evento(AgentEvent::ProcessosAtualizados {
+            lista: vec![processo("proc1"), processo("proc2")],
+        });
+        match &app.modal {
+            Some(Modal::Processos(seletor)) => {
+                assert_eq!(seletor.itens.len(), 2);
+                assert!(seletor.itens[1].titulo.contains("proc2"));
+            }
+            _ => panic!("o modal de processos foi fechado"),
+        }
+    }
+
+    /// Ctrl+C fechando um modal comum não pode deixar a próxima confirmação
+    /// da fila parada até o próximo evento de teclado.
+    #[test]
+    fn ctrl_c_abre_a_proxima_confirmacao_da_fila() {
+        let (mut app, _rx) = app_de_teste();
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        app.fila_confirmacoes.push_back(ConfirmRequest {
+            titulo: "primeira".into(),
+            detalhe: "d1".into(),
+            nivel: PermissionLevel::Semi,
+            resposta: tx1,
+        });
+        app.fila_confirmacoes.push_back(ConfirmRequest {
+            titulo: "segunda".into(),
+            detalhe: "d2".into(),
+            nivel: PermissionLevel::Semi,
+            resposta: tx2,
+        });
+        app.modal = Some(Modal::Texto {
+            titulo: "ajuda".into(),
+            linhas: Vec::new(),
+            scroll: 0,
+        });
+        app.tratar_tecla(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        match &app.modal {
+            Some(Modal::Confirmacao(pedido)) => assert_eq!(pedido.titulo, "primeira"),
+            _ => panic!("a confirmação enfileirada não foi aberta"),
+        }
+    }
+
+    /// O workdir informado pelo agente ao retomar uma sessão de outro projeto
+    /// precisa ser refletido na configuração da interface.
+    #[test]
+    fn sessao_ativa_sincroniza_workdir_da_interface() {
+        let dir =
+            std::env::temp_dir().join(format!("kestrel-app-workdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let esperado = std::fs::canonicalize(&dir).unwrap();
+        let (mut app, _rx) = app_de_teste();
+        app.tratar_evento(AgentEvent::SessaoAtiva {
+            id: "s2".into(),
+            titulo: "outro projeto".into(),
+            workdir: dir.display().to_string(),
+        });
+        assert_eq!(app.config.workdir(), esperado);
+        assert!(app.config.agent.pin_workdir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3411,6 +3688,68 @@ mod tests {
                 assert!(t.contains("esforço de raciocínio: high"), "veio: {t}");
             }
             outro => panic!("esperava aviso, veio {outro:?}"),
+        }
+    }
+
+    /// Eventos automáticos de processos (início/fim de comando em segundo
+    /// plano) só atualizam o estado; não podem abrir um modal por cima do que
+    /// o usuário está fazendo nem descartar uma confirmação pendente.
+    #[test]
+    fn atualizacao_automatica_de_processos_nao_abre_modal() {
+        let (mut app, _rx) = app_de_teste();
+        app.modal = Some(Modal::Ajuda {
+            linhas: Vec::new(),
+            scroll: 0,
+        });
+        app.tratar_evento(AgentEvent::ProcessosAtualizados {
+            lista: vec![ProcessoView {
+                id: "proc1".into(),
+                comando: "sleep 10".into(),
+                cwd: "/tmp".into(),
+                estado: crate::events::EstadoProcesso::Executando,
+                codigo_saida: None,
+                iniciado_em: "agora".into(),
+                linhas: 0,
+            }],
+        });
+        assert_eq!(app.processos.len(), 1);
+        assert!(
+            matches!(app.modal, Some(Modal::Ajuda { .. })),
+            "o modal atual foi substituído pelo seletor de processos"
+        );
+    }
+
+    /// Cancelar a escolha de esforço cancela a troca de modelo; um `/effort`
+    /// depois disso não pode aplicar o modelo que ficou pendente.
+    #[test]
+    fn cancelar_esforco_descarta_modelo_pendente() {
+        use crate::config::Capability;
+        let (mut app, mut rx) = app_de_teste();
+        let mut entrada = crate::config::ModelEntry::new("nvidia/nemotron-3-ultra-550b");
+        entrada.supports_reasoning = Capability::Sim;
+        entrada.reasoning_efforts = vec!["high".into()];
+        app.config.provider.models = vec![entrada.clone()];
+        app.config.provider.model = entrada.id.clone();
+
+        app.abrir_seletor_modelos(String::new());
+        app.tratar_tecla_modal(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(Modal::Esforco(_))));
+        app.tratar_tecla_modal(KeyEvent::from(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert!(
+            app.modelo_pendente.is_none(),
+            "o modelo cancelado ficou pendente"
+        );
+        assert!(rx.try_recv().is_err(), "nada deveria ter sido aplicado");
+
+        // `/effort` posterior altera somente o esforço do modelo atual.
+        app.executar_comando("/effort");
+        assert!(matches!(app.modal, Some(Modal::Esforco(_))));
+        app.tratar_tecla_modal(KeyEvent::from(KeyCode::Down));
+        app.tratar_tecla_modal(KeyEvent::from(KeyCode::Enter));
+        match rx.try_recv().unwrap() {
+            UiCommand::DefinirEsforco(Some(nivel)) => assert_eq!(nivel, "high"),
+            outro => panic!("comando inesperado: {outro:?}"),
         }
     }
 

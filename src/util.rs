@@ -204,7 +204,8 @@ pub fn redact_secrets(input: &str) -> String {
     let re = RE.get_or_init(|| {
         Regex::new(
             r#"(?ix)(
-                nvapi-[A-Za-z0-9_\-]{4,}
+                -----BEGIN[A-Z\ ]*PRIVATE\ KEY-----[\s\S]*?-----END[A-Z\ ]*PRIVATE\ KEY-----
+              | nvapi-[A-Za-z0-9_\-]{4,}
               | sk-[A-Za-z0-9_\-]{4,}
               | gh[pousr]_[A-Za-z0-9]{16,}
               | github_pat_[A-Za-z0-9_]{20,}
@@ -217,7 +218,8 @@ pub fn redact_secrets(input: &str) -> String {
               | \b(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token
                    |auth[_-]?token|refresh[_-]?token|client[_-]?secret
                    |senha|password|passwd|pwd|authorization)\b
-                \s*[:=]\s*['"]?[^\s'"]{6,}
+                ['"]?\s*[:=]\s*
+                (?:['"][^'"\n]*['"]|(?:bearer\s+)?[^\s'"]{6,})
             )"#,
         )
         .expect("regex de redação válida")
@@ -234,6 +236,20 @@ pub fn formatar_num(n: u64) -> String {
         return format!("{:.1}k", n as f64 / 1000.0);
     }
     format!("{:.1}M", n as f64 / 1_000_000.0)
+}
+
+/// Formata tokens com separador de milhares exato: `390.000`.
+///
+/// Diferente de `formatar_num`, o objetivo aqui é o usuário ver o número real
+/// de contexto usado (não uma aproximação) ocupando pouco espaço.
+pub fn formatar_tokens(n: u64) -> String {
+    let texto = n.to_string();
+    let grupos: Vec<&str> = texto
+        .as_bytes()
+        .rchunks(3)
+        .map(|grupo| std::str::from_utf8(grupo).unwrap_or(&texto))
+        .collect();
+    grupos.into_iter().rev().collect::<Vec<_>>().join(".")
 }
 
 /// Formata bytes de forma legível.
@@ -326,7 +342,10 @@ pub fn normalize_path(path: &Path) -> PathBuf {
         match comp {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                if !out.pop() {
+                // `pop()` falha na raiz (`/`), mas empilhar `..` ali criava
+                // `/..` — um caminho que não é raiz para `starts_with`, o que
+                // furava as checagens de escopo. Na raiz, `..` é a própria raiz.
+                if !out.pop() && !out.has_root() {
                     out.push("..");
                 }
             }
@@ -361,6 +380,15 @@ mod tests {
         assert_eq!(formatar_num(999), "999");
         assert_eq!(formatar_num(12400), "12.4k");
         assert_eq!(formatar_num(2_470_000), "2.5M");
+    }
+
+    #[test]
+    fn formata_tokens_com_separador_exato() {
+        assert_eq!(formatar_tokens(0), "0");
+        assert_eq!(formatar_tokens(999), "999");
+        assert_eq!(formatar_tokens(1_000), "1.000");
+        assert_eq!(formatar_tokens(390_000), "390.000");
+        assert_eq!(formatar_tokens(1_000_000), "1.000.000");
     }
 
     #[test]
@@ -400,6 +428,20 @@ mod tests {
             redact_secrets("cargo build --release"),
             "cargo build --release"
         );
+        // Chaves JSON (com aspas entre o nome e os dois-pontos) e o corpo
+        // inteiro de uma chave privada também não podem vazar.
+        let json = r#"{"api_key": "valor com espaços", "senha": "outro-segredo"}"#;
+        let redigido = redact_secrets(json);
+        assert!(!redigido.contains("valor com espaços"), "{redigido}");
+        assert!(!redigido.contains("outro-segredo"), "{redigido}");
+        let pem =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEcorpo\nsegredo\n-----END RSA PRIVATE KEY-----";
+        let redigido = redact_secrets(pem);
+        assert!(!redigido.contains("MIIEcorpo"), "{redigido}");
+        assert!(!redigido.contains("segredo"), "{redigido}");
+        // O esquema Bearer não pode sobrar depois da palavra-chave.
+        let auth = redact_secrets("authorization: Bearer abcdef1234567890");
+        assert!(!auth.contains("abcdef1234567890"), "{auth}");
     }
 
     #[test]
@@ -408,6 +450,13 @@ mod tests {
             normalize_path(Path::new("/a/b/../c")),
             PathBuf::from("/a/c")
         );
+        // `..` na raiz não pode produzir um caminho que pareça fora dela.
+        assert_eq!(normalize_path(Path::new("/..")), PathBuf::from("/"));
+        assert_eq!(
+            normalize_path(Path::new("/../../etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+        assert_eq!(normalize_path(Path::new("../a")), PathBuf::from("../a"));
     }
 
     #[test]

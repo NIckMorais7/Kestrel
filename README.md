@@ -199,9 +199,11 @@ O espaço reservado é fixo: **6 colunas × 2 linhas**. O PNG é recortado na ca
 opaca, redimensionado para a resolução de pixels dessa área e só então movido
 dentro dela. Assim o Pip **nunca passa de duas linhas** e não cobre a conversa.
 
-A renderização é feita pelo `ratatui-image`, sempre em **halfblocks**
-(`▀`/`▄`) no tamanho fixo de 6×2. Halfblocks evita o “rastro”/duplicação que
-protocolos gráficos estado-dependentes causavam ao redesenhar a animação. A arte
+A renderização usa o `ratatui-image` com o **protocolo gráfico do terminal**
+(Sixel, Kitty ou iTerm2) e só cai para halfblocks quando o terminal não oferece
+nenhum. O PNG é redimensionado uma única vez para a resolução de pixels de 6×2 e
+o quadro é codificado já nessa resolução, sem um segundo resize. A moldura é
+opaca na cor do aplicativo, o que evita “rastro”/duplicação ao animar. A arte
 continua geométrica: a massa branca do gato com a tinta (contorno e olhos)
 vazada; os buracos dos olhos são pintados com a cor de fundo da aplicação, então
 não ficam brancos em terminal claro.
@@ -226,6 +228,26 @@ Limitações documentadas:
 - o fundo do aplicativo é **preto** e o acento é branco, no estilo Claude Code
   (a skin `daylight` mantém um tema claro separado); a conversa não usa caixa, e
   apenas o campo de mensagem e os modais têm cantos arredondados.
+
+## Ícone do Kestrel
+
+O cabeçalho usa o novo ícone oficial (`assets/white_icon_kestrel.png` em fundo
+escuro e `assets/icon_kestrel.png` em fundo claro). A escolha é automática:
+fundo claro usa o ícone preto; fundo escuro usa o ícone branco. Trocar de skin
+troca o ícone junto.
+
+Nas respostas do agente não aparece mais a forma geométrica antes de `Kestrel`.
+
+## Contexto no rodapé
+
+O rodapé inferior mostra o **contexto real do modelo**, não a soma de tokens da
+sessão: usado/total e percentual. Exemplo:
+
+```text
+contexto 390.000/1.000.000 (39%)
+```
+
+Tokens acumulados continuam disponíveis em `/cost`.
 
 ## Raciocínio do modelo (`/thinking`)
 
