@@ -57,46 +57,72 @@ fn caps(
 
 /// Consulta a tabela interna de capacidades.
 ///
-/// A lista foi **verificada contra a API da NVIDIA em 17/10/2026**: cada
-/// modelo abaixo respondeu a uma chamada real de chat completions; os marcados
-/// com `tools = Sim` também executaram uma chamada de função. Modelos que
-/// aparecem em `/v1/models` mas respondem 404 (ou 5xx) ficam de fora — entre
-/// eles `moonshotai/kimi-k2.6`, `meta/llama-3.3-70b-instruct` e quase toda a
-/// família `google/gemma-3*`/`mistralai/*`.
+/// A lista foi **reverificada contra o catálogo público da NVIDIA em
+/// 24/10/2026** (`build.nvidia.com`): todos os modelos abaixo têm **free
+/// endpoint** confirmado e são modelos de chat (texto e/ou imagem) com
+/// ferramentas. Modelos que aparecem em `/v1/models` mas já não respondem
+/// (404/5xx), não têm free endpoint ou não são chat (embeddings, guards,
+/// OCR, ASR, TTS, rerank, geração de imagem/vídeo…) ficam de fora — entre
+/// eles `moonshotai/kimi-k2.6`, `meta/llama-3.3-70b-instruct`,
+/// `mistralai/mistral-large`, `google/gemma-3-12b-it`,
+/// `deepseek-ai/deepseek-r1`, `01-ai/yi-large` e
+/// `nvidia/llama-3.1-nemotron-70b-instruct`.
 ///
-/// Contexto: todos aceitaram prompts de ~100k tokens, por isso `ctx` é 128k.
+/// Como esta tabela é a **única fonte** de modelos aceitos na descoberta
+/// automática (ver [`buscar_modelos`]), ela também funciona como allowlist:
+/// nada de lixo do `/v1/models` entra no catálogo local.
 pub fn known_capabilities(model_id: &str) -> Option<KnownCapabilities> {
     let id = model_id.to_lowercase();
-    // Ordenado do mais capaz ao mais leve. `tools`/`reasoning`/`vision` foram
-    // medidos; `ctx` é 128k (todos aceitaram ~100k tokens de prompt).
     match id.as_str() {
-        // Raciocínio + ferramentas + visão.
+        // ── NVIDIA Nemotron ──────────────────────────────────────────────
+        // Raciocínio + ferramentas + visão (early access, free tier).
         "nvidia/nemotron-3.5-super-vl-120b-a12b" => {
             Some(caps(128_000, true, true, true, &["low", "medium", "high"]))
         }
-        // Raciocínio + ferramentas (o carro-chefe).
+        // Raciocínio + ferramentas (1M de contexto).
         "nvidia/nemotron-3-super-120b-a12b" | "nvidia/nemotron-3-ultra-550b-a55b" => {
             Some(caps(128_000, true, false, true, &["low", "medium", "high"]))
         }
-        // Raciocínio + ferramentas.
+        // Raciocínio + ferramentas (1M de contexto).
         "nvidia/nemotron-3.5-lightning-30b-a3b" => {
             Some(caps(128_000, true, false, true, &["low", "medium", "high"]))
         }
+        // Omni-modal (texto, imagem, vídeo, fala) + raciocínio + ferramentas.
         "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" => {
-            Some(caps(128_000, true, false, true, &["low", "medium", "high"]))
+            Some(caps(128_000, true, true, true, &["low", "medium", "high"]))
         }
-        // Raciocínio + ferramentas: os mais fortes para código.
+        // Texto, raciocínio + ferramentas (contexto 64K).
+        "nvidia/nemotron-3.5-bolt-e4b" => Some(caps(64_000, true, false, true, &[])),
+        // ── Z.ai GLM ────────────────────────────────────────────────────
         "z-ai/glm-5.3" => Some(caps(128_000, true, false, true, &["low", "medium", "high"])),
-        "z-ai/glm-5.3-flash" => Some(caps(128_000, true, false, true, &["low", "medium", "high"])),
+        "z-ai/glm-5.3-flash" => Some(caps(128_000, true, true, true, &["low", "medium", "high"])),
+        // ── StepFun ─────────────────────────────────────────────────────
         "stepfun-ai/step-5-preview" => {
-            Some(caps(128_000, true, false, true, &["low", "medium", "high"]))
+            Some(caps(128_000, true, true, true, &["low", "medium", "high"]))
         }
+        // ── OpenAI (open weights) ────────────────────────────────────────
         "openai/gpt-oss-20b" => Some(caps(128_000, true, false, true, &["low", "medium", "high"])),
-        "meta/muse-glimmer-30b" => Some(caps(128_000, true, false, true, &[])),
-        // Especializado em código, com ferramentas.
+        // ── Meta ────────────────────────────────────────────────────────
+        "meta/muse-glimmer-30b" => Some(caps(128_000, true, true, true, &[])),
+        // ── Poolside ────────────────────────────────────────────────────
+        // Especializado em código, com ferramentas; sem raciocínio explícito.
         "poolside/laguna-xs-2.1" => Some(caps(128_000, true, false, false, &[])),
-        // Raciocínio leve; sem ferramentas confirmadas.
-        "google/gemma-4-31b-it" => Some(caps(128_000, true, false, false, &[])),
+        // ── Google ──────────────────────────────────────────────────────
+        "google/gemma-4-31b-it" => Some(caps(128_000, true, false, true, &[])),
+        // ── MiniMax ─────────────────────────────────────────────────────
+        // Raciocínio sempre ligado; esforços em 5 níveis (low…max).
+        // `none`/desligar NÃO é aceito (a API responde 400).
+        "minimaxai/minimax-m3.1-flash" => Some(caps(
+            128_000,
+            true,
+            true,
+            true,
+            &["low", "medium", "high", "xhigh", "max"],
+        )),
+        // ── DeepSeek ────────────────────────────────────────────────────
+        // Raciocínio com esforço *numérico* (1–100), não low/medium/high:
+        // fica fora do seletor de esforços (o modelo pensa com o padrão).
+        "deepseek-ai/deepseek-v4.1-flash" => Some(caps(128_000, true, true, true, &[])),
         _ => None,
     }
 }
@@ -176,9 +202,23 @@ pub fn merge_discovered(existente: &[ModelEntry], descobertos: Vec<ModelEntry>) 
 /// Teto de bytes do corpo de `/models`.
 const LIMITE_MODELS_BYTES: usize = 16 * 1024 * 1024;
 
+/// Remove do catálogo as entradas **descobertas** que não estão na allowlist
+/// (tabela [`known_capabilities`]). Isso limpa a lista de modelos moribundos,
+/// indisponíveis ou não-chat que uma descoberta antiga do `/v1/models` possa
+/// ter trazido. Entradas manuais nunca são tocadas.
+///
+/// Devolve quantas entradas foram removidas.
+pub fn podar_catalogo(entradas: &mut Vec<ModelEntry>) -> usize {
+    let antes = entradas.len();
+    entradas.retain(|e| e.source == ModelSource::Manual || known_capabilities(&e.id).is_some());
+    antes.saturating_sub(entradas.len())
+}
+
 /// Consulta o endpoint `/models` do provedor (API compatível com OpenAI) e
-/// devolve as entradas descobertas, sem enriquecer nem mesclar — isso fica com
-/// [`merge_discovered`]. A falha de rede ou do endpoint é um erro normal:
+/// devolve as entradas descobertas **que estão na allowlist** (tabela
+/// [`known_capabilities`]) — o `/v1/models` lista centenas de modelos que não
+/// são chat, já foram descontinuados ou não são free endpoints; só o que a
+/// allowlist confirma entra. A falha de rede ou do endpoint é um erro normal:
 /// a atualização automática é silenciosa quando o provedor não responde.
 pub async fn buscar_modelos(base_url: &str, api_key: &str) -> Result<Vec<ModelEntry>, String> {
     let base = base_url.trim_end_matches('/');
@@ -227,8 +267,8 @@ pub async fn buscar_modelos(base_url: &str, api_key: &str) -> Result<Vec<ModelEn
         let Some(id) = item.get("id").and_then(|i| i.as_str()) else {
             continue;
         };
-        if id.trim().is_empty() {
-            continue;
+        if id.trim().is_empty() || known_capabilities(id).is_none() {
+            continue; // fora da allowlist: não é chat/free confirmado
         }
         let mut entrada = ModelEntry::new(id);
         entrada.owned_by = item
@@ -236,7 +276,7 @@ pub async fn buscar_modelos(base_url: &str, api_key: &str) -> Result<Vec<ModelEn
             .and_then(|o| o.as_str())
             .map(str::to_string);
         entradas.push(entrada);
-        if entradas.len() >= 300 {
+        if entradas.len() >= 100 {
             break;
         }
     }
@@ -259,8 +299,22 @@ mod tests {
         assert!(!r.efforts.is_empty());
     }
 
-    /// Modelos que a NVIDIA anuncia mas que respondem 404 não podem voltar ao
-    /// catálogo: o agente pediria um modelo morto a cada turno.
+    /// O MiniMax M3.1 Flash suporta raciocínio com cinco níveis de esforço
+    /// (low, medium, high, xhigh, max) — e *não* aceita `none`.
+    #[test]
+    fn minimax_m3_1_flash_suporta_os_cinco_esforcos() {
+        let c = known_capabilities("minimaxai/minimax-m3.1-flash")
+            .expect("minimax m3.1 flash no catálogo");
+        assert_eq!(c.tools, Capability::Sim);
+        assert_eq!(c.reasoning, Capability::Sim);
+        assert_eq!(c.vision, Capability::Sim);
+        assert_eq!(c.efforts, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert!(!c.efforts.contains(&"none".to_string()));
+    }
+
+    /// Modelos que a NVIDIA anuncia mas que respondem 404, perderam o free
+    /// endpoint ou não são chat não podem voltar ao catálogo: o agente pediria
+    /// um modelo morto (ou inútil) a cada turno.
     #[test]
     fn modelos_mortos_da_nvidia_nao_estao_no_catalogo() {
         for morto in [
@@ -271,10 +325,26 @@ mod tests {
             "deepseek-ai/deepseek-r1",
             "01-ai/yi-large",
             "nvidia/llama-3.1-nemotron-70b-instruct",
+            // Não-chat ou sem free endpoint confirmado:
+            "nvidia/nemotron-3-embed-1b",
+            "nvidia/llama-3.1-nemoguard-8b-content-safety",
+            "nvidia/nvclip",
+            "nvidia/vila",
+            "nvidia/neva-22b",
+            "snowflake/arctic-embed-l",
+            "zyphra/zamba2-7b-instruct",
+            "writer/palmyra-fin-70b-32k",
+            "databricks/dbrx-instruct",
+            "bigcode/starcoder2-15b",
+            "microsoft/kosmos-2",
+            "adept/fuyu-8b",
+            "nvidia/nemotron-4-340b-instruct",
+            "meta/llama2-70b",
+            "ibm/granite-34b-code-instruct",
         ] {
             assert!(
                 known_capabilities(morto).is_none(),
-                "{morto} não responde na API e não deveria constar"
+                "{morto} não deveria constar no catálogo"
             );
         }
     }
@@ -288,18 +358,47 @@ mod tests {
             "z-ai/glm-5.3-flash",
             "stepfun-ai/step-5-preview",
             "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-3-ultra-550b-a55b",
             "nvidia/nemotron-3.5-super-vl-120b-a12b",
             "nvidia/nemotron-3.5-lightning-30b-a3b",
             "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            "nvidia/nemotron-3.5-bolt-e4b",
             "openai/gpt-oss-20b",
             "poolside/laguna-xs-2.1",
             "meta/muse-glimmer-30b",
             "google/gemma-4-31b-it",
+            "minimaxai/minimax-m3.1-flash",
+            "deepseek-ai/deepseek-v4.1-flash",
         ] {
             let c = known_capabilities(vivo).unwrap_or_else(|| panic!("{vivo} sumiu"));
             assert_eq!(c.tools, Capability::Sim, "{vivo}");
             assert_eq!(c.streaming, Capability::Sim, "{vivo}");
         }
+    }
+
+    /// A poda remove só o que foi descoberto e saiu da allowlist; o manual
+    /// fica intacto.
+    #[test]
+    fn poda_remove_descobertos_fora_da_allowlist() {
+        let mut entradas = vec![ModelEntry::new("nvidia/nemotron-3-embed-1b")];
+        let mut manual = ModelEntry::new("org/modelo-manual");
+        manual.source = ModelSource::Manual;
+        entradas.push(manual.clone());
+        entradas.push(ModelEntry::new("minimaxai/minimax-m3.1-flash"));
+
+        let removidos = podar_catalogo(&mut entradas);
+        assert_eq!(removidos, 1);
+        assert!(entradas.iter().any(|e| e.id == "org/modelo-manual"));
+        assert!(
+            entradas
+                .iter()
+                .any(|e| e.id == "minimaxai/minimax-m3.1-flash")
+        );
+        assert!(
+            !entradas
+                .iter()
+                .any(|e| e.id == "nvidia/nemotron-3-embed-1b")
+        );
     }
 
     #[test]
@@ -346,9 +445,10 @@ mod tests {
     }
 
     /// A descoberta consulta `/models` de verdade (servidor local) e devolve
-    /// as entradas com o provedor que as expõe.
+    /// **apenas** o que está na allowlist — o lixo do endpoint (embeddings,
+    /// guards, mortos) fica de fora.
     #[tokio::test]
-    async fn buscar_modelos_le_o_endpoint() {
+    async fn buscar_modelos_le_o_endpoint_e_filtra_allowlist() {
         let ouvinte = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endereco = ouvinte.local_addr().unwrap();
         tokio::spawn(async move {
@@ -368,8 +468,10 @@ mod tests {
                         }
                     }
                     let corpo = r#"{"object":"list","data":[
-                        {"id":"nvidia/nemotron-x","object":"model","owned_by":"nvidia"},
-                        {"id":"org/modelo-y"}
+                        {"id":"minimaxai/minimax-m3.1-flash","object":"model","owned_by":"minimaxai"},
+                        {"id":"nvidia/nemotron-3-embed-1b","object":"model","owned_by":"nvidia"},
+                        {"id":"org/modelo-y","object":"model","owned_by":"org"},
+                        {"id":"01-ai/yi-large","object":"model","owned_by":"01-ai"}
                     ]}"#;
                     let resposta = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
@@ -383,11 +485,10 @@ mod tests {
         });
         let base = format!("http://{endereco}/v1");
         let modelos = buscar_modelos(&base, "chave").await.expect("descoberta");
-        assert_eq!(modelos.len(), 2);
-        assert_eq!(modelos[0].id, "nvidia/nemotron-x");
-        assert_eq!(modelos[0].owned_by.as_deref(), Some("nvidia"));
-        assert_eq!(modelos[1].id, "org/modelo-y");
-        assert_eq!(modelos[1].source, ModelSource::Descoberto);
+        assert_eq!(modelos.len(), 1, "só a allowlist passa: {modelos:?}");
+        assert_eq!(modelos[0].id, "minimaxai/minimax-m3.1-flash");
+        assert_eq!(modelos[0].owned_by.as_deref(), Some("minimaxai"));
+        assert_eq!(modelos[0].source, ModelSource::Descoberto);
     }
 
     /// Endpoint indisponível é um erro de descoberta, não um pânico.

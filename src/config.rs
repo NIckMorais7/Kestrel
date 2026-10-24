@@ -312,7 +312,7 @@ impl Config {
                 );
             }
         };
-        let inteiro: Config = match toml::from_str::<Config>(&texto) {
+        let mut inteiro: Config = match toml::from_str::<Config>(&texto) {
             Ok(cfg) => cfg,
             Err(err) => {
                 // Preserva o original antes de qualquer reescrita.
@@ -333,12 +333,33 @@ impl Config {
                 );
             }
         };
+        // Limpa o catálogo de modelos descobertos que não fazem mais parte da
+        // allowlist (mortos, sem free endpoint ou não-chat que uma descoberta
+        // antiga do `/v1/models` possa ter trazido). Manuais nunca são tocados.
+        let removidos = crate::provider::catalog::podar_catalogo(&mut inteiro.provider.models);
         let avisos = inteiro.validar();
-        if avisos.is_empty() {
-            (inteiro, None)
+        let aviso_poda = if removidos > 0 {
+            Some(format!(
+                "catálogo limpo: {removidos} modelo(s) indisponível(is) ou fora da allowlist \
+                 removido(s) do catalogo. Modelos adicionados manualmente foram preservados."
+            ))
         } else {
-            let lista = avisos.join("; ");
-            (inteiro, Some(format!("verifique a configuração: {lista}")))
+            None
+        };
+        match (avisos.is_empty(), aviso_poda) {
+            (true, None) => (inteiro, None),
+            (true, Some(aviso)) => (inteiro, Some(aviso)),
+            (false, None) => {
+                let lista = avisos.join("; ");
+                (inteiro, Some(format!("verifique a configuração: {lista}")))
+            }
+            (false, Some(aviso)) => {
+                let lista = avisos.join("; ");
+                (
+                    inteiro,
+                    Some(format!("{aviso} verifique a configuração: {lista}")),
+                )
+            }
         }
     }
 

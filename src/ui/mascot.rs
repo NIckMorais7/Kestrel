@@ -195,7 +195,15 @@ impl PipGrafico {
             }
         }
 
-        let fechado = olhos_fechados(&base, escala, deslocamento_x, deslocamento_y);
+        // A cor do pelo vem da imagem redimensionada (antes de qualquer pintura
+        // de olho): amostra o anel ao redor de cada buraco, então a piscada
+        // fecha o olho com o tom *real* do pelo — não branco puro fixo, que
+        // aparecia como um “olho branco” estranho quando o pelo é sombreado.
+        let cor_pelo = [
+            cor_do_pelo(&redimensionada, escala, OLHOS[0]),
+            cor_do_pelo(&redimensionada, escala, OLHOS[1]),
+        ];
+        let fechado = olhos_fechados(&base, escala, deslocamento_x, deslocamento_y, &cor_pelo);
         // Sem isso, o buraco transparente do olho mostra o fundo do terminal:
         // em terminal claro o Pip ficava com “olho branco”.
         pintar_olhos(
@@ -276,29 +284,90 @@ fn cor_de_fundo() -> Rgba<u8> {
 
 /// Pinta os furos dos olhos, já na escala de destino, com uma cor opaca.
 fn pintar_olhos(imagem: &mut RgbaImage, escala: f32, ox: i64, oy: i64, cor: Rgba<u8>) {
+    for olho in OLHOS {
+        pintar_olhos_um(imagem, escala, ox, oy, olho, cor);
+    }
+}
+
+/// Cobre os furos dos olhos com a cor do pelo **real** (amostrada ao redor de
+/// cada buraco). A caixa dos olhos é retangular, mas fica inteiramente dentro
+/// da região branca; preenchê-la só fecha o buraco e não altera o contorno. O
+/// olho some por alguns quadros sem depender do fundo do terminal.
+fn olhos_fechados(
+    base: &RgbaImage,
+    escala: f32,
+    ox: i64,
+    oy: i64,
+    cor_pelo: &[Rgba<u8>; 2],
+) -> RgbaImage {
+    let mut fechado = base.clone();
+    for (i, olho) in OLHOS.iter().enumerate() {
+        pintar_olhos_um(&mut fechado, escala, ox, oy, *olho, cor_pelo[i]);
+    }
+    fechado
+}
+
+/// Pinta um único furo de olho (usado pela piscada).
+fn pintar_olhos_um(
+    imagem: &mut RgbaImage,
+    escala: f32,
+    ox: i64,
+    oy: i64,
+    (x0, y0, x1, y1): (u32, u32, u32, u32),
+    cor: Rgba<u8>,
+) {
     let largura = imagem.width() as i64;
     let altura = imagem.height() as i64;
-    for (x0, y0, x1, y1) in OLHOS {
-        let inicio_x = (ox + (x0 as f32 * escala).round() as i64).clamp(0, largura - 1);
-        let inicio_y = (oy + (y0 as f32 * escala).round() as i64).clamp(0, altura - 1);
-        let fim_x = (ox + (x1 as f32 * escala).round() as i64).clamp(0, largura - 1);
-        let fim_y = (oy + (y1 as f32 * escala).round() as i64).clamp(0, altura - 1);
-        for y in inicio_y..=fim_y {
-            for x in inicio_x..=fim_x {
-                imagem.put_pixel(x as u32, y as u32, cor);
-            }
+    let inicio_x = (ox + (x0 as f32 * escala).round() as i64).clamp(0, largura - 1);
+    let inicio_y = (oy + (y0 as f32 * escala).round() as i64).clamp(0, altura - 1);
+    let fim_x = (ox + (x1 as f32 * escala).round() as i64).clamp(0, largura - 1);
+    let fim_y = (oy + (y1 as f32 * escala).round() as i64).clamp(0, altura - 1);
+    for y in inicio_y..=fim_y {
+        for x in inicio_x..=fim_x {
+            imagem.put_pixel(x as u32, y as u32, cor);
         }
     }
 }
 
-/// Cobre os furos dos olhos com a cor do pelo. A caixa dos olhos é retangular,
-/// mas fica inteiramente dentro da região branca; preenchê-la só fecha o
-/// buraco e não altera o contorno. O olho some por alguns quadros sem depender
-/// do fundo do terminal.
-fn olhos_fechados(base: &RgbaImage, escala: f32, ox: i64, oy: i64) -> RgbaImage {
-    let mut fechado = base.clone();
-    pintar_olhos(&mut fechado, escala, ox, oy, Rgba([255, 255, 255, 255]));
-    fechado
+/// Cor média do pelo ao redor de um buraco de olho, na imagem redimensionada
+/// (pré-pintura). O anel externo à caixa do olho é amostrado; sem nada opaco
+/// por perto, cai num branco neutro.
+fn cor_do_pelo(imagem: &RgbaImage, escala: f32, olho: (u32, u32, u32, u32)) -> Rgba<u8> {
+    let (x0, y0, x1, y1) = olho;
+    let e0 = (x0 as f32 * escala).round() as i64;
+    let e1 = (x1 as f32 * escala).round() as i64;
+    let f0 = (y0 as f32 * escala).round() as i64;
+    let f1 = (y1 as f32 * escala).round() as i64;
+    let margem = 3i64;
+    let inicio_x = (e0 - margem).max(0);
+    let inicio_y = (f0 - margem).max(0);
+    let fim_x = (e1 + margem).min(imagem.width() as i64 - 1);
+    let fim_y = (f1 + margem).min(imagem.height() as i64 - 1);
+    let mut soma = (0u64, 0u64, 0u64);
+    let mut n = 0u64;
+    for y in inicio_y..=fim_y {
+        for x in inicio_x..=fim_x {
+            if x >= e0 && x <= e1 && y >= f0 && y <= f1 {
+                continue; // só o anel externo
+            }
+            let px = imagem.get_pixel(x as u32, y as u32);
+            if px[3] > 0 {
+                soma.0 += u64::from(px[0]);
+                soma.1 += u64::from(px[1]);
+                soma.2 += u64::from(px[2]);
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        return Rgba([245, 245, 245, 255]);
+    }
+    Rgba([
+        (soma.0 / n) as u8,
+        (soma.1 / n) as u8,
+        (soma.2 / n) as u8,
+        255,
+    ])
 }
 
 /// Move a imagem dentro da mesma caixa, preenchendo o espaço vazio com
@@ -407,6 +476,36 @@ mod tests {
             assert!(x0 < x1 && y0 < y1);
             assert!(x1 < CAIXA_LARGURA && y1 < CAIXA_ALTURA);
         }
+    }
+
+    /// A cor do pelo amostrada ao redor do olho acompanha o tom real da
+    /// imagem — não um branco puro fixo. Com o pelo em (220,220,220), a
+    /// piscada fecha o olho com ~220, não 255.
+    #[test]
+    fn cor_do_pelo_amostra_o_anel_externo() {
+        let mut imagem = RgbaImage::from_pixel(40, 40, Rgba([0, 0, 0, 0]));
+        // Pelo cinza-claro opaco ao redor de um buraco retangular transparente
+        // (10,10)-(20,20): o anel externo tem a cor do pelo.
+        for y in 0..40 {
+            for x in 0..40 {
+                let dentro = (10..=20).contains(&x) && (10..=20).contains(&y);
+                if !dentro {
+                    imagem.put_pixel(x, y, Rgba([220, 220, 220, 255]));
+                }
+            }
+        }
+        let cor = cor_do_pelo(&imagem, 1.0, (10, 10, 20, 20));
+        assert!(cor[0] > 200 && cor[0] < 240, "veio: {cor:?}");
+        assert_eq!(cor[3], 255);
+    }
+
+    /// Sem pelo opaco por perto (tudo transparente), cai num branco neutro —
+    /// nunca pânico.
+    #[test]
+    fn cor_do_pelo_vazia_usa_branco_neutro() {
+        let imagem = RgbaImage::from_pixel(20, 20, Rgba([0, 0, 0, 0]));
+        let cor = cor_do_pelo(&imagem, 1.0, (4, 4, 8, 8));
+        assert_eq!(cor, Rgba([245, 245, 245, 255]));
     }
 
     #[test]

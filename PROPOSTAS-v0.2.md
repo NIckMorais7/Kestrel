@@ -142,6 +142,17 @@ gerenciamento avançado de sessões no `/historico` (marcar várias com espaço,
 excluir em lote com confirmação `d`/`s`, sessão atual nunca excluída; exclusão
 atômica no banco com limpeza de tudo associado).
 
+**v0.9.5 — "catálogo limpo e piscada certa"** — *implementado*: a descoberta
+automática do `/v1/models` passou a ser **filtrada por allowlist** (só chat
+com free endpoint confirmado entra — nada de embeddings, guards, OCR, ASR,
+image gen ou modelos descontinuados); na carga da configuração, descobertos
+fora da allowlist são podados (manuais preservados); catálogo interno
+reverificado em 24/10/2026 e ampliado: **MiniMax M3.1 Flash** (raciocínio
+sempre ligado com esforços `low`/`medium`/`high`/`xhigh`/`max`, **não**
+aceita `none`), **DeepSeek V4.1 Flash** (multimodal, raciocínio numérico
+1–100) e **Nemotron 3.5 Bolt E4B**; piscada do Pip usa a cor do pelo
+amostrada da imagem (antes branco puro fixo = “olho branco”).
+
 **v0.9.0 — "nitidez e contexto real"** — *implementado*: Pip em protocolo
 gráfico real, sem segundo resize e sem fantasmas; ícone branco/preto do Kestrel
 no cabeçalho; remoção da forma geométrica antes de `Kestrel` nas respostas;

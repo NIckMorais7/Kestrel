@@ -77,6 +77,28 @@ use `/projetos` dentro da interface (a escolha fica salva na configuração).
 2. Digite a tarefa em linguagem natural e pressione Enter. Exemplos:
    `explique a arquitetura deste projeto`, `corrija o bug do parser e rode os testes`.
 
+### Catálogo de modelos
+
+O catálogo é uma **allowlist curada** dos modelos de chat com free endpoint
+confirmado no provedor (NVIDIA NIM). A descoberta automática (`/model`)
+consulta o `/models` do provedor, mas **só entra na lista o que a allowlist
+confirma**: modelos descontinuados (404), sem free endpoint ou que não são
+chat (embeddings, guards, OCR, ASR, geração de imagem/vídeo…) ficam de fora.
+Na carga da configuração, modelos descobertos que saíram da allowlist são
+removidos automaticamente; **modelos adicionados manualmente nunca são
+tocados**.
+
+Esforços de raciocínio (`/effort`) seguem o que cada modelo aceita:
+
+- Nemotron 3.5 Super VL, 3 Super, 3 Ultra, 3.5 Lightning, 3 Nano Omni,
+  GLM-5.3 (e flash), Step 5 Preview, GPT-OSS-20B: `low`/`medium`/`high`;
+- **MiniMax M3.1 Flash**: `low`/`medium`/`high`/`xhigh`/`max` — o
+  raciocínio é sempre ligado e **não** aceita `none` (a API responde 400);
+- DeepSeek V4.1 Flash: raciocínio numérico (1–100), fora do seletor de
+  esforços (pensa com o padrão);
+- Modelos sem esforços configuráveis (Muse Glimmer, Gemma 4, Laguna, Bolt):
+  pensam com o padrão do modelo.
+
 ## Modos
 
 - **build** (padrão): investiga, planeja, edita arquivos e executa comandos
@@ -212,7 +234,10 @@ O ciclo tem 128 tiques e é determinístico: repouso respirando (e piscando),
 caminhada leve para a esquerda e volta, caminhada leve para a direita e volta,
 repouso de novo. Desde a v0.9.4 os deslocamentos são senoidais — o movimento
 acelera no meio e desacelera nas pontas, sem saltos de posição — e a passada
-da caminhada é suave, então o Pip não “treme” nem parece travado.
+da caminhada é suave, então o Pip não “treme” nem parece travado. Na v0.9.5
+a **piscada** passou a fechar o olho com a cor do pelo amostrada da própria
+imagem (antes usava branco puro fixo, que aparecia como um “olho branco”
+estranho quando o pelo é sombreado).
 
 A partir da v0.5.0, o Pip **não fica mais no rodapé** nem no assistente. Ele
 aparece somente na **recepção de nova sessão**, no chat, junto de instruções
@@ -327,7 +352,8 @@ cwd = "/home/user"
 - **Atualização automática do catálogo**: ao abrir, o Kestrel consulta
   `/models` do provedor em segundo plano e mescla os modelos novos no catálogo
   local, preservando entradas manuais; quando há novidades, um aviso temporário
-  aparece (`modelos novos — veja /model`).
+  aparece (`modelos novos — veja /model`). A descoberta é filtrada pela
+  allowlist: apenas chat/free confirmados entram (veja “Catálogo de modelos”).
 
 ## Dados e privacidade
 
