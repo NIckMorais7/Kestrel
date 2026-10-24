@@ -47,7 +47,11 @@ pub struct EstadoAgente {
 pub struct Compartilhado {
     pub paths: Paths,
     pub store: Store,
-    pub registro: ToolRegistry,
+    /// Registro de ferramentas. `RwLock` assíncrono porque ferramentas de
+    /// servidores MCP entram depois do início (o aperto de mão é assíncrono) e
+    /// porque a execução de uma ferramenta segura a trava entre `await`s —
+    /// com `std::sync::RwLock` isso seria acesso simultâneo ou deadlock.
+    pub registro: Arc<tokio::sync::RwLock<ToolRegistry>>,
     pub processos: Arc<ProcessManager>,
     pub arquivos: Arc<FileRegistry>,
     pub eventos: mpsc::UnboundedSender<AgentEvent>,
@@ -344,6 +348,7 @@ impl Compartilhado {
     pub fn contexto_ferramentas(&self, cancel: CancellationToken) -> ToolContext {
         let config = self.config();
         ToolContext {
+            subagente_tarefa: None,
             workdir: config.workdir(),
             roots: config.allowed_roots(),
             level: config.agent.permission,
@@ -420,7 +425,7 @@ pub fn iniciar(config: Config, paths: Paths, store: Store) -> anyhow::Result<Age
     let comp = Arc::new(Compartilhado {
         paths,
         store,
-        registro: ToolRegistry::novo(),
+        registro: Arc::new(tokio::sync::RwLock::new(ToolRegistry::novo())),
         processos: Arc::new(ProcessManager::new()),
         arquivos: Arc::new(FileRegistry::new()),
         eventos: eventos_tx,
@@ -438,6 +443,29 @@ pub fn iniciar(config: Config, paths: Paths, store: Store) -> anyhow::Result<Age
             },
         }),
     });
+
+    // Servidores MCP: o aperto de mão é assíncrono, então sobe em paralelo à
+    // interface. Cada servidor tem seu próprio tempo; a falha de um não impede
+    // os outros nem a abertura do Kestrel.
+    if !comp.config().mcp.is_empty() {
+        let comp_mcp = comp.clone();
+        let servidores = comp.config().mcp.clone();
+        tokio::spawn(async move {
+            let (descobertas, avisos) = crate::tools::mcp::conectar_todos(&servidores).await;
+            for aviso in avisos {
+                comp_mcp.evento(AgentEvent::Aviso { mensagem: aviso });
+            }
+            if !descobertas.is_empty() {
+                let total = descobertas.len();
+                comp_mcp.registro.write().await.registrar_mcp(descobertas);
+                comp_mcp.evento(AgentEvent::Aviso {
+                    mensagem: format!(
+                        "MCP: {total} ferramentas de servidores locais disponíveis                          (nomes com prefixo `mcp__`)."
+                    ),
+                });
+            }
+        });
+    }
 
     // Estado inicial para a interface (a sessão já existe no banco).
     {
@@ -979,7 +1007,7 @@ async fn executar_turno(
 
         // Orçamento de contexto.
         let sistema = montar_prompt(&comp, &cfg, dossie_ativo.as_deref());
-        let ferramentas = comp.registro.specs_do_modo(cfg.agent.modo);
+        let ferramentas = comp.registro.read().await.specs_do_modo(cfg.agent.modo);
         let usados = context::estimar_prompt(&sistema, &historico, &ferramentas);
         let orcamento = context::OrcamentoContexto::novo(
             cfg.context_window(),
@@ -1309,6 +1337,7 @@ async fn executar_turno(
                 resumo: crate::util::redact_secrets(&resumo),
                 adicoes,
                 remocoes,
+                diff: crate::util::redact_secrets(&conteudo),
             });
         }
 
@@ -1686,6 +1715,7 @@ async fn executar_chamadas(
             id: Some(chamada.id.clone()),
             nome: chamada.name.clone(),
             detalhe: detalhe_chamada(chamada),
+            subagente: ctx.subagente_tarefa.clone(),
         });
     }
 
@@ -1698,11 +1728,14 @@ async fn executar_chamadas(
             .map(|chamada| {
                 let args: Value = serde_json::from_str(&chamada.arguments).unwrap_or(Value::Null);
                 let chamada = chamada.clone();
-                let registro = &comp.registro;
+                // O lock de leitura vive dentro do futuro: precisa continuar
+                // válido durante a execução da ferramenta.
+                let registro = comp.registro.clone();
                 let mut ctx = ctx.clone();
                 ctx.chamada_id = Some(chamada.id.clone());
                 async move {
-                    let resultado = registro.executar(&chamada.name, args, &ctx).await;
+                    let guarda = registro.read().await;
+                    let resultado = guarda.executar(&chamada.name, args, &ctx).await;
                     (chamada, converter(resultado))
                 }
             })
@@ -1715,6 +1748,8 @@ async fn executar_chamadas(
             ctx_local.chamada_id = Some(chamada.id.clone());
             let resultado = comp
                 .registro
+                .read()
+                .await
                 .executar(&chamada.name, args, &ctx_local)
                 .await;
             resultados.push((chamada.clone(), converter(resultado)));
@@ -1872,6 +1907,7 @@ fn registrar_malformadas(
             resumo: format!("argumentos inválidos: {}", crate::util::truncate(&erro, 80)),
             adicoes: 0,
             remocoes: 0,
+            diff: String::new(),
         });
     }
     Ok(())
@@ -1919,13 +1955,22 @@ async fn executar_subagente_interno(
     let mut historico = vec![ChatMessage::user(tarefa.to_string())];
     let ferramentas: Vec<ToolSpec> = comp
         .registro
+        .read()
+        .await
         .specs()
         .into_iter()
         .filter(|f| FERRAMENTAS_SUBAGENTE.contains(&f.name.as_str()))
         .collect();
-    let ctx = comp.contexto_ferramentas(cancel.clone());
+    let mut ctx = comp.contexto_ferramentas(cancel.clone());
     let provider = comp.provider();
     let mut relatorio = String::new();
+    // Rótulo curto e estável do subagente: aparece em cada bloco de ferramenta
+    // dele, para o trabalho delegado ser reconhecível no meio da conversa.
+    let rotulo = crate::util::truncate(tarefa, 40);
+    ctx.subagente_tarefa = Some(rotulo.clone());
+    let _ = eventos.send(AgentEvent::SubagenteIniciado {
+        tarefa: tarefa.to_string(),
+    });
 
     for _ in 0..12 {
         if cancel.is_cancelled() {
@@ -1954,6 +1999,7 @@ async fn executar_subagente_interno(
                             id: None,
                             nome: format!("subagente:{nome}"),
                             detalhe: tarefa.to_string(),
+                            subagente: Some(rotulo.clone()),
                         });
                     }
                 }
@@ -1971,6 +2017,7 @@ async fn executar_subagente_interno(
         if validas.is_empty() && malformadas.is_empty() {
             break;
         }
+        let _ = eventos.send(AgentEvent::SubagenteConcluido { sucesso: true });
         // Chamadas malformadas também precisam de um `tool` result: sem ele o
         // histórico fica inválido para a próxima requisição.
         for (chamada, erro) in malformadas {
@@ -1984,6 +2031,7 @@ async fn executar_subagente_interno(
                 resumo: format!("argumentos inválidos: {}", crate::util::truncate(&erro, 80)),
                 adicoes: 0,
                 remocoes: 0,
+                diff: String::new(),
             });
             historico.push(ChatMessage::tool_result(
                 chamada.id,
@@ -2004,6 +2052,7 @@ async fn executar_subagente_interno(
                     resumo: "ferramenta indisponível para subagentes".into(),
                     adicoes: 0,
                     remocoes: 0,
+                    diff: String::new(),
                 });
                 historico.push(ChatMessage::tool_result(
                     chamada.id,
@@ -2016,7 +2065,14 @@ async fn executar_subagente_interno(
                 continue;
             }
             let args: Value = serde_json::from_str(&chamada.arguments).unwrap_or(Value::Null);
-            let resultado = comp.registro.executar(&chamada.name, args, &ctx).await;
+            let mut ctx_local = ctx.clone();
+            ctx_local.chamada_id = Some(chamada.id.clone());
+            let resultado = comp
+                .registro
+                .read()
+                .await
+                .executar(&chamada.name, args, &ctx_local)
+                .await;
             let (sucesso, texto, resumo, adicoes, remocoes) = match resultado {
                 Ok(saida) => {
                     let texto = if saida.conteudo.trim().is_empty() {
@@ -2047,6 +2103,7 @@ async fn executar_subagente_interno(
                 resumo: crate::util::redact_secrets(&resumo),
                 adicoes,
                 remocoes,
+                diff: String::new(),
             });
             // Segredos não podem voltar ao modelo nem ao relatório.
             let texto = crate::util::redact_secrets(&texto);
@@ -2263,7 +2320,7 @@ mod tests {
         let comp = Arc::new(Compartilhado {
             paths: Paths::with_root("/tmp/kestrel-teste"),
             store,
-            registro: ToolRegistry::novo(),
+            registro: Arc::new(tokio::sync::RwLock::new(ToolRegistry::novo())),
             processos: Arc::new(ProcessManager::new()),
             arquivos: Arc::new(FileRegistry::new()),
             eventos: eventos_tx,

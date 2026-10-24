@@ -19,7 +19,9 @@ use crate::ui::markdown;
 use crate::ui::mascot::{self, AnimacaoPip, EstadoMascote, PipGrafico};
 use crate::ui::{self, theme};
 use crate::util::Paths;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
@@ -42,11 +44,21 @@ pub enum Bloco {
         resumo: Option<String>,
         adicoes: usize,
         remocoes: usize,
+        /// Linhas do diff real, quando a ferramenta as devolveu.
+        diff: Vec<LinhaDiff>,
+        /// Subtarefa do subagente que a chamou, quando não foi o principal.
+        subagente: Option<String>,
     },
     Saida {
         id: Option<String>,
         nome: String,
         linhas: Vec<String>,
+    },
+    /// Cabeçalho de um subagente: a subtarefa que ele está executando.
+    Subagente {
+        tarefa: String,
+        rodando: bool,
+        sucesso: bool,
     },
     Erro {
         mensagem: String,
@@ -54,6 +66,8 @@ pub enum Bloco {
     },
     Aviso(String),
     Turno(String),
+    /// Fio horizontal que abre um turno do usuário.
+    Separador,
     Dossie {
         resumo: String,
         nova_sessao: String,
@@ -69,6 +83,51 @@ pub enum Bloco {
         linhas: Vec<LinhaTarefa>,
         mudancas: bool,
     },
+}
+
+/// Uma linha de diff já classificada (para colorir no chat).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinhaDiff {
+    pub texto: String,
+    pub tipo: TipoLinhaDiff,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TipoLinhaDiff {
+    Contexto,
+    Adicao,
+    Remocao,
+    /// Cabeçalho de arquivo/trecho (`diff --git`, `@@`, `+++`).
+    Meta,
+}
+
+impl LinhaDiff {
+    /// Classifica as linhas de um diff unificado.
+    pub fn de_texto(texto: &str) -> Vec<LinhaDiff> {
+        texto
+            .lines()
+            .map(|l| {
+                let tipo = if l.starts_with("diff --git")
+                    || l.starts_with("index ")
+                    || l.starts_with("--- ")
+                    || l.starts_with("+++ ")
+                    || l.starts_with("@@")
+                {
+                    TipoLinhaDiff::Meta
+                } else if l.starts_with('+') {
+                    TipoLinhaDiff::Adicao
+                } else if l.starts_with('-') {
+                    TipoLinhaDiff::Remocao
+                } else {
+                    TipoLinhaDiff::Contexto
+                };
+                LinhaDiff {
+                    texto: l.to_string(),
+                    tipo,
+                }
+            })
+            .collect()
+    }
 }
 
 /// Linha de subtarefa pronta para exibição.
@@ -97,8 +156,43 @@ impl LinhaTarefa {
 }
 
 impl Bloco {
-    /// Linhas prontas para exibição (o embrulho de texto é feito pelo widget).
+    /// Linhas prontas para exibição, com a trilha lateral colorida aplicada.
     pub fn linhas(&self) -> Vec<Line<'static>> {
+        com_trilha(self.linhas_internas(), self.trilha())
+    }
+
+    /// Trilha lateral que identifica o tipo do bloco pela cor.
+    pub fn trilha(&self) -> theme::Trilha {
+        match self {
+            // Trabalho delegado mantém a cor do subagente: é o que permite
+            // distinguir, num relance, quem fez o quê.
+            Bloco::Ferramenta {
+                subagente: Some(_), ..
+            } => theme::Trilha::Subagente,
+            Bloco::Ferramenta {
+                nome,
+                sucesso,
+                rodando,
+                ..
+            } => {
+                if !*rodando && !*sucesso {
+                    theme::Trilha::Erro
+                } else {
+                    theme::Trilha::da_ferramenta(nome)
+                }
+            }
+            Bloco::Saida { nome, .. } => theme::Trilha::da_ferramenta(nome),
+            Bloco::Subagente { .. } => theme::Trilha::Subagente,
+            Bloco::Erro { .. } => theme::Trilha::Erro,
+            Bloco::Raciocinio(_) => theme::Trilha::Subagente,
+            Bloco::Plano { .. } | Bloco::Tarefas { .. } => theme::Trilha::Shell,
+            Bloco::Separador => theme::Trilha::Leitura,
+            _ => theme::Trilha::Leitura,
+        }
+    }
+
+    /// Conteúdo do bloco, sem a trilha.
+    fn linhas_internas(&self) -> Vec<Line<'static>> {
         match self {
             Bloco::Usuario(texto) => {
                 prefixar_linhas(texto, "❯ ", theme::usuario(), "  ", theme::usuario())
@@ -140,6 +234,8 @@ impl Bloco {
                 resumo,
                 adicoes,
                 remocoes,
+                diff,
+                subagente,
                 ..
             } => {
                 let (marcador, estilo_marcador) = if *rodando {
@@ -153,6 +249,15 @@ impl Bloco {
                     Span::styled(format!("{marcador} "), estilo_marcador),
                     Span::styled(nome.clone(), theme::rotulo()),
                 ];
+                // Ferramenta de subagente: recuada e identificada, para o
+                // trabalho delegado não se misturar com o do agente principal.
+                if let Some(sub) = subagente {
+                    spans.push(Span::styled("  └ ", theme::apagado()));
+                    spans.push(Span::styled(
+                        crate::util::truncate(sub, 40),
+                        Style::default().fg(theme::Trilha::Subagente.cor()),
+                    ));
+                }
                 if !detalhe.is_empty() && detalhe != nome {
                     spans.push(Span::styled(format!("  {detalhe}"), theme::apagado()));
                 }
@@ -168,6 +273,19 @@ impl Bloco {
                         Span::styled("  ⎿  ", theme::apagado()),
                         Span::styled(resumo.clone(), theme::apagado()),
                     ]));
+                }
+                // Diff real, colorido por tipo de linha: é a informação que o
+                // usuário quer conferir sem abrir o arquivo.
+                for linha in diff.iter().filter(|l| l.tipo != TipoLinhaDiff::Contexto) {
+                    let estilo = match linha.tipo {
+                        TipoLinhaDiff::Adicao => theme::sucesso().bg(theme::cor_diff_add()),
+                        TipoLinhaDiff::Remocao => theme::falha().bg(theme::cor_diff_del()),
+                        _ => theme::apagado(),
+                    };
+                    linhas.push(Line::from(Span::styled(
+                        format!("    {}", linha.texto),
+                        estilo,
+                    )));
                 }
                 linhas
             }
@@ -211,9 +329,43 @@ impl Bloco {
                 // Rodapé de turno: uma linha curta e apagada, sem caixa nem
                 // repetição do que o agente já disse.
                 vec![Line::from(vec![
-                    Span::styled("└ ", theme::acento_fraco()),
+                    Span::styled("  └ ", theme::acento_fraco()),
                     Span::styled(texto.clone(), theme::apagado()),
                 ])]
+            }
+            Bloco::Subagente {
+                tarefa,
+                rodando,
+                sucesso,
+            } => {
+                // Cabeçalho do subagente: o que foi delegado, com estado.
+                let rotulo = if *rodando {
+                    "◆ subagente trabalhando"
+                } else if *sucesso {
+                    "◆ subagente concluiu"
+                } else {
+                    "◆ subagente falhou"
+                };
+                let cor = if *rodando {
+                    theme::em_execucao()
+                } else if *sucesso {
+                    theme::sucesso()
+                } else {
+                    theme::falha()
+                };
+                vec![
+                    Line::from(vec![Span::styled(rotulo, cor)]),
+                    Line::from(Span::styled(format!("  └ {tarefa}"), theme::apagado())),
+                ]
+            }
+            Bloco::Separador => {
+                // Fio que abre um turno: dá costura à conversa, que sem isso é
+                // um bloco contínuo de blocos.
+                let largura = 48;
+                vec![Line::from(Span::styled(
+                    "  ".to_string() + &"─".repeat(largura),
+                    Style::default().fg(theme::cor_borda()),
+                ))]
             }
             Bloco::Dossie {
                 resumo,
@@ -339,6 +491,27 @@ fn prefixar_linhas(
         linhas.push(Line::from(Span::styled(primeiro, estilo_primeiro)));
     }
     linhas
+}
+
+/// Aplica a trilha lateral colorida a todas as linhas de um bloco.
+///
+/// A trilha é o que permite varrer a conversa por cor: leitura, escrita,
+/// shell, web, erro e subagente têm cor própria na skin atual. O glifo é
+/// estreito (`▎`) para não deslocar o texto.
+fn com_trilha(linhas: Vec<Line<'static>>, trilha: theme::Trilha) -> Vec<Line<'static>> {
+    let cor = trilha.cor();
+    linhas
+        .into_iter()
+        .map(|mut linha| {
+            let mut spans = vec![Span::styled(
+                theme::GLIFO_TRILHA,
+                ratatui::style::Style::default().fg(cor),
+            )];
+            spans.extend(linha.spans);
+            linha.spans = spans;
+            linha
+        })
+        .collect()
 }
 
 /// Valor associado a um item de seletor.
@@ -497,6 +670,23 @@ pub struct App {
     pub encerrado: bool,
     pub sugestao_sel: usize,
     modelo_pendente: Option<String>,
+    /// Blocos recolhidos (índice em `blocos`). Clica-se no bloco para
+    /// abrir/fechar; começa aberto e o usuário decide o que esconder.
+    pub recolhidos: std::collections::HashSet<usize>,
+    /// Mapa de clique por bloco, preenchido durante o desenho: (índice do
+    /// bloco, área na tela). Sem ele não há como saber em qual bloco o
+    /// mouse foi clicado.
+    pub areas_blocos: Vec<(usize, ratatui::layout::Rect)>,
+    /// Aviso temporário sobreposto no topo da conversa (`(texto, tick de
+    /// expiração)`); Some apenas enquanto visível.
+    pub toast: Option<(String, u64)>,
+    /// Valor animado do medidor de contexto (interpola até `contexto`).
+    /// `0` significa "ainda não animado": o valor real é usado direto.
+    pub contexto_exibido: u32,
+    /// Alvo da rolagem suave: `scroll` caminha até ele em vez de pular.
+    pub scroll_alvo: u16,
+    /// Tick em que o modal atual foi aberto (animação de crescimento).
+    pub modal_desde: Option<u64>,
 }
 
 impl App {
@@ -565,6 +755,12 @@ impl App {
             encerrado: false,
             sugestao_sel: 0,
             modelo_pendente: None,
+            recolhidos: std::collections::HashSet::new(),
+            areas_blocos: Vec::new(),
+            toast: None,
+            contexto_exibido: 0,
+            scroll_alvo: 0,
+            modal_desde: None,
         }
     }
 
@@ -578,8 +774,50 @@ impl App {
             // Mantém a memória sob controle sem perder o que está visível.
             let remover = self.blocos.len() - 500;
             self.blocos.drain(..remover);
+            // Os índices recolhidos são por posição: deslocar junto, senão um
+            // bloco qualquer passaria a abrir/fechar no lugar errado.
+            self.recolhidos = self
+                .recolhidos
+                .iter()
+                .filter_map(|i| i.checked_sub(remover))
+                .collect();
             self.construir_tudo();
         }
+    }
+
+    /// Abre ou fecha um bloco (clique do mouse sobre ele).
+    pub fn alternar_bloco(&mut self, indice: usize) {
+        if self.recolhidos.contains(&indice) {
+            self.recolhidos.remove(&indice);
+        } else {
+            self.recolhidos.insert(indice);
+        }
+        self.reconstruir_do(indice);
+    }
+
+    /// Aviso temporário no topo da conversa (some sozinho).
+    ///
+    /// Confirmações rápidas (skin trocada, pensamento ligado, permissão
+    /// alterada) não precisam virar bloco permanente: a conversa fica limpa e
+    /// a informação continua aparecendo.
+    fn avisar_rapido(&mut self, mensagem: String, tiques: u64) {
+        self.toast = Some((mensagem, self.tick + tiques));
+    }
+
+    /// Valor do medidor de contexto já animado (ou o real, antes da primeira
+    /// interpolação). Mostrar zero com contexto medido seria informar errado.
+    pub fn contexto_animado(&self) -> u32 {
+        if self.contexto_exibido == 0 {
+            self.contexto.0
+        } else {
+            self.contexto_exibido
+        }
+    }
+
+    /// Deslocamento em `linhas` do começo de cada bloco (mesmo índice de
+    /// `blocos`). A UI usa para saber onde cada bloco começa e termina.
+    pub fn marcos(&self) -> &[usize] {
+        &self.marcos
     }
 
     /// Reconstrói as linhas a partir do bloco `inicio` (os anteriores não mudam).
@@ -596,7 +834,18 @@ impl App {
         }
         for i in inicio..self.blocos.len() {
             self.marcos.push(self.linhas.len());
-            self.linhas.extend(self.blocos[i].linhas());
+            if self.recolhidos.contains(&i) {
+                // Recolhido: só a primeira linha (o resumo) aparece.
+                self.linhas.extend(
+                    self.blocos[i]
+                        .linhas()
+                        .into_iter()
+                        .take(1)
+                        .collect::<Vec<_>>(),
+                );
+            } else {
+                self.linhas.extend(self.blocos[i].linhas());
+            }
         }
     }
 
@@ -735,6 +984,8 @@ impl App {
             return;
         }
         let redirecionar = self.turno_ativo;
+        // Fio de abertura do turno: dá costura visual à conversa.
+        self.empurrar_bloco(Bloco::Separador);
         self.empurrar_bloco(Bloco::Usuario(texto.clone()));
         self.seguir_fim = true;
         // Fase inicial do turno, ao lado do Pip: o raciocínio em si só aparece
@@ -754,7 +1005,7 @@ impl App {
         let argumento = partes.next().unwrap_or("").trim().to_string();
         match comando.as_str() {
             "/help" | "/ajuda" => {
-                self.modal = Some(Modal::Ajuda {
+                self.abrir_modal(Modal::Ajuda {
                     linhas: texto_de_ajuda(),
                     scroll: 0,
                 });
@@ -831,10 +1082,13 @@ impl App {
                 };
                 self.definir_raciocinio(novo);
                 let estado = if novo { "visível" } else { "oculto" };
-                self.avisar(format!(
-                    "raciocínio do modelo: {estado}. Quando oculto, o pensamento não aparece \
-                     na conversa — apenas o estado ao lado do Pip."
-                ));
+                self.avisar_rapido(
+                    format!(
+                        "raciocínio do modelo: {estado}. Quando oculto, o pensamento não aparece \
+                         na conversa — apenas o estado ao lado do Pip."
+                    ),
+                    20,
+                );
             }
             "/person" | "/pessoa" | "/comp" => self.executar_person(&argumento),
             "/skin" | "/tema" => {
@@ -865,10 +1119,13 @@ impl App {
                             // Markdown e outros widgets guardam estilos já
                             // resolvidos; reconstruir aplica a nova paleta.
                             self.construir_tudo();
-                            self.avisar(format!(
-                                "skin `{}` aplicada. Use /skin sem argumento para ver as opções.",
-                                theme::skin_atual()
-                            ));
+                            self.avisar_rapido(
+                                format!(
+                                    "skin `{}` aplicada. Use /skin sem argumento para ver as opções.",
+                                    theme::skin_atual()
+                                ),
+                                20,
+                            );
                         }
                         Err(e) => self.avisar(e),
                     }
@@ -876,15 +1133,18 @@ impl App {
             }
             "/permissions" | "/permissoes" => {
                 if argumento.is_empty() {
-                    self.modal = Some(Modal::Permissoes(seletor_permissoes(self.nivel)));
+                    self.abrir_modal(Modal::Permissoes(seletor_permissoes(self.nivel)));
                 } else if let Some(nivel) = PermissionLevel::parse(&argumento) {
                     self.nivel = nivel;
                     let _ = self.cmd_tx.send(UiCommand::DefinirPermissao(nivel));
-                    self.avisar(format!(
-                        "nível de permissão: {} — {}",
-                        nivel.label(),
-                        nivel.description()
-                    ));
+                    self.avisar_rapido(
+                        format!(
+                            "nível de permissão: {} — {}",
+                            nivel.label(),
+                            nivel.description()
+                        ),
+                        20,
+                    );
                 } else {
                     self.avisar(format!(
                         "nível `{argumento}` inválido. Use read, write, semi ou full."
@@ -981,7 +1241,7 @@ impl App {
             }
             "/analyze" | "/analisar" => {
                 let _ = self.cmd_tx.send(UiCommand::AnalisarProjeto);
-                self.avisar("reanalisando o projeto…".into());
+                self.avisar_rapido("reanalisando o projeto…".into(), 15);
             }
             "/processes" | "/processos" => {
                 let _ = self.cmd_tx.send(UiCommand::ListarProcessos);
@@ -1033,7 +1293,7 @@ impl App {
                     self.config.web.engine,
                     contexto
                 );
-                self.modal = Some(Modal::Texto {
+                self.abrir_modal(Modal::Texto {
                     titulo: "Configuração".into(),
                     linhas: markdown::renderizar(&texto),
                     scroll: 0,
@@ -1140,7 +1400,7 @@ impl App {
                 if alvo.is_empty() {
                     self.avisar("uso: `/person remove <nome>`.".into());
                 } else if let Some((comp, _)) = comps::encontrar(&self.paths.comps_dir(), &alvo) {
-                    self.modal = Some(Modal::ConfirmarComp { nome: comp.nome });
+                    self.abrir_modal(Modal::ConfirmarComp { nome: comp.nome });
                 } else {
                     self.avisar(format!(
                         "Comp `{alvo}` não encontrado em {}.",
@@ -1217,7 +1477,7 @@ impl App {
         };
         let mut editor = Editor::novo(50);
         editor.definir_texto(instrucoes);
-        self.modal = Some(Modal::CompEditor {
+        self.abrir_modal(Modal::CompEditor {
             nome: nome_exibicao,
             novo,
             descricao,
@@ -1241,11 +1501,14 @@ impl App {
         let _ = self
             .cmd_tx
             .send(UiCommand::DefinirComp(Some(comp.nome.clone())));
-        self.avisar(format!(
-            "Comp ativo: {} (~{} tokens no system prompt). Vale a partir do próximo turno.",
-            comp.nome,
-            comp.tokens()
-        ));
+        self.avisar_rapido(
+            format!(
+                "Comp ativo: {} (~{} tokens no system prompt). Vale a partir do próximo turno.",
+                comp.nome,
+                comp.tokens()
+            ),
+            20,
+        );
     }
 
     fn desativar_comp(&mut self) {
@@ -1257,7 +1520,7 @@ impl App {
             self.avisar(format!("Comp desativado, mas não foi possível salvar: {e}"));
         }
         let _ = self.cmd_tx.send(UiCommand::DefinirComp(None));
-        self.avisar("Comp desativado; o Kestrel volta ao tom padrão.".into());
+        self.avisar_rapido("Comp desativado; o Kestrel volta ao tom padrão.".into(), 20);
     }
 
     fn ver_comp(&mut self, nome: &str) {
@@ -1290,7 +1553,7 @@ impl App {
                 .lines()
                 .map(|linha| Line::from(Span::styled(linha.to_string(), theme::texto()))),
         );
-        self.modal = Some(Modal::Texto {
+        self.abrir_modal(Modal::Texto {
             titulo: format!("Comp — {}", comp.nome),
             linhas,
             scroll: 0,
@@ -1323,7 +1586,7 @@ impl App {
                 comp.nome
             )),
             Err(e) => {
-                self.modal = Some(Modal::CompEditor {
+                self.abrir_modal(Modal::CompEditor {
                     nome,
                     novo,
                     descricao,
@@ -1369,16 +1632,19 @@ impl App {
     /// Troca o modo de operação e informa o usuário (o agente persiste).
     fn trocar_modo(&mut self, modo: ModoOperacao) {
         if self.modo == modo {
-            self.avisar(format!("o modo já é {}.", modo.label()));
+            self.avisar_rapido(format!("o modo já é {}.", modo.label()), 15);
             return;
         }
         self.modo = modo;
         let _ = self.cmd_tx.send(UiCommand::DefinirModo(modo));
-        self.avisar(format!(
-            "modo de operação: {} — {}",
-            modo.label(),
-            modo.description()
-        ));
+        self.avisar_rapido(
+            format!(
+                "modo de operação: {} — {}",
+                modo.label(),
+                modo.description()
+            ),
+            20,
+        );
     }
 
     fn iniciar_saida(&mut self) {
@@ -1476,7 +1742,7 @@ impl App {
                 linhas.push(Line::from(estilo));
             }
         }
-        self.modal = Some(Modal::Texto {
+        self.abrir_modal(Modal::Texto {
             titulo: "Alterações da sessão".into(),
             linhas,
             scroll: 0,
@@ -1592,7 +1858,7 @@ impl App {
             seletor.sel = posicao;
         }
         seletor.filtro = filtro;
-        self.modal = Some(Modal::Modelos(seletor));
+        self.abrir_modal(Modal::Modelos(seletor));
     }
 
     fn escolher_modelo(&mut self, entrada: &crate::config::ModelEntry) {
@@ -1648,7 +1914,7 @@ impl App {
             Some(modelo) => format!("Esforço de raciocínio — modelo `{modelo}`"),
             None => "Esforço de raciocínio".into(),
         };
-        self.modal = Some(Modal::Esforco(Seletor::novo(
+        self.abrir_modal(Modal::Esforco(Seletor::novo(
             titulo,
             "enter confirma · esc cancela",
             itens,
@@ -1703,7 +1969,7 @@ impl App {
             self.avisar(format!("nenhum resultado para `{termo}`."));
             return;
         }
-        self.modal = Some(Modal::Sessoes(Seletor::novo(
+        self.abrir_modal(Modal::Sessoes(Seletor::novo(
             "Histórico de sessões",
             "enter retoma a sessão escolhida · digite para filtrar · esc cancela",
             itens,
@@ -1739,7 +2005,7 @@ impl App {
             self.avisar("nenhum projeto registrado ainda.".into());
             return;
         }
-        self.modal = Some(Modal::Projetos(Seletor::novo(
+        self.abrir_modal(Modal::Projetos(Seletor::novo(
             "Projetos recentes",
             "enter troca o diretório de trabalho e inicia uma nova sessão · esc cancela",
             itens,
@@ -1752,7 +2018,7 @@ impl App {
             self.avisar("nenhum processo gerenciado no momento.".into());
             return;
         }
-        self.modal = Some(Modal::Processos(Seletor::novo(
+        self.abrir_modal(Modal::Processos(Seletor::novo(
             "Processos",
             "esc fecha",
             itens_processos(&lista),
@@ -1853,7 +2119,12 @@ impl App {
                 }
                 self.acompanhar_fim();
             }
-            AgentEvent::FerramentaIniciada { id, nome, detalhe } => {
+            AgentEvent::FerramentaIniciada {
+                id,
+                nome,
+                detalhe,
+                subagente,
+            } => {
                 self.empurrar_bloco(Bloco::Ferramenta {
                     id,
                     nome,
@@ -1863,6 +2134,8 @@ impl App {
                     resumo: None,
                     adicoes: 0,
                     remocoes: 0,
+                    diff: Vec::new(),
+                    subagente,
                 });
                 self.definir_estado(EstadoMascote::Ferramentas, "executando ferramenta");
                 self.acompanhar_fim();
@@ -1919,6 +2192,7 @@ impl App {
                 resumo,
                 adicoes,
                 remocoes,
+                diff,
             } => {
                 let encontrado = self.localizar_ferramenta(id.as_deref(), &nome);
                 if let Some(i) = encontrado {
@@ -1928,6 +2202,7 @@ impl App {
                         resumo: r,
                         adicoes: a,
                         remocoes: rem,
+                        diff: d,
                         ..
                     } = &mut self.blocos[i]
                     {
@@ -1936,6 +2211,9 @@ impl App {
                         *r = Some(resumo);
                         *a = adicoes;
                         *rem = remocoes;
+                        if !diff.trim().is_empty() {
+                            *d = LinhaDiff::de_texto(&diff);
+                        }
                     }
                     self.reconstruir_do(i);
                 }
@@ -1952,6 +2230,50 @@ impl App {
                     },
                 );
                 // Evento do agente: so arrasta para o fim quem ja estava la.
+                self.acompanhar_fim();
+            }
+            AgentEvent::SubagenteIniciado { tarefa } => {
+                // Grupo do subagente: cabeçalho com a subtarefa. As ferramentas
+                // que ele chamar entram marcadas abaixo dela.
+                self.empurrar_bloco(Bloco::Subagente {
+                    tarefa: crate::util::truncate(&tarefa, 120),
+                    rodando: true,
+                    sucesso: false,
+                });
+                self.definir_estado(EstadoMascote::Ferramentas, "subagente trabalhando");
+                self.acompanhar_fim();
+            }
+            AgentEvent::SubagenteConcluido { sucesso } => {
+                // Fecha o grupo: o último bloco de subagente sai do estado
+                // "rodando" para o resultado final.
+                if let Some(Bloco::Subagente {
+                    rodando,
+                    sucesso: ok,
+                    ..
+                }) = self
+                    .blocos
+                    .iter_mut()
+                    .rev()
+                    .find(|b| matches!(b, Bloco::Subagente { .. }))
+                {
+                    *rodando = false;
+                    *ok = sucesso;
+                    self.construir_tudo();
+                }
+                if self.estado == EstadoMascote::Ferramentas {
+                    self.definir_estado(
+                        if sucesso {
+                            EstadoMascote::Pensando
+                        } else {
+                            EstadoMascote::Erro
+                        },
+                        if sucesso {
+                            "subagente concluiu"
+                        } else {
+                            "subagente falhou"
+                        },
+                    );
+                }
                 self.acompanhar_fim();
             }
             AgentEvent::PlanoAtualizado { objetivo, passos } => {
@@ -2141,10 +2463,11 @@ impl App {
                 self.config.provider.reasoning_effort = esforco.clone();
                 if mudou {
                     match &esforco {
-                        Some(nivel) => self.avisar(format!(
-                            "modelo atual: {modelo} (esforço de raciocínio: {nivel})"
-                        )),
-                        None => self.avisar(format!("modelo atual: {modelo}")),
+                        Some(nivel) => self.avisar_rapido(
+                            format!("modelo atual: {modelo} (esforço de raciocínio: {nivel})"),
+                            20,
+                        ),
+                        None => self.avisar_rapido(format!("modelo atual: {modelo}"), 20),
                     }
                 }
             }
@@ -2214,13 +2537,20 @@ impl App {
             self.modelo_pendente = None;
         }
         self.modal = None;
+        self.modal_desde = None;
+    }
+
+    /// Abre um modal registrando o tick de abertura (animação de crescimento).
+    fn abrir_modal(&mut self, modal: Modal) {
+        self.modal = Some(modal);
+        self.modal_desde = Some(self.tick);
     }
 
     fn proximo_confirmacao(&mut self) {
         if self.modal.is_none()
             && let Some(pedido) = self.fila_confirmacoes.pop_front()
         {
-            self.modal = Some(Modal::Confirmacao(pedido));
+            self.abrir_modal(Modal::Confirmacao(pedido));
         }
     }
 
@@ -2278,16 +2608,16 @@ impl App {
     fn tratar_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.scroll = self.scroll.saturating_sub(3);
+                self.rolar_para(self.scroll.saturating_sub(3));
                 self.seguir_fim = false;
             }
             MouseEventKind::ScrollDown => {
-                self.scroll = self.scroll.saturating_add(3);
+                self.rolar_para(self.scroll.saturating_add(3));
                 // Chegar ao fim pelo mouse volta a acompanhar o estado mais
                 // recente: a conferência final é feita em
                 // `ui::desenhar_conversa`, que conhece a altura real da área.
             }
-            MouseEventKind::Down(_) => {
+            MouseEventKind::Down(botao) => {
                 // Clique no atalho "voltar para o último".
                 if let Some(area) = self.area_voltar
                     && mouse.column >= area.x
@@ -2296,6 +2626,25 @@ impl App {
                     && mouse.row < area.y + area.height
                 {
                     self.ir_para_o_fim();
+                    return;
+                }
+                // Clique num bloco da conversa: abre ou fecha. Só o botão
+                // esquerdo, e só sobre um bloco — clicar em texto não faz
+                // nada, então não há risco de fechar sem querer.
+                if botao == MouseButton::Left {
+                    let alvo = self
+                        .areas_blocos
+                        .iter()
+                        .find(|(_, area)| {
+                            mouse.column >= area.x
+                                && mouse.column < area.x + area.width
+                                && mouse.row >= area.y
+                                && mouse.row < area.y + area.height
+                        })
+                        .map(|(indice, _)| *indice);
+                    if let Some(indice) = alvo {
+                        self.alternar_bloco(indice);
+                    }
                 }
             }
             _ => {}
@@ -2307,6 +2656,13 @@ impl App {
         // O desenho posiciona `scroll` no máximo quando `seguir_fim` é true.
         self.seguir_fim = true;
         self.scroll = u16::MAX;
+        self.scroll_alvo = self.scroll;
+    }
+
+    /// Rola até uma posição, com a escalada suave feita em `tiquetaquear`.
+    fn rolar_para(&mut self, alvo: u16) {
+        self.seguir_fim = false;
+        self.scroll_alvo = alvo;
     }
 
     fn tratar_tecla(&mut self, tecla: KeyEvent) {
@@ -2416,18 +2772,21 @@ impl App {
                 // Shift+Tab alterna o nível de permissão em ciclo.
                 self.nivel = self.nivel.cycle();
                 let _ = self.cmd_tx.send(UiCommand::DefinirPermissao(self.nivel));
-                self.avisar(format!(
-                    "nível de permissão: {} — {}",
-                    self.nivel.label(),
-                    self.nivel.description()
-                ));
+                self.avisar_rapido(
+                    format!(
+                        "nível de permissão: {} — {}",
+                        self.nivel.label(),
+                        self.nivel.description()
+                    ),
+                    20,
+                );
             }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_sub(15);
+                self.rolar_para(self.scroll.saturating_sub(15));
                 self.seguir_fim = false;
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_add(15);
+                self.rolar_para(self.scroll.saturating_add(15));
             }
             KeyCode::Esc => {
                 if self.turno_ativo {
@@ -2440,7 +2799,7 @@ impl App {
                 }
             }
             KeyCode::F(1) => {
-                self.modal = Some(Modal::Ajuda {
+                self.abrir_modal(Modal::Ajuda {
                     linhas: texto_de_ajuda(),
                     scroll: 0,
                 });
@@ -2452,7 +2811,7 @@ impl App {
                 } else {
                     "oculto"
                 };
-                self.avisar(format!("raciocínio do modelo agora está {estado}"));
+                self.avisar_rapido(format!("raciocínio do modelo agora está {estado}"), 20);
             }
             _ => {}
         }
@@ -2641,6 +3000,25 @@ impl App {
     pub fn tiquetaquear(&mut self) -> bool {
         self.tick = self.tick.wrapping_add(1);
         let mut mudou = false;
+        // Aviso temporário: expira sozinho, sem ninguém precisar limpá-lo.
+        if let Some((_, expira)) = &self.toast
+            && self.tick >= *expira
+        {
+            self.toast = None;
+            mudou = true;
+        }
+        // Medidor de contexto: caminha até o valor real em vez de pular. Um
+        // salto de 40 pontos de uma vez parece erro de leitura.
+        if self.contexto_exibido != self.contexto.0 {
+            let distancia = self.contexto.0.abs_diff(self.contexto_exibido);
+            let passo = (distancia / 8).max(1).min(distancia);
+            self.contexto_exibido = if self.contexto.0 > self.contexto_exibido {
+                self.contexto_exibido.saturating_add(passo)
+            } else {
+                self.contexto_exibido.saturating_sub(passo)
+            };
+            mudou = true;
+        }
         if let Some(expira) = self.estado_expira
             && self.tick >= expira
         {
@@ -2670,6 +3048,17 @@ impl App {
         }
         self.pip = novo;
         if self.pip != anterior {
+            mudou = true;
+        }
+        // Rolagem suave: o alvo é onde se quer chegar, `scroll` caminha até lá.
+        if self.scroll != self.scroll_alvo {
+            let distancia = self.scroll.abs_diff(self.scroll_alvo);
+            let passo = (distancia / 2).max(1).min(distancia);
+            self.scroll = if self.scroll_alvo > self.scroll {
+                self.scroll.saturating_add(passo)
+            } else {
+                self.scroll.saturating_sub(passo)
+            };
             mudou = true;
         }
         mudou || self.turno_ativo
@@ -2791,7 +3180,14 @@ fn texto_de_ajuda() -> Vec<Line<'static>> {
         ));
     }
     texto.push_str(
-        "\n## Modos\n\n\
+        "\n## Conversa\n\n\
+         - Cada bloco tem uma **trilha colorida** à esquerda: leitura (azul), escrita (verde), \
+comandos (âmbar), web (ciano), falha (vermelho) e subagente (violeta).\n\
+         - **Clique com o botão esquerdo** sobre um bloco para recolher ou abrir: conversas longas ficam legíveis sem rolar o dia inteiro.\n\
+         - Confirmações rápidas (modo, permissão, modelo, skin, thinking) aparecem como **aviso temporário** no topo e somem sozinhas, sem virar bloco permanente.\n\
+         - O campo de mensagem mostra um **spinner** enquanto o agente trabalha.\n\
+         - O rodapé traz o **medidor de contexto** (blocos + percentual) e um chip com os processos ativos.\n\n\
+         ## Modos\n\n\
          - **build** (padrão): investiga, planeja, edita arquivos e executa comandos conforme o nível de permissão.\n\
          - **chat**: somente conversa e leitura; ferramentas que escrevem, executam ou planejam ficam indisponíveis.\n\
          - Troque com `/chat` e `/agent`; o modo atual aparece no topo da interface e é registrado na auditoria.\n\n\
@@ -2811,6 +3207,9 @@ Um Comp por sessão; as instruções ficam em `~/.config/kestrel/comps/<nome>.to
 Prontas: `mono` (padrão), `kestrel`, `daylight`; skins próprias em `~/.config/kestrel/skins/<nome>.toml` \
 (chaves de cor `#rrggbb`) entram na lista. `KESTREL_SKIN=<nome>` força uma skin só nesta sessão.\n\
          - No editor de Comp: Enter quebra linha, Ctrl+S salva e Esc cancela.\n\n\
+         ## Mouse\n\n\
+         - Clique esquerdo sobre um bloco recolhe/abre\n\
+         - Clique em `↓ voltar para o último` volta a acompanhar o fim da conversa\n\n\
          ## Teclado\n\n\
          - Enter envia; Alt+Enter (ou Shift+Enter) quebra linha\n\
          - Up/Down navega no histórico (ou nas sugestões de comando); Tab ou Enter completam um comando parcial\n\
@@ -2821,6 +3220,11 @@ Prontas: `mono` (padrão), `kestrel`, `daylight`; skins próprias em `~/.config/
          - PageUp/PageDown e a roda do mouse rolam a conversa\n\
          - Rolando para cima você pode ler o histórico à vontade; o canto do campo de mensagem \
 ganha o atalho `↓ voltar para o último` (clique ou role até o fim para voltar a acompanhar)\n\n\
+         ## MCP (servidores locais)\n\n\
+         - Servidores declarados em `[[mcp]]` no `config.toml` são iniciados junto com o Kestrel e suas ferramentas entram na lista do modelo com o prefixo `mcp__<servidor>__<ferramenta>`.\n\
+         - Só stdio: o servidor é um processo filho, sem URL nem porta — não há superfície de rede nova.\n\
+         - Um servidor que falha não impede os outros; o aviso aparece na conversa.\n\
+         - Ferramentas MCP passam pela mesma verificação de permissão e escopo das nativas.\n\n\
          ## Segurança\n\n\
          - Comandos catastróficos são bloqueados em qualquer nível de permissão.\n\
          - Em níveis mais restritos, ações sensíveis pedem confirmação.\n\
@@ -3222,6 +3626,7 @@ mod tests {
             id: Some("call-1".into()),
             nome: "edit_file".into(),
             detalhe: "src/main.rs".into(),
+            subagente: None,
         });
         app.tratar_evento(AgentEvent::FerramentaConcluida {
             id: Some("call-1".into()),
@@ -3230,6 +3635,7 @@ mod tests {
             resumo: "3 linhas alteradas".into(),
             adicoes: 5,
             remocoes: 2,
+            diff: "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,2 +1,2 @@\n-fn velho() {}\n+fn novo() {}".into(),
         });
         match app.blocos.last() {
             Some(Bloco::Ferramenta {
@@ -3258,6 +3664,7 @@ mod tests {
                 id: Some(id.into()),
                 nome: "read_file".into(),
                 detalhe: detalhe.into(),
+                subagente: None,
             });
         }
         app.tratar_evento(AgentEvent::FerramentaConcluida {
@@ -3267,6 +3674,7 @@ mod tests {
             resumo: "b.rs lido".into(),
             adicoes: 0,
             remocoes: 0,
+            diff: String::new(),
         });
         let blocos: Vec<(&str, bool, Option<&str>)> = app
             .blocos
@@ -3589,16 +3997,18 @@ mod tests {
             UiCommand::DefinirModo(ModoOperacao::Chat) => {}
             outro => panic!("comando inesperado: {outro:?}"),
         }
-        match app.blocos.last() {
-            Some(Bloco::Aviso(t)) => assert!(t.contains("chat")),
-            outro => panic!("esperava aviso, veio {outro:?}"),
+        // Confirmações de modo são toasts: somem sozinhas, sem entulhar a
+        // conversa (o histórico do modo fica no cabeçalho e na auditoria).
+        match &app.toast {
+            Some((t, _)) => assert!(t.contains("chat"), "veio: {t}"),
+            outra => panic!("esperava toast de modo, veio {outra:?}"),
         }
         // Repetir o mesmo modo apenas informa, sem reenviar o comando.
         app.entrada.definir_texto("/chat".into());
         app.enviar_entrada();
-        match app.blocos.last() {
-            Some(Bloco::Aviso(t)) => assert!(t.contains("já é chat")),
-            outro => panic!("esperava aviso, veio {outro:?}"),
+        match &app.toast {
+            Some((t, _)) => assert!(t.contains("já é chat"), "veio: {t}"),
+            outra => panic!("esperava toast de modo repetido, veio {outra:?}"),
         }
         assert!(rx.try_recv().is_err());
         app.entrada.definir_texto("/agent".into());
@@ -3646,14 +4056,14 @@ mod tests {
             esforco: None,
         });
         assert_eq!(app.modelo, "nvidia/nemotron-3-ultra-550b");
-        match app.blocos.last() {
-            Some(Bloco::Aviso(t)) => {
+        match &app.toast {
+            Some((t, _)) => {
                 assert!(
                     t.contains("modelo atual: nvidia/nemotron-3-ultra-550b"),
                     "veio: {t}"
                 );
             }
-            outro => panic!("esperava aviso de troca de modelo, veio {outro:?}"),
+            outra => panic!("esperava toast de troca de modelo, veio {outra:?}"),
         }
     }
 
@@ -3683,11 +4093,11 @@ mod tests {
             modelo: "nvidia/nemotron-3-ultra-550b".into(),
             esforco: Some("high".into()),
         });
-        match app.blocos.last() {
-            Some(Bloco::Aviso(t)) => {
+        match &app.toast {
+            Some((t, _)) => {
                 assert!(t.contains("esforço de raciocínio: high"), "veio: {t}");
             }
-            outro => panic!("esperava aviso, veio {outro:?}"),
+            outra => panic!("esperava toast de esforço, veio {outra:?}"),
         }
     }
 
@@ -3806,6 +4216,244 @@ mod tests {
         assert!(
             desenhos > 0,
             "a respiração/piscada precisa desenhar às vezes"
+        );
+    }
+
+    /// Blocos de subagente são agrupados: cabeçalho com a subtarefa, com as
+    /// ferramentas dele marcadas abaixo, e cabeçalho saindo do "rodando".
+    #[test]
+    fn subagente_visivel_agrupa_suas_ferramentas() {
+        let (mut app, _rx) = app_de_teste();
+        app.tratar_evento(AgentEvent::SubagenteIniciado {
+            tarefa: "investigar a API da lib X".into(),
+        });
+        app.tratar_evento(AgentEvent::FerramentaIniciada {
+            id: None,
+            nome: "subagente:read_file".into(),
+            detalhe: "src/lib.rs".into(),
+            subagente: Some("investigar a API da lib X".into()),
+        });
+        app.tratar_evento(AgentEvent::FerramentaConcluida {
+            id: None,
+            nome: "subagente:read_file".into(),
+            sucesso: true,
+            resumo: "leu".into(),
+            adicoes: 0,
+            remocoes: 0,
+            diff: String::new(),
+        });
+        app.tratar_evento(AgentEvent::SubagenteConcluido { sucesso: true });
+
+        let cabecalhos = app
+            .blocos
+            .iter()
+            .filter(|b| matches!(b, Bloco::Subagente { .. }))
+            .count();
+        assert_eq!(cabecalhos, 1, "deveria haver um grupo de subagente");
+        // A ferramenta do subagente carrega a subtarefa (fica recuada no chat).
+        let marcada = app.blocos.iter().any(|b| {
+            matches!(
+                b,
+                Bloco::Ferramenta {
+                    subagente: Some(sub),
+                    ..
+                } if sub.contains("investigar")
+            )
+        });
+        assert!(
+            marcada,
+            "a ferramenta deveria estar marcada com a subtarefa"
+        );
+        // O cabeçalho saiu do estado "rodando".
+        let grupo = app
+            .blocos
+            .iter()
+            .find(|b| matches!(b, Bloco::Subagente { .. }))
+            .expect("grupo do subagente");
+        assert!(
+            matches!(
+                grupo,
+                Bloco::Subagente {
+                    rodando: false,
+                    sucesso: true,
+                    ..
+                }
+            ),
+            "veio: {grupo:?}"
+        );
+    }
+
+    /// Clicar abre/fecha um bloco: o conteúdo recolhido vira uma linha só.
+    #[test]
+    fn clique_abre_e_fecha_bloco() {
+        let (mut app, _rx) = app_de_teste();
+        app.tratar_evento(AgentEvent::FerramentaIniciada {
+            id: Some("c1".into()),
+            nome: "read_file".into(),
+            detalhe: "src/main.rs".into(),
+            subagente: None,
+        });
+        // Saída com várias linhas: recolhido precisa ocupar bem menos.
+        for i in 0..10 {
+            app.tratar_evento(AgentEvent::FerramentaSaida {
+                id: Some("c1".into()),
+                nome: "read_file".into(),
+                linha: format!("linha {i}"),
+            });
+        }
+        let total_antes = app.linhas.len();
+        assert!(total_antes > 5, "o bloco deveria ter várias linhas");
+        // A saída é o último bloco: é ele que se recolhe.
+        let alvo = app.blocos.len() - 1;
+        app.alternar_bloco(alvo);
+        assert!(app.recolhidos.contains(&alvo));
+        let total_recolhido = app.linhas.len();
+        assert!(
+            total_recolhido < total_antes,
+            "recolhido deveria ocupar menos linhas: {total_recolhido} vs {total_antes}"
+        );
+        app.alternar_bloco(alvo);
+        assert!(!app.recolhidos.contains(&alvo));
+        assert_eq!(app.linhas.len(), total_antes, "reabrir volta ao total");
+    }
+
+    /// Ao drenar blocos antigos, os índices recolhidos são deslocados: sem
+    /// isso um bloco qualquer passaria a abrir/fechar no lugar errado.
+    #[test]
+    fn recolhidos_acompanham_a_drenagem() {
+        let (mut app, _rx) = app_de_teste();
+        for i in 0..620 {
+            app.empurrar_bloco(Bloco::Assistente(format!("resposta {i}")));
+        }
+        assert!(app.blocos.len() <= 600, "blocos deveriam ser podados");
+        app.recolhidos.insert(10);
+        app.empurrar_bloco(Bloco::Assistente("mais uma".into()));
+        // 10 - (620 - 500) = 10 - 120 => sai do conjunto (já foi drenado).
+        assert!(!app.recolhidos.contains(&0));
+        assert!(app.recolhidos.iter().all(|i| *i < app.blocos.len()));
+    }
+
+    /// O aviso temporário expira sozinho e some da conversa.
+    #[test]
+    fn toast_expira_sozinho() {
+        let (mut app, _rx) = app_de_teste();
+        app.entrada.definir_texto("/chat".into());
+        app.enviar_entrada();
+        assert!(app.toast.is_some(), "deveria haver um toast");
+        let texto = app.toast.as_ref().unwrap().0.clone();
+        assert!(texto.contains("chat"), "veio: {texto}");
+        // Nenhum bloco de aviso permanente na conversa.
+        assert!(
+            !app.blocos.iter().any(|b| matches!(b, Bloco::Aviso(_))),
+            "confirmação rápida não deve virar bloco permanente"
+        );
+        for _ in 0..30 {
+            app.tiquetaquear();
+        }
+        assert!(app.toast.is_none(), "o toast deveria ter expirado");
+    }
+
+    /// O diff real da ferramenta é classificado linha a linha, para colorir
+    /// somente o que entrou e saiu.
+    #[test]
+    fn diff_e_classificado_por_tipo() {
+        let linhas =
+            LinhaDiff::de_texto("diff --git a/f b/f\n@@ -1 +1 @@\n contexto\n-velho\n+novo");
+        let tipos: Vec<TipoLinhaDiff> = linhas.iter().map(|l| l.tipo).collect();
+        assert_eq!(
+            tipos,
+            vec![
+                TipoLinhaDiff::Meta,
+                TipoLinhaDiff::Meta,
+                TipoLinhaDiff::Contexto,
+                TipoLinhaDiff::Remocao,
+                TipoLinhaDiff::Adicao,
+            ]
+        );
+    }
+
+    /// Cada turno do usuário abre com um fio de separação, dando costura à
+    /// conversa.
+    #[test]
+    fn turno_abre_com_fio_de_separacao() {
+        let (mut app, mut rx) = app_de_teste();
+        app.entrada.definir_texto("primeira tarefa".into());
+        app.enviar_entrada();
+        assert!(matches!(app.blocos[0], Bloco::Separador), "fio primeiro");
+        assert!(matches!(app.blocos[1], Bloco::Usuario(_)));
+        assert!(!rx.try_recv().is_err());
+    }
+
+    /// A trilha identifica o tipo de bloco: leitura, escrita, shell, web,
+    /// erro e subagente têm cor própria.
+    #[test]
+    fn trilha_identifica_o_tipo_do_bloco() {
+        use crate::ui::theme::Trilha;
+        assert_eq!(
+            Bloco::Ferramenta {
+                id: None,
+                nome: "read_file".into(),
+                detalhe: String::new(),
+                rodando: true,
+                sucesso: false,
+                resumo: None,
+                adicoes: 0,
+                remocoes: 0,
+                diff: Vec::new(),
+                subagente: None,
+            }
+            .trilha(),
+            Trilha::Leitura
+        );
+        assert_eq!(
+            Bloco::Ferramenta {
+                id: None,
+                nome: "web_search".into(),
+                detalhe: String::new(),
+                rodando: true,
+                sucesso: false,
+                resumo: None,
+                adicoes: 0,
+                remocoes: 0,
+                diff: Vec::new(),
+                subagente: None,
+            }
+            .trilha(),
+            Trilha::Web
+        );
+        assert_eq!(
+            Bloco::Ferramenta {
+                id: None,
+                nome: "edit_file".into(),
+                detalhe: String::new(),
+                rodando: false,
+                sucesso: false,
+                resumo: None,
+                adicoes: 1,
+                remocoes: 1,
+                diff: Vec::new(),
+                subagente: None,
+            }
+            .trilha(),
+            Trilha::Erro
+        );
+        // Marcado como subagente, a trilha é a do subagente — não a da
+        // ferramenta em si.
+        assert_eq!(
+            Bloco::Ferramenta {
+                id: None,
+                nome: "read_file".into(),
+                detalhe: String::new(),
+                rodando: true,
+                sucesso: false,
+                resumo: None,
+                adicoes: 0,
+                remocoes: 0,
+                diff: Vec::new(),
+                subagente: Some("subtarefa".into()),
+            }
+            .trilha(),
+            Trilha::Subagente
         );
     }
 }

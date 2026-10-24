@@ -34,6 +34,9 @@ struct Renderizador {
     listas: Vec<OpcaoLista>,
     citacao: u16,
     em_codigo: bool,
+    /// Linguagem declarada no bloco de código (```` ```rust ````), exibida na
+    /// moldura do cartão.
+    linguagem_codigo: Option<String>,
     ultima_vazia: bool,
     tabela: Option<Tabela>,
     link_pendente: Option<String>,
@@ -61,6 +64,7 @@ impl Renderizador {
             listas: Vec::new(),
             citacao: 0,
             em_codigo: false,
+            linguagem_codigo: None,
             ultima_vazia: true,
             tabela: None,
             link_pendente: None,
@@ -87,7 +91,8 @@ impl Renderizador {
         }
         if self.citacao > 0 {
             for _ in 0..self.citacao {
-                self.atual.push(Span::styled("▏ ", theme::apagado()));
+                self.atual
+                    .push(Span::styled("▏ ", Style::default().fg(theme::citacao())));
             }
         }
         if self.prefixo_item_pendente {
@@ -143,7 +148,9 @@ impl Renderizador {
                 _ => theme::rotulo(),
             }
         } else if self.citacao > 0 {
-            theme::raciocinio()
+            // Citação: barra colorida (em `garantir_prefixo`) e texto inclinado
+            // e apagado — lê como uma citação, não como resposta do agente.
+            theme::raciocinio().add_modifier(Modifier::ITALIC)
         } else {
             theme::texto()
         };
@@ -281,9 +288,25 @@ impl Renderizador {
                 self.separacao();
                 self.citacao += 1;
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(tipo) => {
                 self.separacao();
                 self.em_codigo = true;
+                self.linguagem_codigo = match tipo {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => {
+                        let limpa = info.trim().to_string();
+                        (!limpa.is_empty()).then_some(limpa)
+                    }
+                    pulldown_cmark::CodeBlockKind::Indented => None,
+                };
+                // Abertura do cartão: moldura arredondada com a linguagem.
+                let rotulo = match &self.linguagem_codigo {
+                    Some(ling) => format!("╭─ {ling} "),
+                    None => "╭────── ".to_string(),
+                };
+                self.linhas.push(Line::from(Span::styled(
+                    rotulo,
+                    Style::default().fg(theme::codigo_borda()),
+                )));
             }
             Tag::List(inicio) => {
                 if self.listas.is_empty() {
@@ -353,6 +376,11 @@ impl Renderizador {
             TagEnd::CodeBlock => {
                 self.em_codigo = false;
                 self.fechar_linha();
+                self.linhas.push(Line::from(Span::styled(
+                    "╰──────",
+                    Style::default().fg(theme::codigo_borda()),
+                )));
+                self.linguagem_codigo = None;
             }
             TagEnd::List(_) => {
                 self.listas.pop();

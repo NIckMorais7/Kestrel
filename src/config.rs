@@ -279,6 +279,8 @@ pub struct Config {
     pub agent: AgentConfig,
     pub ui: UiConfig,
     pub web: WebConfig,
+    /// Servidores MCP locais (subprocessos que expõem ferramentas).
+    pub mcp: Vec<McpServidor>,
 }
 
 impl Config {
@@ -415,6 +417,27 @@ impl Config {
         if self.web.request_timeout_secs == 0 {
             avisos.push("web.request_timeout_secs = 0".into());
         }
+        let mut vistos = std::collections::HashSet::new();
+        for servidor in &self.mcp {
+            if servidor.comando.trim().is_empty() {
+                avisos.push(format!(
+                    "servidor MCP `{}` sem `comando`: ele não será iniciado",
+                    servidor.nome
+                ));
+                continue;
+            }
+            if servidor.nome.trim().is_empty() {
+                avisos.push("servidor MCP sem `nome`: use um nome curto e único".into());
+            }
+            // Nomes repetidos fariam duas ferramentas diferentes dividirem o
+            // mesmo prefixo `mcp__<nome>__`, confundindo o modelo.
+            if !vistos.insert(servidor.nome.trim().to_lowercase()) {
+                avisos.push(format!(
+                    "servidor MCP `{}` repetido: renomeie para não haver colisão de ferramentas",
+                    servidor.nome
+                ));
+            }
+        }
         avisos
     }
 
@@ -505,6 +528,26 @@ impl Config {
             .and_then(|m| m.context_window)
             .unwrap_or(self.agent.default_context_window)
     }
+}
+
+/// Um servidor MCP local que o Kestrel deve subir ao iniciar.
+///
+/// O servidor é um processo filho que fala JSON-RPC 2.0 por stdio — é o
+/// transporte que o protocolo define. Nada aqui cria superfície de rede:
+/// sem URL, sem porta.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct McpServidor {
+    /// Nome curto que identifica o servidor (vira parte do nome da ferramenta).
+    pub nome: String,
+    /// Executável (`npx`, `uvx`, um caminho absoluto…).
+    pub comando: String,
+    pub args: Vec<String>,
+    /// Variáveis de ambiente adicionais do servidor.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Diretório de trabalho do servidor (padrão: o do Kestrel).
+    pub cwd: Option<PathBuf>,
 }
 
 /// Config corrompido: o original é preservado e o usuário é avisado, em vez de

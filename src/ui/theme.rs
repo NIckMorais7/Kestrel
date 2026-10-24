@@ -33,16 +33,44 @@ pub struct Paleta {
     pub acento_fraco: Color,
     pub borda: Color,
     pub borda_ativa: Color,
+    /// Cor da borda do elemento com foco (modal aberto, campo ativo).
+    pub foco: Color,
+    /// Véu aplicado atrás de um modal (`Modifier::DIM` vem junto).
+    pub dim: Color,
     pub usuario: Color,
     pub raciocinio: Color,
+    /// Barra de citação (`▏`) dos blocos citados.
+    pub citacao: Color,
     pub sucesso: Color,
     pub falha: Color,
     pub aviso: Color,
     pub info: Color,
     pub execucao: Color,
+    /// Trilha lateral colorida por tipo de bloco da conversa. Por padrão cada
+    /// uma aponta para um papel já existente — skins próprias ganham cor sem
+    /// declarar nada, e quem quiser cor de verdade sobrescreve no TOML.
+    pub trilha_leitura: Color,
+    pub trilha_escrita: Color,
+    pub trilha_shell: Color,
+    pub trilha_web: Color,
+    pub trilha_erro: Color,
+    pub trilha_subagente: Color,
     pub codigo_fundo: Color,
+    /// Borda do cartão de código (moldura arredondada).
+    pub codigo_borda: Color,
+    /// Fundo das linhas adicionadas/removidas no diff do chat.
+    pub diff_add: Color,
+    pub diff_del: Color,
+    /// Fundo do aviso temporário (toast).
+    pub toast_fundo: Color,
     pub selecao_fundo: Color,
     pub selecao_texto: Color,
+}
+
+impl Default for Paleta {
+    fn default() -> Self {
+        Self::kestrel()
+    }
 }
 
 impl Paleta {
@@ -59,14 +87,27 @@ impl Paleta {
             acento_fraco: Color::Rgb(150, 150, 150),
             borda: Color::Rgb(52, 52, 52),
             borda_ativa: Color::Rgb(180, 180, 180),
+            foco: Color::Rgb(238, 238, 238),
+            dim: Color::Rgb(8, 8, 8),
             usuario: Color::Rgb(238, 238, 238),
             raciocinio: Color::Rgb(150, 150, 150),
+            citacao: Color::Rgb(120, 120, 120),
             sucesso: Color::Rgb(190, 190, 190),
             falha: Color::Rgb(160, 160, 160),
             aviso: Color::Rgb(210, 210, 210),
             info: Color::Rgb(180, 180, 180),
             execucao: Color::Rgb(210, 210, 210),
+            trilha_leitura: Color::Rgb(110, 150, 200),
+            trilha_escrita: Color::Rgb(120, 190, 130),
+            trilha_shell: Color::Rgb(210, 175, 90),
+            trilha_web: Color::Rgb(120, 190, 200),
+            trilha_erro: Color::Rgb(200, 110, 105),
+            trilha_subagente: Color::Rgb(175, 145, 215),
             codigo_fundo: Color::Rgb(32, 32, 32),
+            codigo_borda: Color::Rgb(64, 64, 64),
+            diff_add: Color::Rgb(24, 48, 32),
+            diff_del: Color::Rgb(52, 26, 26),
+            toast_fundo: Color::Rgb(40, 40, 40),
             selecao_fundo: Color::Rgb(225, 225, 225),
             selecao_texto: Color::Rgb(14, 14, 14),
         }
@@ -83,14 +124,28 @@ impl Paleta {
             acento_fraco: Color::Rgb(208, 208, 208),
             borda: Color::Rgb(46, 46, 46),
             borda_ativa: Color::Rgb(255, 255, 255),
+            foco: Color::Rgb(255, 255, 255),
+            dim: Color::Rgb(0, 0, 0),
             usuario: Color::Rgb(255, 255, 255),
             raciocinio: Color::Rgb(168, 168, 168),
+            citacao: Color::Rgb(140, 140, 140),
             sucesso: Color::Rgb(224, 224, 224),
             falha: Color::Rgb(199, 74, 70),
             aviso: Color::Rgb(196, 148, 70),
             info: Color::Rgb(214, 214, 214),
             execucao: Color::Rgb(224, 224, 224),
+            // Monocromático de propósito: a trilha se distingue por luminância.
+            trilha_leitura: Color::Rgb(214, 214, 214),
+            trilha_escrita: Color::Rgb(255, 255, 255),
+            trilha_shell: Color::Rgb(196, 148, 70),
+            trilha_web: Color::Rgb(168, 168, 168),
+            trilha_erro: Color::Rgb(199, 74, 70),
+            trilha_subagente: Color::Rgb(178, 178, 178),
             codigo_fundo: Color::Rgb(18, 18, 18),
+            codigo_borda: Color::Rgb(96, 96, 96),
+            diff_add: Color::Rgb(28, 28, 28),
+            diff_del: Color::Rgb(46, 46, 46),
+            toast_fundo: Color::Rgb(24, 24, 24),
             selecao_fundo: Color::Rgb(255, 255, 255),
             selecao_texto: Color::Rgb(0, 0, 0),
         }
@@ -107,14 +162,27 @@ impl Paleta {
             acento_fraco: Color::Rgb(118, 110, 101),
             borda: Color::Rgb(216, 211, 202),
             borda_ativa: Color::Rgb(28, 27, 25),
+            foco: Color::Rgb(58, 104, 145),
+            dim: Color::Rgb(226, 222, 213),
             usuario: Color::Rgb(33, 31, 28),
             raciocinio: Color::Rgb(118, 111, 103),
+            citacao: Color::Rgb(168, 160, 148),
             sucesso: Color::Rgb(56, 126, 78),
             falha: Color::Rgb(174, 62, 58),
             aviso: Color::Rgb(146, 108, 37),
             info: Color::Rgb(58, 104, 145),
             execucao: Color::Rgb(146, 108, 37),
+            trilha_leitura: Color::Rgb(58, 104, 145),
+            trilha_escrita: Color::Rgb(56, 126, 78),
+            trilha_shell: Color::Rgb(190, 140, 40),
+            trilha_web: Color::Rgb(48, 138, 148),
+            trilha_erro: Color::Rgb(174, 62, 58),
+            trilha_subagente: Color::Rgb(124, 92, 174),
             codigo_fundo: Color::Rgb(241, 238, 231),
+            codigo_borda: Color::Rgb(206, 200, 189),
+            diff_add: Color::Rgb(223, 240, 226),
+            diff_del: Color::Rgb(248, 224, 222),
+            toast_fundo: Color::Rgb(236, 232, 224),
             selecao_fundo: Color::Rgb(28, 27, 25),
             selecao_texto: Color::Rgb(255, 255, 252),
         }
@@ -221,14 +289,27 @@ fn paleta_de_arquivo(caminho: &Path) -> Result<Paleta, String> {
     cor!("acento_fraco", acento_fraco);
     cor!("borda", borda);
     cor!("borda_ativa", borda_ativa);
+    cor!("foco", foco);
+    cor!("dim", dim);
     cor!("usuario", usuario);
     cor!("raciocinio", raciocinio);
+    cor!("citacao", citacao);
     cor!("sucesso", sucesso);
     cor!("falha", falha);
     cor!("aviso", aviso);
     cor!("info", info);
     cor!("execucao", execucao);
+    cor!("trilha_leitura", trilha_leitura);
+    cor!("trilha_escrita", trilha_escrita);
+    cor!("trilha_shell", trilha_shell);
+    cor!("trilha_web", trilha_web);
+    cor!("trilha_erro", trilha_erro);
+    cor!("trilha_subagente", trilha_subagente);
     cor!("codigo_fundo", codigo_fundo);
+    cor!("codigo_borda", codigo_borda);
+    cor!("diff_add", diff_add);
+    cor!("diff_del", diff_del);
+    cor!("toast_fundo", toast_fundo);
     cor!("selecao_fundo", selecao_fundo);
     cor!("selecao_texto", selecao_texto);
     Ok(paleta)
@@ -543,10 +624,103 @@ pub fn botao_negar() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Cor de texto pura (sem estilo): útil para compor fundos próprios.
+pub fn texto_cor() -> Color {
+    com(|p| p.texto)
+}
+
 /// Fundo destacado (código inline, blocos de código).
 pub fn codigo_fundo() -> Color {
     com(|p| p.codigo_fundo)
 }
+
+/// Borda do cartão de código.
+pub fn codigo_borda() -> Color {
+    com(|p| p.codigo_borda)
+}
+
+/// Estilo do fundo escurecido atrás de um modal.
+pub fn veu() -> Style {
+    Style::default()
+        .bg(com(|p| p.dim))
+        .add_modifier(Modifier::DIM)
+}
+
+/// Fundo do aviso temporário (toast).
+pub fn toast_fundo() -> Color {
+    com(|p| p.toast_fundo)
+}
+
+/// Barra de citação (`▏`).
+pub fn citacao() -> Color {
+    com(|p| p.citacao)
+}
+
+/// Fundo das linhas adicionadas no diff do chat.
+pub fn cor_diff_add() -> Color {
+    com(|p| p.diff_add)
+}
+
+/// Fundo das linhas removidas no diff do chat.
+pub fn cor_diff_del() -> Color {
+    com(|p| p.diff_del)
+}
+
+/// Cor da borda/comandos de separação (fio de turno, molduras discretas).
+pub fn cor_borda() -> Color {
+    com(|p| p.borda)
+}
+
+/// Cor da trilha lateral de um bloco da conversa.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trilha {
+    /// Leitura de arquivo, busca, metadados, skills.
+    Leitura,
+    /// Escrita, edição e remoção de arquivos.
+    Escrita,
+    /// Execução de comandos, testes e processos.
+    Shell,
+    /// Web: pesquisa, fetch, download, navegador.
+    Web,
+    /// Falha, bloqueio e negação.
+    Erro,
+    /// Trabalho de um subagente.
+    Subagente,
+}
+
+impl Trilha {
+    /// Cor da trilha na skin atual.
+    pub fn cor(&self) -> Color {
+        com(|p| match self {
+            Trilha::Leitura => p.trilha_leitura,
+            Trilha::Escrita => p.trilha_escrita,
+            Trilha::Shell => p.trilha_shell,
+            Trilha::Web => p.trilha_web,
+            Trilha::Erro => p.trilha_erro,
+            Trilha::Subagente => p.trilha_subagente,
+        })
+    }
+
+    /// Trilha de uma ferramenta pelo nome (usado pelos blocos de ferramenta).
+    pub fn da_ferramenta(nome: &str) -> Trilha {
+        use crate::perm::tool_risk;
+        match tool_risk(nome) {
+            crate::perm::ToolRisk::Leitura => match nome {
+                "web_search" | "fetch_url" | "browser_render" | "download_file" => Trilha::Web,
+                _ => Trilha::Leitura,
+            },
+            crate::perm::ToolRisk::Escrita => Trilha::Escrita,
+            crate::perm::ToolRisk::Interna => Trilha::Leitura,
+            crate::perm::ToolRisk::Sensivel => match nome {
+                "web_search" | "fetch_url" | "browser_render" | "download_file" => Trilha::Web,
+                _ => Trilha::Shell,
+            },
+        }
+    }
+}
+
+/// Glifo da trilha lateral desenhado em cada linha do bloco.
+pub const GLIFO_TRILHA: &str = "▎";
 
 #[cfg(test)]
 mod testes {
@@ -572,6 +746,53 @@ mod testes {
             Paleta::por_nome("kestrel").unwrap().fundo,
             Color::Rgb(14, 14, 14)
         );
+    }
+
+    /// As trilhas são a espinha dorsal da leitura da conversa: precisam ser
+    /// distintas entre si e visíveis sobre o fundo em toda skin.
+    #[test]
+    fn trilhas_sao_distintas_e_visiveis() {
+        instalar_registro(Vec::new());
+        for nome in skins() {
+            let paleta = Paleta::por_nome(&nome).expect("skin pronta");
+            let cores = [
+                paleta.trilha_leitura,
+                paleta.trilha_escrita,
+                paleta.trilha_shell,
+                paleta.trilha_web,
+                paleta.trilha_erro,
+                paleta.trilha_subagente,
+            ];
+            for (i, cor) in cores.iter().enumerate() {
+                assert_ne!(*cor, paleta.fundo, "{nome}: trilha {i} some no fundo");
+                for outra in &cores[i + 1..] {
+                    // Em `mono` a distinção é por luminância; nas demais, cor.
+                    assert_ne!(*cor, *outra, "{nome}: trilhas {i} repetidas");
+                }
+            }
+        }
+    }
+
+    /// Skin própria só declara o que quer: o resto herda a `kestrel`, inclusive
+    /// os papéis novos (trilhas, véu, diff).
+    #[test]
+    fn skin_propria_herda_papeis_novos() {
+        let dir = std::env::temp_dir().join(format!("kestrel-skin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("verde.toml"),
+            "fundo = \"#0a0f0a\"\nsucesso = \"#3f9d4f\"\n",
+        )
+        .unwrap();
+        let paletas = carregar_paletas(&dir);
+        assert_eq!(paletas.len(), 1);
+        let paleta = &paletas[0];
+        assert_eq!(paleta.nome, "verde");
+        assert_eq!(paleta.fundo, Color::Rgb(10, 15, 10));
+        // Papéis não declarados vêm da `kestrel`, não de zero.
+        assert_eq!(paleta.trilha_escrita, Paleta::kestrel().trilha_escrita);
+        assert_eq!(super::veu().bg, Some(Paleta::kestrel().dim));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -277,6 +277,45 @@ O Kestrel começa **no diretório de onde foi chamado**. Fixar um projeto
 abrir sempre nesse diretório — para voltar ao comportamento "onde estou",
 desligue a fixação em `/config` ou apague os dois campos do `config.toml`.
 
+## MCP (servidores locais)
+
+O Kestrel sobe servidores MCP declarados em `~/.config/kestrel/config.toml` e
+expõe as ferramentas deles ao modelo, com o prefixo `mcp__<servidor>__<nome>`:
+
+```toml
+[[mcp]]
+nome = "github"
+comando = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[[mcp]]
+nome = "arquivos"
+comando = "uvx"
+args = ["mcp-server-filesystem", "/caminho/permitido"]
+cwd = "/home/user"
+```
+
+- **Só stdio.** O servidor é um processo filho que morre com o Kestrel: não
+  existe URL, porta nem superfície de rede nova.
+- **Mesmas regras.** Ferramentas MCP passam pela verificação de permissão, pelo
+  escopo de caminhos e pela auditoria, como qualquer ferramenta nativa.
+- **Sem travar.** Um servidor que falha (comando inexistente, aperto de mão
+  estourado) não impede os outros nem a abertura do Kestrel: o aviso aparece na
+  conversa e o resto continua funcionando.
+
+## Conversa
+
+- **Trilha colorida** em cada bloco: leitura, escrita, comandos, web, falha e
+  subagente têm cor própria — a conversa é lida por cor, não por glifo.
+- **Clique esquerdo** sobre um bloco recolhe ou expande: saídas longas ficam em
+  uma linha e abrem quando você quiser conferir.
+- **Avisos temporários** no topo para confirmações rápidas (modo, permissão,
+  modelo, skin, thinking) em vez de blocos permanentes na conversa.
+- **Medidor de contexto** no rodapé, com blocos e percentual, e um chip com os
+  processos ainda em execução.
+- **Subagentes visíveis**: o trabalho delegado abre um grupo com a subtarefa, e
+  cada ferramenta dele aparece recuada e identificada.
+
 ## Dados e privacidade
 
 - Configuração: `~/.config/kestrel/config.toml`

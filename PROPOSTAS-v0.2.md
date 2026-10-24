@@ -122,6 +122,14 @@ sessão, com instruções que somem na primeira mensagem; aviso de “sessão an
 interrompida” removido; progresso no chat com estrela branca fluida; campo de
 mensagem mais baixo e rodapé compacto.
 
+**v0.9.1 — "legível e composto"** — *implementado*: trilha colorida por
+tipo de bloco, blocos recolhíveis por clique, avisos temporários (toast),
+medidor de contexto no rodapé, spinner no campo de mensagem, véu e crescimento
+nos modais, cartão de código com moldura e linguagem, citações hierárquicas,
+diff colorido no chat, subagentes visíveis (grupo com subtarefa e ferramentas
+recuadas) e cliente MCP por stdio (`[[mcp]]` no config, ferramentas
+`mcp__<servidor>__<nome>`).
+
 **v0.9.0 — "nitidez e contexto real"** — *implementado*: Pip em protocolo
 gráfico real, sem segundo resize e sem fantasmas; ícone branco/preto do Kestrel
 no cabeçalho; remoção da forma geométrica antes de `Kestrel` nas respostas;

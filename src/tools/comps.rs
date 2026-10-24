@@ -147,6 +147,7 @@ mod testes {
             web: WebConfig::default(),
             max_saida: 10_000,
             subagente: None,
+            subagente_tarefa: None,
             escopo_processos: String::new(),
             chamada_id: None,
         }

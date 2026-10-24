@@ -157,6 +157,9 @@ pub enum AgentEvent {
         id: Option<String>,
         nome: String,
         detalhe: String,
+        /// Subtarefa do subagente que a chamou; `None` quando é o agente
+        /// principal. Marca o bloco como trabalho delegado.
+        subagente: Option<String>,
     },
     FerramentaSaida {
         id: Option<String>,
@@ -170,6 +173,16 @@ pub enum AgentEvent {
         resumo: String,
         adicoes: usize,
         remocoes: usize,
+        /// Diff unificado, quando a ferramenta produziu um (edições de arquivo).
+        diff: String,
+    },
+    /// Um subagente começou a trabalhar numa subtarefa (abre um grupo).
+    SubagenteIniciado {
+        tarefa: String,
+    },
+    /// O subagente terminou a subtarefa (fecha o grupo).
+    SubagenteConcluido {
+        sucesso: bool,
     },
     PlanoAtualizado {
         objetivo: String,

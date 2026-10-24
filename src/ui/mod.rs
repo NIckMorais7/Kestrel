@@ -205,74 +205,12 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
         height: area.height,
     };
     let largura = interno.width.max(1) as usize;
+    app.areas_blocos.clear();
 
-    // Estado vazio: recepção de nova sessão, no estilo Claude Code. O mascote
-    // aparece aqui (e em nenhum outro lugar da interface), com instruções que
-    // somem junto com ele na primeira mensagem.
+    // Estado vazio: recepção de nova sessão. Card com moldura, o mascote e
+    // sugestões derivadas do estado real — o que não se aplica não aparece.
     if app.blocos.is_empty() {
-        let com_pip = app.config.ui.show_mascot && app.pip_grafico.is_some();
-        let texto_area = if com_pip && interno.width > mascot::COLUNAS + 4 {
-            Rect {
-                x: interno.x + mascot::COLUNAS + 2,
-                y: interno.y,
-                width: interno.width.saturating_sub(mascot::COLUNAS + 2),
-                height: interno.height,
-            }
-        } else {
-            interno
-        };
-        let linhas: Vec<Line<'static>> = vec![
-            Line::default(),
-            Line::from(vec![
-                Span::styled("◆ ", theme::titulo()),
-                Span::styled("Kestrel", theme::titulo()),
-                Span::styled(
-                    format!("  v{}", env!("CARGO_PKG_VERSION")),
-                    theme::apagado(),
-                ),
-            ]),
-            Line::default(),
-            Line::from(Span::styled(
-                "Nova sessão. Descreva a tarefa em linguagem natural.",
-                theme::texto(),
-            )),
-            Line::default(),
-            Line::from(vec![
-                Span::styled("/help", theme::rotulo()),
-                Span::styled("  comandos", theme::apagado()),
-                Span::styled("     /model", theme::rotulo()),
-                Span::styled("  troca o modelo", theme::apagado()),
-                Span::styled("     /person", theme::rotulo()),
-                Span::styled("  personalidades", theme::apagado()),
-            ]),
-            Line::from(vec![
-                Span::styled("/agent", theme::rotulo()),
-                Span::styled("  modo build", theme::apagado()),
-                Span::styled("   /chat", theme::rotulo()),
-                Span::styled("  modo conversa", theme::apagado()),
-                Span::styled("   /skin", theme::rotulo()),
-                Span::styled("  troca a aparência", theme::apagado()),
-            ]),
-        ];
-        f.render_widget(
-            Paragraph::new(Text::from(linhas)).wrap(Wrap { trim: false }),
-            texto_area,
-        );
-        if com_pip && interno.height >= mascot::LINHAS {
-            // Por último: a imagem ocupa 6×2 e não é coberta pelo texto.
-            if let Some(pip) = &app.pip_grafico {
-                pip.desenhar(
-                    f,
-                    Rect {
-                        x: interno.x,
-                        y: interno.y,
-                        width: mascot::COLUNAS.min(interno.width),
-                        height: mascot::LINHAS.min(interno.height),
-                    },
-                    app.pip,
-                );
-            }
-        }
+        desenhar_recepcao(f, app, interno);
         return;
     }
 
@@ -294,6 +232,33 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
         .scroll((scroll, 0));
     f.render_widget(paragrafo, interno);
 
+    // Mapa de clique: qual bloco ocupa qual região da tela. Sem isso, o clique
+    // do mouse não teria como saber onde soltar.
+    let marcos: Vec<usize> = app.marcos().to_vec();
+    let total_linhas = app.linhas.len();
+    for (indice, inicio) in marcos.iter().enumerate() {
+        let altura = marcos
+            .get(indice + 1)
+            .unwrap_or(&total_linhas)
+            .saturating_sub(*inicio);
+        let y = interno.y as i32 + inicio.saturating_sub(scroll as usize) as i32;
+        if y + altura as i32 <= interno.y as i32 || y >= interno.y as i32 + interno.height as i32 {
+            continue; // fora da vista: não é clicável
+        }
+        let altura_visivel = (altura as i32)
+            .min(interno.y as i32 + interno.height as i32 - y)
+            .max(0) as u16;
+        app.areas_blocos.push((
+            indice,
+            Rect {
+                x: interno.x,
+                y: y.max(interno.y as i32) as u16,
+                width: interno.width,
+                height: altura_visivel,
+            },
+        ));
+    }
+
     // Indicador de rolagem quando o usuário saiu do fim.
     if !app.seguir_fim && max_scroll > 0 {
         let indicador = format!(" ↑ {scroll}/{max_scroll} ");
@@ -311,6 +276,126 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
             );
         }
     }
+
+    desenhar_toast(f, app, interno);
+}
+
+/// Recepção de sessão nova: card com moldura, mascote e sugestões reais.
+fn desenhar_recepcao(f: &mut Frame, app: &App, interno: Rect) {
+    let com_pip = app.config.ui.show_mascot && app.pip_grafico.is_some();
+    let texto_area = if com_pip && interno.width > mascot::COLUNAS + 4 {
+        Rect {
+            x: interno.x + mascot::COLUNAS + 2,
+            y: interno.y,
+            width: interno.width.saturating_sub(mascot::COLUNAS + 2),
+            height: interno.height,
+        }
+    } else {
+        interno
+    };
+
+    let mut linhas: Vec<Line<'static>> = vec![
+        Line::default(),
+        Line::from(vec![
+            Span::styled("◆ ", theme::titulo()),
+            Span::styled("Kestrel", theme::titulo()),
+            Span::styled(
+                format!("  v{}", env!("CARGO_PKG_VERSION")),
+                theme::apagado(),
+            ),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "Nova sessão. Descreva a tarefa em linguagem natural.",
+            theme::texto(),
+        )),
+        Line::default(),
+        Line::from(Span::styled("Sugestões para começar:", theme::apagado())),
+    ];
+    // Só o que existe de verdade: prometer um comando que não leva a lugar
+    // nenhum é pior que não sugerir.
+    if !app.sessao_id.is_empty() {
+        linhas.push(Line::from(vec![
+            Span::styled("  /resume", theme::rotulo()),
+            Span::styled("  retomar uma sessão anterior", theme::apagado()),
+        ]));
+    }
+    if !app.skills.is_empty() {
+        linhas.push(Line::from(vec![
+            Span::styled("  /skills", theme::rotulo()),
+            Span::styled(
+                format!("  {} skills instaladas", app.skills.all().len()),
+                theme::apagado(),
+            ),
+        ]));
+    }
+    linhas.push(Line::from(vec![
+        Span::styled("  /help", theme::rotulo()),
+        Span::styled("  todos os comandos", theme::apagado()),
+    ]));
+    linhas.push(Line::from(vec![
+        Span::styled("  /agent", theme::rotulo()),
+        Span::styled("  modo build (trabalha no projeto)", theme::apagado()),
+    ]));
+    linhas.push(Line::from(vec![
+        Span::styled("  /chat", theme::rotulo()),
+        Span::styled("  modo conversa (somente leitura)", theme::apagado()),
+    ]));
+    if let Some(plano) = &app.plano {
+        linhas.push(Line::from(vec![
+            Span::styled("  /plan", theme::rotulo()),
+            Span::styled(
+                format!("  ver o plano «{}»", crate::util::truncate(&plano.0, 32)),
+                theme::apagado(),
+            ),
+        ]));
+    }
+
+    f.render_widget(
+        Paragraph::new(Text::from(linhas)).wrap(Wrap { trim: false }),
+        texto_area,
+    );
+    if com_pip
+        && interno.height >= mascot::LINHAS
+        && let Some(pip) = &app.pip_grafico
+    {
+        pip.desenhar(
+            f,
+            Rect {
+                x: interno.x,
+                y: interno.y,
+                width: mascot::COLUNAS.min(interno.width),
+                height: mascot::LINHAS.min(interno.height),
+            },
+            app.pip,
+        );
+    }
+}
+
+/// Aviso temporário sobreposto no topo da conversa.
+fn desenhar_toast(f: &mut Frame, app: &App, area: Rect) {
+    let Some((texto, _)) = &app.toast else {
+        return;
+    };
+    let conteudo = format!(" {texto} ");
+    let largura = (unicode_width::UnicodeWidthStr::width(conteudo.as_str()) as u16)
+        .min(area.width.saturating_sub(2))
+        .max(1);
+    let destino = Rect {
+        x: area.x + 1,
+        y: area.y,
+        width: largura,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            conteudo,
+            Style::default()
+                .fg(theme::texto_cor())
+                .bg(theme::toast_fundo()),
+        ))),
+        destino,
+    );
 }
 
 /// Fases da estrela: pequena → grande → pequena. O ciclo é rápido o bastante
@@ -368,16 +453,25 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect) {
     // continuam em `/cost`; somar tudo no rodapé fazia parecer que uma pergunta
     // simples consumia 30 mil tokens.
     if app.contexto.1 > 0 {
-        let fracao = app.contexto.0 as f32 / app.contexto.1.max(1) as f32;
-        spans.push(Span::styled(" · contexto ", theme::apagado()));
+        // Medidor em blocos + percentual: a leitura é imediata, sem somar
+        // dígitos. O valor vem de `contexto_exibido`, que interpola até o real.
+        let fracao = app.contexto_animado() as f32 / app.contexto.1.max(1) as f32;
+        let cor = theme::cor_contexto(fracao);
+        let cheios = ((fracao * 8.0).round() as usize).min(8);
+        let mut medidor = String::new();
+        for i in 0..8 {
+            medidor.push(if i < cheios { '▮' } else { '▯' });
+        }
+        spans.push(Span::styled("  contexto ", theme::apagado()));
+        spans.push(Span::styled(medidor, Style::default().fg(cor)));
         spans.push(Span::styled(
             format!(
-                "{}/{} ({:.0}%)",
-                crate::util::formatar_tokens(app.contexto.0 as u64),
+                " {}/{} ({}%)",
+                crate::util::formatar_tokens(app.contexto_animado() as u64),
                 crate::util::formatar_tokens(app.contexto.1 as u64),
-                (fracao * 100.0).round()
+                (fracao * 100.0).round() as i64
             ),
-            Style::default().fg(theme::cor_contexto(fracao)),
+            Style::default().fg(cor),
         ));
     }
     if app.mostrar_raciocinio {
@@ -392,9 +486,13 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect) {
     // Skills saíram do rodapé: para conferir skills existe `/skills`. Só um
     // aviso de processo ativo continua, porque indica trabalho real em curso.
     if ativos > 0 {
+        // Chip: processos ativos são trabalho real em curso e merecem destaque
+        // próprio, não mais um item da lista de textos apagados.
         spans.push(Span::styled(
-            format!(" · processos {ativos}"),
-            theme::apagado(),
+            format!("  ⚙ {ativos} "),
+            Style::default()
+                .fg(theme::em_execucao().fg.unwrap_or(theme::texto_cor()))
+                .bg(theme::superficie_cor()),
         ));
     }
 
@@ -505,8 +603,16 @@ fn desenhar_entrada(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         theme::acento().add_modifier(Modifier::BOLD)
     };
+    // Durante um turno o glifo do prompt vira spinner: a atividade fica ao
+    // lado de onde se digita, sem ocupar linha da conversa.
+    let glifo_prompt: &str = if app.turno_ativo {
+        const SPIINER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        SPIINER[(app.tick as usize) % SPIINER.len()]
+    } else {
+        "❯"
+    };
     f.render_widget(
-        Paragraph::new(Span::styled("❯", estilo_prompt)),
+        Paragraph::new(Span::styled(glifo_prompt, estilo_prompt)),
         Rect {
             x: interno.x,
             y: interno.y,
@@ -635,7 +741,32 @@ fn desenhar_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(modal) = app.modal.as_ref() else {
         return;
     };
+    // Véu: o modal passa a ser o único elemento em foco. Antes o `Clear`
+    // simplesmente apagava o que estava atrás, sem dar sensação de camada.
+    f.render_widget(Block::default().style(theme::veu()), area);
     let area_modal = retangulo_central(area, 84, 70);
+    // Abertura em dois quadros: o modal nasce um pouco menor e cresce até o
+    // tamanho final. Nenhum salto visual.
+    let area_modal = match app.modal_desde {
+        Some(desde) if app.tick.saturating_sub(desde) <= 1 => {
+            let reducao = if app.tick.saturating_sub(desde) == 0 {
+                4
+            } else {
+                2
+            };
+            let largura = area_modal.width.saturating_sub(reducao * 2).max(10);
+            let altura = area_modal.height.saturating_sub(reducao).max(5);
+            let x = area_modal.x + (area_modal.width.saturating_sub(largura)) / 2;
+            let y = area_modal.y + (area_modal.height.saturating_sub(altura)) / 2;
+            Rect {
+                x,
+                y,
+                width: largura,
+                height: altura,
+            }
+        }
+        _ => area_modal,
+    };
     match modal {
         Modal::Confirmacao(pedido) => {
             f.render_widget(Clear, area_modal);
@@ -1170,7 +1301,8 @@ mod tests {
             linhas: 0,
         });
         let tela = desenhar_em(&mut app, 120, 30);
-        assert!(tela.contains("processos 1"));
+        // Chip de processos ativos: `⚙ N`, não uma linha a mais de texto.
+        assert!(tela.contains("⚙ 1"), "tela: {tela}");
         assert!(!tela.contains("skills"));
     }
 
