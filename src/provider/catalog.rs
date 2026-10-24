@@ -7,6 +7,9 @@
 //! capacidade permanece `desconhecido` e a interface informa isso.
 
 use crate::config::{Capability, ModelEntry, ModelSource};
+use futures_util::StreamExt;
+use serde_json::Value;
+use std::time::Duration;
 
 /// Capacidades conhecidas de uma família de modelos.
 #[derive(Clone, Debug)]
@@ -170,6 +173,76 @@ pub fn merge_discovered(existente: &[ModelEntry], descobertos: Vec<ModelEntry>) 
     resultado
 }
 
+/// Teto de bytes do corpo de `/models`.
+const LIMITE_MODELS_BYTES: usize = 16 * 1024 * 1024;
+
+/// Consulta o endpoint `/models` do provedor (API compatível com OpenAI) e
+/// devolve as entradas descobertas, sem enriquecer nem mesclar — isso fica com
+/// [`merge_discovered`]. A falha de rede ou do endpoint é um erro normal:
+/// a atualização automática é silenciosa quando o provedor não responde.
+pub async fn buscar_modelos(base_url: &str, api_key: &str) -> Result<Vec<ModelEntry>, String> {
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{base}/models");
+    let cliente = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(20))
+        .user_agent(format!(
+            "Kestrel/{} (agente de codificação)",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .build()
+        .map_err(|e| format!("cliente HTTP: {e}"))?;
+    let resposta = cliente
+        .get(&url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|e| format!("falha ao consultar {url}: {e}"))?;
+    if !resposta.status().is_success() {
+        return Err(format!(
+            "o provedor respondeu {} em /models",
+            resposta.status()
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    let mut stream = resposta.bytes_stream();
+    while let Some(pedaco) = stream.next().await {
+        let pedaco = pedaco.map_err(|e| format!("leitura da resposta de /models: {e}"))?;
+        if bytes.len().saturating_add(pedaco.len()) > LIMITE_MODELS_BYTES {
+            return Err("resposta de /models grande demais".into());
+        }
+        bytes.extend_from_slice(&pedaco);
+    }
+    let texto =
+        String::from_utf8(bytes).map_err(|_| "resposta de /models não é UTF-8".to_string())?;
+    let corpo: Value =
+        serde_json::from_str(&texto).map_err(|e| format!("resposta inválida de /models: {e}"))?;
+
+    let Some(dados) = corpo.get("data").and_then(|d| d.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut entradas = Vec::new();
+    for item in dados {
+        let Some(id) = item.get("id").and_then(|i| i.as_str()) else {
+            continue;
+        };
+        if id.trim().is_empty() {
+            continue;
+        }
+        let mut entrada = ModelEntry::new(id);
+        entrada.owned_by = item
+            .get("owned_by")
+            .and_then(|o| o.as_str())
+            .map(str::to_string);
+        entradas.push(entrada);
+        if entradas.len() >= 300 {
+            break;
+        }
+    }
+    Ok(entradas)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +343,57 @@ mod tests {
         manual.source = ModelSource::Manual;
         let mesclado = merge_discovered(&[manual], vec![ModelEntry::new("a/b")]);
         assert!(mesclado.iter().any(|m| m.id == "manual/apenas"));
+    }
+
+    /// A descoberta consulta `/models` de verdade (servidor local) e devolve
+    /// as entradas com o provedor que as expõe.
+    #[tokio::test]
+    async fn buscar_modelos_le_o_endpoint() {
+        let ouvinte = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endereco = ouvinte.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut soquete, _)) = ouvinte.accept().await else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut lido = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !lido.windows(4).any(|j| j == b"\r\n\r\n") {
+                        match soquete.read(&mut buf).await {
+                            Ok(0) => return,
+                            Ok(n) => lido.extend_from_slice(&buf[..n]),
+                            Err(_) => return,
+                        }
+                    }
+                    let corpo = r#"{"object":"list","data":[
+                        {"id":"nvidia/nemotron-x","object":"model","owned_by":"nvidia"},
+                        {"id":"org/modelo-y"}
+                    ]}"#;
+                    let resposta = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        corpo.len(),
+                        corpo
+                    );
+                    let _ = soquete.write_all(resposta.as_bytes()).await;
+                    let _ = soquete.flush().await;
+                });
+            }
+        });
+        let base = format!("http://{endereco}/v1");
+        let modelos = buscar_modelos(&base, "chave").await.expect("descoberta");
+        assert_eq!(modelos.len(), 2);
+        assert_eq!(modelos[0].id, "nvidia/nemotron-x");
+        assert_eq!(modelos[0].owned_by.as_deref(), Some("nvidia"));
+        assert_eq!(modelos[1].id, "org/modelo-y");
+        assert_eq!(modelos[1].source, ModelSource::Descoberto);
+    }
+
+    /// Endpoint indisponível é um erro de descoberta, não um pânico.
+    #[tokio::test]
+    async fn buscar_modelos_falha_sem_panico() {
+        let erro = buscar_modelos("http://127.0.0.1:1/v1", "chave").await;
+        assert!(erro.is_err());
     }
 }

@@ -85,6 +85,53 @@ impl Compartilhado {
         let _ = self.eventos.send(evento);
     }
 
+    /// Verifica o catálogo remoto do provedor em segundo plano e mescla os
+    /// modelos novos com o catálogo local, persistindo e avisando a interface.
+    ///
+    /// Só acontece quando algo mudou de verdade; falha de rede, chave ausente
+    /// ou endpoint indisponível passam em silêncio — a atualização automática
+    /// não pode atrapalhar a abertura nem o trabalho do agente.
+    pub fn atualizar_catalogo_async(self: &Arc<Self>) {
+        let cfg = self.config();
+        let Some(chave) = cfg.api_key() else {
+            return;
+        };
+        if cfg.provider.base_url.trim().is_empty() {
+            return;
+        }
+        let base_url = cfg.provider.base_url.clone();
+        let existentes = cfg.provider.models.clone();
+        let comp = Arc::clone(self);
+        tokio::spawn(async move {
+            let Ok(descobertos) = crate::provider::catalog::buscar_modelos(&base_url, &chave).await
+            else {
+                return;
+            };
+            let mesclados = crate::provider::catalog::merge_discovered(&existentes, descobertos);
+            let novos = mesclados
+                .iter()
+                .filter(|m| !existentes.iter().any(|e| e.id == m.id))
+                .count();
+            if novos == 0 && mesclados.len() == existentes.len() {
+                return; // nada mudou: não persiste nem incomoda
+            }
+            {
+                let mut estado = comp.estado.write().expect("estado");
+                estado.config.provider.models = mesclados.clone();
+                if let Err(e) = estado.config.save(&comp.paths) {
+                    let _ = comp.eventos.send(AgentEvent::Aviso {
+                        mensagem: format!("catálogo atualizado, mas falha ao salvar: {e}"),
+                    });
+                    return;
+                }
+            }
+            let _ = comp.eventos.send(AgentEvent::CatalogoAtualizado {
+                modelos: mesclados,
+                novos,
+            });
+        });
+    }
+
     pub fn estado_ui(&self, mensagem: impl Into<String>) {
         self.evento(AgentEvent::Estado {
             mensagem: mensagem.into(),
@@ -466,6 +513,10 @@ pub fn iniciar(config: Config, paths: Paths, store: Store) -> anyhow::Result<Age
             }
         });
     }
+
+    // Catálogo de modelos: atualização automática em segundo plano (a falha
+    // é silenciosa e o resultado só aparece quando há modelos novos).
+    comp.atualizar_catalogo_async();
 
     // Estado inicial para a interface (a sessão já existe no banco).
     {

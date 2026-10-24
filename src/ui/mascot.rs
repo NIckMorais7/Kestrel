@@ -79,28 +79,38 @@ impl AnimacaoPip {
 }
 
 /// Deslocamento da respiração para um tique: ciclo lento de 16 tiques,
-/// com subida e retorno suaves.
+/// com uma onda senoidal — o peito sobe na metade positiva da onda e desce
+/// na negativa, sem salto (o `dy` só pode ser 0 ou 1, mas a transição fica
+/// nos zeros da onda, onde o movimento é mínimo).
 fn respiracao(tique: u64) -> i8 {
-    i8::from((4..12).contains(&(tique % 16)))
+    let angulo = 2.0 * std::f32::consts::PI * ((tique % 16) as f32) / 16.0;
+    i8::from(angulo.sin() > 0.0)
+}
+
+/// Caminhada leve para um lado: onda senoidal de 32 tiques. A posição
+/// horizontal acompanha o seno (acelera no meio, desacelera nas pontas) em
+/// vez de saltar entre duas posições; o `dy` marca a passada (o corpo sobe
+/// levemente no meio de cada passo).
+fn caminhada(fase: u64, inicio: u64, direcao: i8) -> (i8, i8) {
+    let progresso = (fase - inicio) as f32 / 32.0; // 0..1 (ida e volta)
+    let ondulacao = (std::f32::consts::PI * progresso).sin();
+    let dx = (4.0 * ondulacao * f32::from(direcao)).round() as i8;
+    let passo = ((2.0 * std::f32::consts::PI * progresso).sin() > 0.6) as i8;
+    (dx, passo)
 }
 
 /// Quadro do ciclo de animação para um tique.
 ///
-/// O ciclo completo tem 128 tiques. Com a cadência de 120 ms do turno ativo,
-/// isso dá cerca de 15 segundos. A caminhada usa 32 tiques para cada lado
-/// (ida e volta), com passos de 1 px na imagem redimensionada.
+/// O ciclo completo tem 128 tiques. Com a cadência de 80 ms do turno ativo,
+/// isso dá cerca de 10 segundos. A caminhada usa 32 tiques para cada lado
+/// (ida e volta), com deslocamento senoidal na imagem redimensionada — o
+/// movimento é contínuo, sem “saltos” entre posições.
 pub fn quadro_de(tique: u64) -> AnimacaoPip {
-    let fase = (tique % 128) as u32;
+    let fase = tique % 128;
     let (dx, dy) = match fase {
-        32..=39 => (-2, 0),
-        40..=47 => (-4, 0),
-        48..=55 => (-2, 0),
-        56..=63 => (0, 0),
-        64..=71 => (2, 0),
-        72..=79 => (4, 0),
-        80..=87 => (2, 0),
-        88..=95 => (0, 0),
-        // Repouso antes e depois da caminhada.
+        32..=63 => caminhada(fase, 32, -1),
+        64..=95 => caminhada(fase, 64, 1),
+        // Repouso antes e depois da caminhada (respiração).
         _ => (0, respiracao(tique)),
     };
     AnimacaoPip {
@@ -332,14 +342,51 @@ mod tests {
                 piscando: false
             }
         );
+        // Caminhada à esquerda: sai do centro, vai até -4 e volta.
+        assert_eq!(quadro_de(32).dx, 0);
         assert_eq!(quadro_de(36).dx, -2);
         assert_eq!(quadro_de(44).dx, -4);
-        assert_eq!(quadro_de(60).dx, 0);
+        assert_eq!(quadro_de(48).dx, -4); // meio da ida
+        assert_eq!(quadro_de(60).dx, -2);
+        assert_eq!(quadro_de(64).dx, 0); // fim da volta
+        // Idem para a direita, simétrica.
         assert_eq!(quadro_de(68).dx, 2);
         assert_eq!(quadro_de(76).dx, 4);
-        assert_eq!(quadro_de(92).dx, 0);
-        assert_eq!(quadro_de(100).dx, 0);
+        assert_eq!(quadro_de(84).dx, 4);
+        assert_eq!(quadro_de(92).dx, 2);
+        assert_eq!(quadro_de(96).dx, 0);
+        assert_eq!(quadro_de(100).dx, 0); // repouso
         assert_eq!(quadro_de(128), quadro_de(0));
+    }
+
+    #[test]
+    fn caminhada_e_simetrica_e_continua() {
+        // A ida à esquerda é o espelho da ida à direita (mesma onda).
+        for p in 0..=31 {
+            let esquerda = quadro_de(32 + p);
+            let direita = quadro_de(64 + p);
+            assert_eq!(esquerda.dx, -direita.dx, "passo {p}");
+        }
+        // Nenhum salto maior que 1 px entre quadros consecutivos.
+        let mut anterior = quadro_de(31).dx;
+        for tique in 32..=95 {
+            let atual = quadro_de(tique).dx;
+            assert!(
+                (atual - anterior).abs() <= 1,
+                "salto em {tique}: {anterior} -> {atual}"
+            );
+            anterior = atual;
+        }
+        // A passada sobe em algum momento e desce em outro (dy varia).
+        let mut viu_zero = false;
+        let mut viu_um = false;
+        for tique in 32..=95 {
+            match quadro_de(tique).dy {
+                0 => viu_zero = true,
+                _ => viu_um = true,
+            }
+        }
+        assert!(viu_zero && viu_um, "a caminhada precisa ter passada");
     }
 
     #[test]

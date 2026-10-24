@@ -130,6 +130,18 @@ diff colorido no chat, subagentes visíveis (grupo com subtarefa e ferramentas
 recuadas) e cliente MCP por stdio (`[[mcp]]` no config, ferramentas
 `mcp__<servidor>__<nome>`).
 
+**v0.9.4 — "fluido e discreto"** — *implementado*: animação do Pip corrigida
+(deslocamentos senoidais, sem saltos; passada suave — o diagnóstico era o
+salto de posição, que parecia travamento); estrela de progresso removida do
+chat (trabalho fica no spinner do campo e no estado do rodapé); indicador de
+atividade inferior discreto (ponto `·` fixo, sem pulso); barrinhas de contexto
+`▮▯` removidas (só texto usado/total); cabeçalho e rodapé com textos mais
+apagados; atualização automática do catálogo de modelos (consulta `/models` do
+provedor em segundo plano, mescla preservando manuais, avisa quando há novos);
+gerenciamento avançado de sessões no `/historico` (marcar várias com espaço,
+excluir em lote com confirmação `d`/`s`, sessão atual nunca excluída; exclusão
+atômica no banco com limpeza de tudo associado).
+
 **v0.9.0 — "nitidez e contexto real"** — *implementado*: Pip em protocolo
 gráfico real, sem segundo resize e sem fantasmas; ícone branco/preto do Kestrel
 no cabeçalho; remoção da forma geométrica antes de `Kestrel` nas respostas;

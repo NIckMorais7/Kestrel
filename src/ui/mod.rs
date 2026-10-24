@@ -91,19 +91,8 @@ pub fn desenhar(f: &mut Frame, app: &mut App) {
     ])
     .areas(area);
 
-    // Durante o turno, uma linha do chat vira linha de progresso: a estrela
-    // branca aparece ali, acima do campo, sem cobrir o texto da conversa.
-    let (corpo, linha_progresso) = if app.turno_ativo && corpo.height >= 3 {
-        let [conversa, linha] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(corpo);
-        (conversa, Some(linha))
-    } else {
-        (corpo, None)
-    };
-
     desenhar_cabecalho(f, app, cabecalho);
     desenhar_conversa(f, app, corpo);
-    desenhar_progresso_estrela(f, app, linha_progresso);
     desenhar_entrada(f, app, area_entrada);
     desenhar_sugestoes(f, app, area_entrada);
     desenhar_status(f, app, status);
@@ -141,7 +130,7 @@ fn desenhar_cabecalho(f: &mut Frame, app: &App, area: Rect) {
     titulo.push(Span::styled("   ", theme::apagado()));
     titulo.push(Span::styled(
         crate::util::truncate(&app.modelo, 42),
-        theme::texto(),
+        theme::apagado(),
     ));
     if let Some(esforco) = &app.esforco {
         titulo.push(Span::styled(format!(" · {esforco}"), theme::apagado()));
@@ -170,7 +159,7 @@ fn desenhar_cabecalho(f: &mut Frame, app: &App, area: Rect) {
     ));
     if let Some(comp) = &app.config.ui.active_comp {
         contexto.push(Span::styled(" · comp ", theme::apagado()));
-        contexto.push(Span::styled(comp.clone(), theme::titulo()));
+        contexto.push(Span::styled(comp.clone(), theme::apagado()));
     }
 
     f.render_widget(
@@ -398,34 +387,6 @@ fn desenhar_toast(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Fases da estrela: pequena → grande → pequena. O ciclo é rápido o bastante
-/// para ficar fluido na cadência de 80 ms, sem piscar.
-fn estrela_progresso(tique: u64) -> &'static str {
-    const FASES: [&str; 10] = ["✧", "✶", "✦", "✪", "✰", "★", "✰", "✪", "✦", "✶"];
-    let fase = ((tique / 2) % FASES.len() as u64) as usize;
-    FASES[fase]
-}
-
-fn desenhar_progresso_estrela(f: &mut Frame, app: &App, area: Option<Rect>) {
-    let Some(area) = area else { return };
-    if !app.turno_ativo || area.height == 0 || area.width < 4 {
-        return;
-    }
-    let linha = Line::from(vec![
-        Span::styled(estrela_progresso(app.tick), theme::acento()),
-        Span::styled(format!("  {}", app.estado_texto), theme::apagado()),
-    ]);
-    f.render_widget(
-        Paragraph::new(linha),
-        Rect {
-            x: area.x + 2,
-            y: area.y,
-            width: area.width.saturating_sub(2),
-            height: 1,
-        },
-    );
-}
-
 fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect) {
     // Rodapé compacto no estilo Claude Code: estado à esquerda, atalhos à
     // direita. O mascote saiu daqui; o progresso agora acontece no chat.
@@ -439,34 +400,20 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect) {
         _ => theme::em_execucao(),
     };
     let mut spans = Vec::new();
-    // O marcador pulsa enquanto há trabalho; parado, fica no acento fixo.
-    spans.push(Span::styled(
-        "● ".to_string(),
-        if app.turno_ativo {
-            theme::pulso(app.tick, true)
-        } else {
-            estilo_estado
-        },
-    ));
+    // Indicador de atividade discreto: um ponto pequeno, fixo — sem pulso.
+    // O estado em si (cor e texto) já comunica o que o agente está fazendo.
+    spans.push(Span::styled("· ", estilo_estado));
     spans.push(Span::styled(app.estado_texto.clone(), estilo_estado));
     // Contexto real do modelo: usado/total e percentual. Tokens acumulados
     // continuam em `/cost`; somar tudo no rodapé fazia parecer que uma pergunta
     // simples consumia 30 mil tokens.
     if app.contexto.1 > 0 {
-        // Medidor em blocos + percentual: a leitura é imediata, sem somar
-        // dígitos. O valor vem de `contexto_exibido`, que interpola até o real.
         let fracao = app.contexto_animado() as f32 / app.contexto.1.max(1) as f32;
         let cor = theme::cor_contexto(fracao);
-        let cheios = ((fracao * 8.0).round() as usize).min(8);
-        let mut medidor = String::new();
-        for i in 0..8 {
-            medidor.push(if i < cheios { '▮' } else { '▯' });
-        }
         spans.push(Span::styled("  contexto ", theme::apagado()));
-        spans.push(Span::styled(medidor, Style::default().fg(cor)));
         spans.push(Span::styled(
             format!(
-                " {}/{} ({}%)",
+                "{}/{} ({}%)",
                 crate::util::formatar_tokens(app.contexto_animado() as u64),
                 crate::util::formatar_tokens(app.contexto.1 as u64),
                 (fracao * 100.0).round() as i64
@@ -486,14 +433,9 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect) {
     // Skills saíram do rodapé: para conferir skills existe `/skills`. Só um
     // aviso de processo ativo continua, porque indica trabalho real em curso.
     if ativos > 0 {
-        // Chip: processos ativos são trabalho real em curso e merecem destaque
-        // próprio, não mais um item da lista de textos apagados.
-        spans.push(Span::styled(
-            format!("  ⚙ {ativos} "),
-            Style::default()
-                .fg(theme::em_execucao().fg.unwrap_or(theme::texto_cor()))
-                .bg(theme::superficie_cor()),
-        ));
+        // Processos ativos: só o número, discreto, junto ao estado — o chip
+        // chamativo saiu para o rodapé não competir com a conversa.
+        spans.push(Span::styled(format!("  ⚙ {ativos}"), theme::apagado()));
     }
 
     // Atalhos à direita. Quando o usuário saiu do fim, o único atalho é o
@@ -812,10 +754,15 @@ fn desenhar_modal(f: &mut Frame, app: &mut App, area: Rect) {
         Modal::Permissoes(seletor)
         | Modal::Modelos(seletor)
         | Modal::Esforco(seletor)
-        | Modal::Sessoes(seletor)
         | Modal::Projetos(seletor)
         | Modal::Processos(seletor) => {
-            desenhar_seletor(f, seletor, area_modal, app.tick);
+            desenhar_seletor(f, seletor, None, area_modal, app.tick);
+        }
+        Modal::Sessoes { seletor, marcadas } => {
+            desenhar_seletor(f, seletor, Some(marcadas), area_modal, app.tick);
+        }
+        Modal::ConfirmarSessoes { ids } => {
+            desenhar_confirmar_sessoes(f, ids.len(), area_modal);
         }
         Modal::CompEditor {
             nome,
@@ -987,7 +934,49 @@ fn desenhar_confirmar_comp(f: &mut Frame, nome: &str, area: Rect) {
     );
 }
 
-fn desenhar_seletor(f: &mut Frame, seletor: &Seletor, area: Rect, tique: u64) {
+/// Confirmação de exclusão de sessões em lote: separada do fluxo de
+/// ferramentas porque a decisão é do usuário na interface.
+fn desenhar_confirmar_sessoes(f: &mut Frame, quantidade: usize, area: Rect) {
+    f.render_widget(Clear, area);
+    let bloco = theme::bloco()
+        .border_style(theme::modal_borda())
+        .style(theme::superficie())
+        .title(Span::styled(" excluir sessões ", theme::titulo()));
+    let interno = bloco.inner(area);
+    f.render_widget(bloco, area);
+    let linhas = vec![
+        Line::default(),
+        Line::from(vec![
+            Span::styled("Excluir ", theme::texto()),
+            Span::styled(format!("{quantidade}"), theme::titulo()),
+            Span::styled(" sessão(ões)?", theme::texto()),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "As conversas, o plano, a auditoria e o uso de tokens dessas sessões serão apagados de vez. A sessão atual não é afetada.",
+            theme::apagado(),
+        )),
+        Line::default(),
+        Line::from(vec![
+            Span::styled(" S ", theme::botao_permitir()),
+            Span::styled(" excluir   ", theme::texto()),
+            Span::styled(" N ", theme::botao_negar()),
+            Span::styled(" cancelar", theme::texto()),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(Text::from(linhas)).wrap(Wrap { trim: false }),
+        interno,
+    );
+}
+
+fn desenhar_seletor(
+    f: &mut Frame,
+    seletor: &Seletor,
+    marcadas: Option<&std::collections::HashSet<usize>>,
+    area: Rect,
+    tique: u64,
+) {
     f.render_widget(Clear, area);
     let filtrados = seletor.filtrados();
     let total = filtrados.len();
@@ -1041,6 +1030,7 @@ fn desenhar_seletor(f: &mut Frame, seletor: &Seletor, area: Rect, tique: u64) {
     let mut faixas: Vec<(usize, usize)> = Vec::with_capacity(filtrados.len());
     for (indice, (_, item)) in filtrados.iter().enumerate() {
         let selecionado = indice == seletor.sel;
+        let marcado = marcadas.map(|m| m.contains(&indice)).unwrap_or(false);
         let inicio = linhas.len();
         let estilo_titulo = if selecionado {
             theme::pulso(tique, true).add_modifier(Modifier::BOLD)
@@ -1048,15 +1038,23 @@ fn desenhar_seletor(f: &mut Frame, seletor: &Seletor, area: Rect, tique: u64) {
             theme::texto()
         };
         // O glifo pula levemente entre dois estados (sem mover texto) para o
-        // item selecionado ser perceptível sem piscar a linha inteira.
-        let marcador = if selecionado {
-            if (tique / 2) % 4 < 2 { "▶ " } else { "▮ " }
+        // item selecionado ser perceptível sem piscar a linha inteira. Em
+        // seletores de sessões, o marcado ganha um visto — o que foi marcado
+        // para exclusão não se confunde com a linha escolhida.
+        let marcador = match (selecionado, marcado) {
+            (true, true) => "▶✓  ",
+            (true, false) => "▶   ",
+            (false, true) => "  ✓  ",
+            (false, false) => "     ",
+        };
+        let estilo_linha = if marcado && !selecionado {
+            theme::texto().add_modifier(Modifier::DIM)
         } else {
-            "  "
+            estilo_titulo
         };
         linhas.push(Line::from(Span::styled(
             format!("{marcador}{}", item.titulo),
-            estilo_titulo,
+            estilo_linha,
         )));
         for (i, parte) in item.detalhe.lines().enumerate() {
             if i >= 2 {
@@ -1344,13 +1342,13 @@ mod tests {
             crate::ui::mascot::PipGrafico::novo(&ratatui_image::picker::Picker::halfblocks())
                 .expect("Pip de teste"),
         );
-        app.tick = 10; // fase grande da estrela de progresso.
         app.tratar_evento(crate::events::AgentEvent::TurnoIniciado);
         let nova = desenhar_em(&mut app, 120, 36);
-        // Nova sessão: mascote + instruções + progresso com estrela no chat.
+        // Nova sessão: mascote + instruções no chat.
         assert!(nova.contains("Nova sessão"));
         assert!(nova.contains("/help"));
-        assert!(nova.contains("★"), "estrela de progresso deveria aparecer");
+        // A estrela de progresso saiu: nenhum glifo de estrela na tela.
+        assert!(!nova.contains('★') && !nova.contains('✦') && !nova.contains('✶'));
         assert!(
             nova.matches('▀').count() + nova.matches('▄').count() >= 6,
             "o Pip deveria aparecer na recepção de nova sessão"
@@ -1364,8 +1362,6 @@ mod tests {
         assert!(depois.contains("linha da conversa"));
         assert!(!depois.contains("Nova sessão"));
         assert!(!depois.contains("▀") && !depois.contains("▄"));
-        // O progresso continua, mas agora é só a estrela no chat.
-        assert!(depois.contains("★"));
     }
 
     #[test]

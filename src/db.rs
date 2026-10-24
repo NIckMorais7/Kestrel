@@ -371,6 +371,53 @@ impl Store {
         })
     }
 
+    /// Exclui sessões inteiras numa transação atômica: a sessão e tudo o que
+    /// pertence a ela (mensagens, planos, tarefas, auditoria, uso de tokens…).
+    /// Devolve quantas sessões foram excluídas.
+    pub fn delete_sessions(&self, ids: &[String]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let marcadores = vec!["?"; ids.len()].join(",");
+        self.with(|c| {
+            c.execute_batch("BEGIN IMMEDIATE")?;
+            let delecao = (|| -> Result<usize> {
+                // Sem chave estrangeira com cascade, cada tabela filha precisa
+                // ser limpa explicitamente; o banco inteiro fica consistente.
+                let dependentes = [
+                    "messages",
+                    "tool_runs",
+                    "plans",
+                    "tasks",
+                    "file_changes",
+                    "decisions",
+                    "audit",
+                    "context_state",
+                    "usage",
+                ];
+                for tabela in dependentes {
+                    let sql = format!("DELETE FROM {tabela} WHERE session_id IN ({marcadores})");
+                    let mut stmt = c.prepare(&sql)?;
+                    stmt.execute(rusqlite::params_from_iter(ids.iter()))?;
+                }
+                let sql = format!("DELETE FROM sessions WHERE id IN ({marcadores})");
+                let mut stmt = c.prepare(&sql)?;
+                let excluidas = stmt.execute(rusqlite::params_from_iter(ids.iter()))?;
+                Ok(excluidas as usize)
+            })();
+            match delecao {
+                Ok(n) => {
+                    c.execute_batch("COMMIT")?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    let _ = c.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
     /// Última sessão de um projeto que pode ser retomada.
     pub fn last_resumable_session(&self, project: &str) -> Result<Option<SessionRow>> {
         self.with(|c| {
@@ -1163,5 +1210,81 @@ mod tests {
         let (used, cap, dossier) = s.context_state("s1").unwrap().unwrap();
         assert_eq!((used, cap), (100, 1000));
         assert_eq!(dossier.as_deref(), Some("dossie"));
+    }
+
+    /// Excluir sessões remove a sessão e tudo o que pertence a ela, sem
+    /// tocar nas outras.
+    #[test]
+    fn deletar_sessoes_remove_tudo_associado() {
+        let s = store();
+        s.create_session("s1", "/p", "t1", "m", None, "semi", None)
+            .unwrap();
+        s.create_session("s2", "/p", "t2", "m", None, "semi", None)
+            .unwrap();
+        s.create_session("s3", "/p", "t3", "m", None, "semi", None)
+            .unwrap();
+        for (id, texto) in [("s1", "msg1"), ("s2", "msg2"), ("s3", "msg3")] {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, created_at) \
+                 VALUES (?1, 'user', ?2, '2026-01-01')",
+                rusqlite::params![id, texto],
+            )
+            .unwrap();
+        }
+        s.record_usage("s1", 10, 0, 0).unwrap();
+        s.audit(Some("s1"), "teste", None, Some("permitido"))
+            .unwrap();
+        s.set_context_state("s2", 5, 1000, None).unwrap();
+
+        let excluidas = s.delete_sessions(&["s1".into(), "s2".into()]).unwrap();
+        assert_eq!(excluidas, 2);
+        assert!(s.get_session("s1").unwrap().is_none());
+        assert!(s.get_session("s2").unwrap().is_none());
+        assert!(s.get_session("s3").unwrap().is_some());
+
+        // Consulta direta sob o lock; o guard é solto antes de qualquer
+        // próxima chamada via `Store::with` (o mutex não é reentrante).
+        {
+            let conn = s.conn.lock().unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE session_id IN ('s1','s2')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "mensagens das sessões excluídas deveriam sumir");
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = 's3'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "mensagens da sessão restante não podem ser tocadas");
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM usage", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0);
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0);
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM context_state", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0);
+        }
+        let restantes = s.list_sessions(None, 10).unwrap();
+        assert_eq!(restantes.len(), 1);
+        assert_eq!(restantes[0].id, "s3");
+    }
+
+    /// Nenhuma lista vazia de sessões deve tocar no banco.
+    #[test]
+    fn deletar_sessoes_vazias_e_nao_op() {
+        let s = store();
+        assert_eq!(s.delete_sessions(&[]).unwrap(), 0);
     }
 }

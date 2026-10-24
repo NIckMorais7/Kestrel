@@ -591,7 +591,18 @@ pub enum Modal {
     Permissoes(Seletor),
     Modelos(Seletor),
     Esforco(Seletor),
-    Sessoes(Seletor),
+    /// Histórico de sessões com seleção múltipla para exclusão. `marcadas`
+    /// guarda os índices (na lista original, antes de qualquer filtro) das
+    /// sessões marcadas para exclusão.
+    Sessoes {
+        seletor: Seletor,
+        marcadas: std::collections::HashSet<usize>,
+    },
+    /// Confirmação de exclusão de sessões marcadas (separada do fluxo de
+    /// confirmações de ferramenta: a decisão é do usuário na interface).
+    ConfirmarSessoes {
+        ids: Vec<String>,
+    },
     Projetos(Seletor),
     Processos(Seletor),
     Texto {
@@ -1969,11 +1980,31 @@ impl App {
             self.avisar(format!("nenhum resultado para `{termo}`."));
             return;
         }
-        self.abrir_modal(Modal::Sessoes(Seletor::novo(
-            "Histórico de sessões",
-            "enter retoma a sessão escolhida · digite para filtrar · esc cancela",
-            itens,
-        )));
+        self.abrir_modal(Modal::Sessoes {
+            seletor: Seletor::novo(
+                "Histórico de sessões",
+                "enter retoma · espaço marca para excluir · d exclui as marcadas · esc cancela",
+                itens,
+            ),
+            marcadas: std::collections::HashSet::new(),
+        });
+    }
+
+    /// Exclui as sessões dadas (o usuário já confirmou). A sessão ativa nunca
+    /// chega aqui — quem filtra é o próprio fluxo de marcação.
+    fn excluir_sessoes(&mut self, ids: Vec<String>) {
+        let total = ids.len();
+        match self.store.delete_sessions(&ids) {
+            Ok(n) => {
+                self.fechar_modal();
+                if n == 0 {
+                    self.avisar("nenhuma sessão encontrada para excluir.".into());
+                    return;
+                }
+                self.avisar_rapido(format!("{n} de {total} sessão(ões) excluída(s)"), 25);
+            }
+            Err(e) => self.avisar(format!("falha ao excluir sessões: {e}")),
+        }
     }
 
     fn abrir_projetos(&mut self) {
@@ -2279,6 +2310,26 @@ impl App {
             AgentEvent::PlanoAtualizado { objetivo, passos } => {
                 self.aplicar_plano(objetivo, passos);
             }
+            AgentEvent::CatalogoAtualizado { modelos, novos } => {
+                // O catálogo chega já mesclado com as entradas manuais. Só
+                // persiste quando mudou alguma coisa (novos modelos ou entradas
+                // diferentes) — nada de reescrever o config toda abertura.
+                let mudou = modelos.len() != self.config.provider.models.len()
+                    || modelos
+                        .iter()
+                        .any(|m| !self.config.provider.models.iter().any(|e| e.id == m.id));
+                self.config.provider.models = modelos;
+                if mudou && let Err(e) = self.config.save(&self.paths) {
+                    self.avisar(format!("catálogo atualizado, mas falha ao salvar: {e}"));
+                    return;
+                }
+                if novos > 0 {
+                    self.avisar_rapido(
+                        format!("catálogo atualizado: {novos} modelo(s) novo(s) — veja /model"),
+                        30,
+                    );
+                }
+            }
             AgentEvent::TarefasAtualizadas { tarefas } => {
                 self.aplicar_tarefas(tarefas);
             }
@@ -2583,7 +2634,7 @@ impl App {
                     Modal::Permissoes(seletor)
                     | Modal::Modelos(seletor)
                     | Modal::Esforco(seletor)
-                    | Modal::Sessoes(seletor)
+                    | Modal::Sessoes { seletor, .. }
                     | Modal::Projetos(seletor)
                     | Modal::Processos(seletor),
                 ) => {
@@ -2827,6 +2878,9 @@ impl App {
             Escolher(ItemSeletor),
             SalvarComp,
             RemoverComp,
+            Avisar(String),
+            PedirConfirmacaoExcluir(Vec<String>),
+            ConfirmarExcluir(Vec<String>),
         }
         let reacao = match self.modal.as_mut() {
             None => Reacao::Nada,
@@ -2846,7 +2900,6 @@ impl App {
             Some(Modal::Permissoes(seletor))
             | Some(Modal::Modelos(seletor))
             | Some(Modal::Esforco(seletor))
-            | Some(Modal::Sessoes(seletor))
             | Some(Modal::Projetos(seletor))
             | Some(Modal::Processos(seletor)) => {
                 let mut reacao = Reacao::Nada;
@@ -2877,6 +2930,79 @@ impl App {
                 seletor.ajustar_selecao();
                 reacao
             }
+            // Histórico de sessões: além de retomar (enter), marca várias para
+            // excluir de uma vez (espaço/X) e pede confirmação (d).
+            Some(Modal::Sessoes { seletor, marcadas }) => {
+                let mut reacao = Reacao::Nada;
+                match tecla.code {
+                    KeyCode::Esc => reacao = Reacao::Fechar,
+                    KeyCode::Up => seletor.sel = seletor.sel.saturating_sub(1),
+                    KeyCode::Down => {
+                        let total = seletor.filtrados().len();
+                        if total > 0 {
+                            seletor.sel = (seletor.sel + 1).min(total - 1);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        seletor.filtro.pop();
+                        seletor.sel = 0;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(item) = seletor.selecionado() {
+                            reacao = Reacao::Escolher(item.clone());
+                        }
+                    }
+                    // Espaço ou X marca/desmarca a sessão atual para exclusão.
+                    KeyCode::Char(' ') | KeyCode::Char('x') | KeyCode::Char('X') => {
+                        if let Some((indice, item)) = seletor.filtrados().get(seletor.sel)
+                            && matches!(item.valor, ValorSeletor::Sessao(_))
+                            && !marcadas.insert(*indice)
+                        {
+                            marcadas.remove(indice);
+                        }
+                    }
+                    // D: exclui as marcadas (a sessão ativa nunca entra).
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        if marcadas.is_empty() {
+                            reacao = Reacao::Avisar(
+                                "marque sessões com espaço antes de excluir.".into(),
+                            );
+                        } else {
+                            let ids: Vec<String> = seletor
+                                .itens
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| marcadas.contains(i))
+                                .filter_map(|(_, item)| match &item.valor {
+                                    ValorSeletor::Sessao(id) => Some(id.clone()),
+                                    _ => None,
+                                })
+                                .filter(|id| *id != self.sessao_id)
+                                .collect();
+                            if ids.is_empty() {
+                                reacao =
+                                    Reacao::Avisar("a sessão atual não pode ser excluída.".into());
+                            } else {
+                                reacao = Reacao::PedirConfirmacaoExcluir(ids);
+                            }
+                        }
+                    }
+                    KeyCode::Char(c) if !controle && !alt => {
+                        seletor.filtro.push(c);
+                        seletor.sel = 0;
+                    }
+                    _ => {}
+                }
+                seletor.ajustar_selecao();
+                reacao
+            }
+            Some(Modal::ConfirmarSessoes { ids }) => match tecla.code {
+                KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Enter => {
+                    Reacao::ConfirmarExcluir(ids.clone())
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Reacao::Fechar,
+                _ => Reacao::Nada,
+            },
             Some(Modal::CompEditor {
                 editor,
                 erro,
@@ -2982,6 +3108,13 @@ impl App {
             Reacao::Confirmar(resposta) => self.responder_confirmacao(resposta),
             Reacao::SalvarComp => self.salvar_comp_modal(),
             Reacao::RemoverComp => self.remover_comp_confirmado(),
+            Reacao::Avisar(mensagem) => self.avisar(mensagem),
+            Reacao::PedirConfirmacaoExcluir(ids) => {
+                self.abrir_modal(Modal::ConfirmarSessoes { ids });
+            }
+            Reacao::ConfirmarExcluir(ids) => {
+                self.excluir_sessoes(ids);
+            }
             Reacao::Escolher(item) => {
                 // Fecha antes de agir: escolher um modelo com raciocínio abre o
                 // seletor de esforço, que não pode ser fechado por engano.
@@ -3186,7 +3319,7 @@ comandos (âmbar), web (ciano), falha (vermelho) e subagente (violeta).\n\
          - **Clique com o botão esquerdo** sobre um bloco para recolher ou abrir: conversas longas ficam legíveis sem rolar o dia inteiro.\n\
          - Confirmações rápidas (modo, permissão, modelo, skin, thinking) aparecem como **aviso temporário** no topo e somem sozinhas, sem virar bloco permanente.\n\
          - O campo de mensagem mostra um **spinner** enquanto o agente trabalha.\n\
-         - O rodapé traz o **medidor de contexto** (blocos + percentual) e um chip com os processos ativos.\n\n\
+         - O rodapé traz o **uso de contexto** (usado/total + percentual) e um indicador discreto dos processos ativos.\n\n\
          ## Modos\n\n\
          - **build** (padrão): investiga, planeja, edita arquivos e executa comandos conforme o nível de permissão.\n\
          - **chat**: somente conversa e leitura; ferramentas que escrevem, executam ou planejam ficam indisponíveis.\n\
@@ -3196,8 +3329,9 @@ comandos (âmbar), web (ciano), falha (vermelho) e subagente (violeta).\n\
          - O rodapé inferior não mostra skills nem “enter envia”; use `/skills` para ver as skills.\n\n\
          ## Nova sessão e progresso\n\n\
          - Em uma sessão nova, o Pip e instruções curtas aparecem no chat; ambos somem na primeira mensagem.\n\
-         - Durante o turno, o progresso aparece no chat como uma estrela branca que cresce e diminui.\n\
-         - Não aparece mais o aviso de “sessão anterior interrompida”; use `/retomar` quando quiser.\n\n\
+         - Durante o turno, o trabalho aparece só no rodapé (estado discreto) e no spinner do campo de mensagem.\n\
+         - Não aparece mais o aviso de “sessão anterior interrompida”; use `/retomar` quando quiser.\n\
+         - `/historico` também **exclui sessões em lote**: espaço marca, `d` exclui as marcadas (com confirmação; a sessão atual nunca é excluída).\n\n\
          ## Comps e skins\n\n\
          - **Comps** são personalidades: um bloco de instruções que muda o tom e o estilo da resposta. \
 `/person` lista, `/person new <nome>` cria com o editor dentro do Kestrel, `/person use <nome>` ativa, \
@@ -4455,5 +4589,109 @@ mod tests {
             .trilha(),
             Trilha::Subagente
         );
+    }
+
+    /// O histórico marca várias sessões (espaço), pede confirmação (d) e
+    /// exclui (s) — sem nunca tocar na sessão ativa.
+    #[test]
+    fn historico_marca_e_exclui_varias_sessoes() {
+        let (mut app, _rx) = app_de_teste();
+        for (id, titulo) in [("a", "zeta-um"), ("b", "zeta-dois"), ("c", "zeta-tres")] {
+            app.store
+                .create_session(id, "/p", titulo, "m", None, "semi", None)
+                .unwrap();
+        }
+        app.sessao_id = "s".into();
+
+        app.abrir_historico("");
+        let Modal::Sessoes { seletor, .. } = app.modal.as_ref().unwrap() else {
+            panic!("esperava modal de sessões");
+        };
+        assert_eq!(seletor.itens.len(), 4);
+
+        // Marca direto pelas sessões "zeta-um" e "zeta-dois" (o atalho de
+        // espaço é testado à parte; aqui o que importa é o fluxo de exclusão).
+        {
+            let Modal::Sessoes { seletor, marcadas } = app.modal.as_mut().unwrap() else {
+                panic!("modal de sessões sumiu");
+            };
+            for titulo in ["zeta-um", "zeta-dois"] {
+                seletor.filtro = titulo.to_string();
+                seletor.ajustar_selecao();
+                let (indice, item) = seletor.filtrados()[0];
+                assert!(
+                    matches!(&item.valor, ValorSeletor::Sessao(_)),
+                    "item deveria ser sessão"
+                );
+                marcadas.insert(indice);
+            }
+            seletor.filtro.clear();
+            seletor.ajustar_selecao();
+        }
+        let Modal::Sessoes { marcadas, .. } = app.modal.as_ref().unwrap() else {
+            panic!("modal de sessões sumiu");
+        };
+        assert_eq!(marcadas.len(), 2, "duas sessões marcadas");
+
+        // D pede confirmação com exatamente as duas marcadas.
+        app.tratar_tecla(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        let Modal::ConfirmarSessoes { ids } = app.modal.as_ref().unwrap() else {
+            panic!("esperava confirmação de exclusão");
+        };
+        assert_eq!(ids.len(), 2);
+
+        // S confirma e exclui.
+        app.tratar_tecla(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(app.store.get_session("a").unwrap().is_none());
+        assert!(app.store.get_session("b").unwrap().is_none());
+        assert!(app.store.get_session("c").unwrap().is_some());
+        assert!(app.store.get_session("s").unwrap().is_some());
+        assert!(app.toast.is_some(), "deveria haver um toast de confirmação");
+    }
+
+    /// Cancelar a confirmação (N/Esc) não exclui nada.
+    #[test]
+    fn exclusao_de_sessoes_cancelada_nao_apaga() {
+        let (mut app, _rx) = app_de_teste();
+        app.store
+            .create_session("a", "/p", "zeta-um", "m", None, "semi", None)
+            .unwrap();
+        app.abrir_historico("");
+        for c in ['z', 'e', 't', 'a', '-', 'u', 'm'] {
+            app.tratar_tecla(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.tratar_tecla(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.tratar_tecla(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::ConfirmarSessoes { .. })));
+        app.tratar_tecla(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.modal.is_none(), "cancelar devia fechar o modal");
+        assert!(app.store.get_session("a").unwrap().is_some());
+    }
+
+    /// O catálogo atualizado em segundo plano entra na configuração da
+    /// interface, é persistido e avisa quando há modelos novos.
+    #[test]
+    fn catalogo_atualizado_entra_na_config() {
+        let (mut app, _rx) = app_de_teste();
+        app.tratar_evento(AgentEvent::CatalogoAtualizado {
+            modelos: vec![crate::config::ModelEntry::new("novo/modelo")],
+            novos: 1,
+        });
+        assert!(
+            app.config
+                .provider
+                .models
+                .iter()
+                .any(|m| m.id == "novo/modelo"),
+            "o modelo novo deveria estar no catálogo"
+        );
+        assert!(app.toast.is_some());
+        // Sem modelos novos, nada de aviso.
+        app.toast = None;
+        app.tratar_evento(AgentEvent::CatalogoAtualizado {
+            modelos: app.config.provider.models.clone(),
+            novos: 0,
+        });
+        assert!(app.toast.is_none());
     }
 }

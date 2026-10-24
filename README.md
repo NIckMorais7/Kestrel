@@ -210,15 +210,18 @@ não ficam brancos em terminal claro.
 
 O ciclo tem 128 tiques e é determinístico: repouso respirando (e piscando),
 caminhada leve para a esquerda e volta, caminhada leve para a direita e volta,
-repouso de novo.
+repouso de novo. Desde a v0.9.4 os deslocamentos são senoidais — o movimento
+acelera no meio e desacelera nas pontas, sem saltos de posição — e a passada
+da caminhada é suave, então o Pip não “treme” nem parece travado.
 
 A partir da v0.5.0, o Pip **não fica mais no rodapé** nem no assistente. Ele
 aparece somente na **recepção de nova sessão**, no chat, junto de instruções
 curtas. Ao enviar a primeira mensagem, o Pip e as instruções somem juntos e a
 conversa segue limpa.
 
-Durante o turno, o progresso aparece no chat como uma **estrela branca** que
-cresce e diminuindo, fluida, acima do campo de mensagem.
+Durante o turno, o trabalho aparece em dois lugares discretos: o **spinner** no
+campo de mensagem e o **estado** no rodapé (com o indicador de atividade fixo,
+sem piscar). Não existe mais estrela de progresso no chat.
 
 Limitações documentadas:
 
@@ -241,13 +244,16 @@ Nas respostas do agente não aparece mais a forma geométrica antes de `Kestrel`
 ## Contexto no rodapé
 
 O rodapé inferior mostra o **contexto real do modelo**, não a soma de tokens da
-sessão: usado/total e percentual. Exemplo:
+sessão: usado/total e percentual, sem barrinhas — só o texto. Exemplo:
 
 ```text
 contexto 390.000/1.000.000 (39%)
 ```
 
-Tokens acumulados continuam disponíveis em `/cost`.
+O rodapé e o cabeçalho são **discretos**: estado e contexto em texto apagado,
+indicador de atividade fixo (`·`), processos ativos só como `⚙ N`, modelo e
+Comp no cabeçalho sem destaque. Tokens acumulados continuam disponíveis em
+`/cost`.
 
 ## Raciocínio do modelo (`/thinking`)
 
@@ -311,10 +317,17 @@ cwd = "/home/user"
   uma linha e abrem quando você quiser conferir.
 - **Avisos temporários** no topo para confirmações rápidas (modo, permissão,
   modelo, skin, thinking) em vez de blocos permanentes na conversa.
-- **Medidor de contexto** no rodapé, com blocos e percentual, e um chip com os
-  processos ainda em execução.
+- **Contexto discreto** no rodapé: usado/total e percentual em texto, sem
+  barrinhas; processos ativos como um simples `⚙ N`.
 - **Subagentes visíveis**: o trabalho delegado abre um grupo com a subtarefa, e
   cada ferramenta dele aparece recuada e identificada.
+- **Histórico de sessões com exclusão em lote**: `/historico` marca várias
+  sessões com espaço, `d` pede confirmação e exclui tudo de uma vez (a sessão
+  atual nunca é excluída).
+- **Atualização automática do catálogo**: ao abrir, o Kestrel consulta
+  `/models` do provedor em segundo plano e mescla os modelos novos no catálogo
+  local, preservando entradas manuais; quando há novidades, um aviso temporário
+  aparece (`modelos novos — veja /model`).
 
 ## Dados e privacidade
 

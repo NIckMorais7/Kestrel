@@ -188,6 +188,13 @@ pub enum AgentEvent {
         objetivo: String,
         passos: Vec<PlanoPasso>,
     },
+    /// Catálogo de modelos atualizado em segundo plano (descoberta remota).
+    /// `modelos` já vem mesclado com as entradas manuais; `novos` é quantos
+    /// modelos inéditos entraram nesta atualização (0 = nada mudou).
+    CatalogoAtualizado {
+        modelos: Vec<crate::config::ModelEntry>,
+        novos: usize,
+    },
     TarefasAtualizadas {
         tarefas: Vec<TarefaView>,
     },
