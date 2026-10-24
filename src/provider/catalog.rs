@@ -214,6 +214,23 @@ pub fn podar_catalogo(entradas: &mut Vec<ModelEntry>) -> usize {
     antes.saturating_sub(entradas.len())
 }
 
+/// Poda o catálogo **e re-aplica as capacidades conhecidas** nas entradas
+/// descobertas que ficaram.
+///
+/// Uma entrada gravada em disco antes de o modelo entrar na tabela interna
+/// (ex.: o MiniMax M3.1 Flash com esforços vazios) continuaria mostrando
+/// `desconhecido` para sempre — o `enrich` corrige isso sem depender de uma
+/// nova chamada à rede. Escolhas manuais nunca são alteradas.
+pub fn podar_e_atualizar_catalogo(entradas: &mut Vec<ModelEntry>) -> usize {
+    let removidos = podar_catalogo(entradas);
+    for entrada in entradas.iter_mut() {
+        if entrada.source == ModelSource::Descoberto {
+            *entrada = enrich(entrada.clone());
+        }
+    }
+    removidos
+}
+
 /// Consulta o endpoint `/models` do provedor (API compatível com OpenAI) e
 /// devolve as entradas descobertas **que estão na allowlist** (tabela
 /// [`known_capabilities`]) — o `/v1/models` lista centenas de modelos que não
@@ -399,6 +416,38 @@ mod tests {
                 .iter()
                 .any(|e| e.id == "nvidia/nemotron-3-embed-1b")
         );
+    }
+
+    /// A poda + re-enriquecimento corrige entradas antigas: o MiniMax que foi
+    /// gravado como `desconhecido` (antes de entrar na tabela) ganha os cinco
+    /// esforços — é exatamente o bug visível na interface do usuário.
+    #[test]
+    fn poda_re_enriquece_descobertos_antigos() {
+        let mut minimax = ModelEntry::new("minimaxai/minimax-m3.1-flash");
+        minimax.supports_reasoning = Capability::Desconhecido;
+        minimax.reasoning_efforts = Vec::new();
+        let mut manual = ModelEntry::new("org/modelo-manual");
+        manual.source = ModelSource::Manual;
+        manual.supports_tools = Capability::Nao; // escolha manual: preservar
+
+        let mut entradas = vec![minimax, manual];
+        let removidos = podar_e_atualizar_catalogo(&mut entradas);
+        assert_eq!(removidos, 0);
+
+        let minimax = entradas
+            .iter()
+            .find(|e| e.id == "minimaxai/minimax-m3.1-flash")
+            .unwrap();
+        assert_eq!(minimax.supports_reasoning, Capability::Sim);
+        assert_eq!(
+            minimax.reasoning_efforts,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        let manual = entradas
+            .iter()
+            .find(|e| e.id == "org/modelo-manual")
+            .unwrap();
+        assert_eq!(manual.supports_tools, Capability::Nao, "manual não muda");
     }
 
     #[test]

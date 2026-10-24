@@ -335,8 +335,12 @@ impl Config {
         };
         // Limpa o catálogo de modelos descobertos que não fazem mais parte da
         // allowlist (mortos, sem free endpoint ou não-chat que uma descoberta
-        // antiga do `/v1/models` possa ter trazido). Manuais nunca são tocados.
-        let removidos = crate::provider::catalog::podar_catalogo(&mut inteiro.provider.models);
+        // antiga do `/v1/models` possa ter trazido) e re-aplica capacidades
+        // conhecidas nos que ficaram (ex.: esforços do MiniMax M3.1 Flash que
+        // foram gravados como `desconhecido` antes de entrar na tabela).
+        // Manuais nunca são tocados.
+        let removidos =
+            crate::provider::catalog::podar_e_atualizar_catalogo(&mut inteiro.provider.models);
         let avisos = inteiro.validar();
         let aviso_poda = if removidos > 0 {
             Some(format!(
