@@ -861,6 +861,9 @@ pub struct App {
     atividade_chave: Option<String>,
     /// Linha de atividade (spinner + tempo + estado) no fim da conversa.
     atividade_linha: Option<Line<'static>>,
+    /// Nome da ferramenta em execução no momento (se houver): aparece na
+    /// linha de atividade ("usando create_file") enquanto a ferramenta roda.
+    ferramenta_atual: Option<String>,
     pub modelo: String,
     pub esforco: Option<String>,
     pub nivel: PermissionLevel,
@@ -965,6 +968,7 @@ impl App {
             turno_iniciado_em: None,
             atividade_chave: None,
             atividade_linha: None,
+            ferramenta_atual: None,
             modelo,
             esforco,
             nivel,
@@ -1150,7 +1154,9 @@ impl App {
         let tempo = crate::util::format_duration_ms(
             iniciado.elapsed().as_millis().min(u64::MAX as u128) as u64,
         );
-        let estado = if self.estado_texto.trim().is_empty() {
+        let estado = if let Some(ferramenta) = &self.ferramenta_atual {
+            format!("usando {ferramenta}")
+        } else if self.estado_texto.trim().is_empty() {
             "trabalhando".to_string()
         } else {
             self.estado_texto.to_lowercase()
@@ -2574,6 +2580,7 @@ impl App {
                 detalhe,
                 subagente,
             } => {
+                let nome_ferramenta = nome.clone();
                 self.empurrar_bloco(Bloco::Ferramenta {
                     id,
                     nome,
@@ -2586,6 +2593,10 @@ impl App {
                     diff: Vec::new(),
                     subagente,
                 });
+                // Mostra o nome da ferramenta enquanto ela roda (ex.: "usando
+                // create_file"), em vez de só um estado genérico — para
+                // ferramentas rápidas o bloco mal aparece no chat.
+                self.ferramenta_atual = Some(nome_ferramenta);
                 self.definir_estado(EstadoMascote::Ferramentas, "executando ferramenta");
                 self.acompanhar_fim();
             }
@@ -2643,6 +2654,7 @@ impl App {
                 remocoes,
                 diff,
             } => {
+                self.ferramenta_atual = None;
                 let encontrado = self.localizar_ferramenta(id.as_deref(), &nome);
                 if let Some(i) = encontrado {
                     if let Bloco::Ferramenta {
@@ -4942,6 +4954,56 @@ mod tests {
             .filter(|l| l.spans.iter().any(|s| s.content.contains("tok/s")))
             .count();
         assert_eq!(fins, 1, "o resumo do turno deve aparecer uma única vez");
+    }
+
+    /// Enquanto QUALQUER ferramenta roda, o nome dela aparece na linha de
+    /// atividade ("usando create_file", "usando read_file", …) — e some
+    /// quando ela conclui. Não é específico de `create_file`.
+    #[test]
+    fn ferramenta_em_execucao_aparece_na_atividade() {
+        let (mut app, _rx) = app_de_teste();
+        app.empurrar_bloco(Bloco::Usuario("oi".into()));
+        app.tratar_evento(AgentEvent::TurnoIniciado);
+        app.turno_iniciado_em = Some(std::time::Instant::now());
+
+        // Cobre várias ferramentas (criação, leitura, execução).
+        for (id, nome) in [
+            ("c1", "create_file"),
+            ("c2", "read_file"),
+            ("c3", "run_command"),
+        ] {
+            app.tratar_evento(AgentEvent::FerramentaIniciada {
+                id: Some(id.into()),
+                nome: nome.into(),
+                detalhe: "alvo".into(),
+                subagente: None,
+            });
+            app.atualizar_atividade();
+            let esperado = format!("usando {nome}");
+            assert!(
+                app.linhas
+                    .iter()
+                    .any(|l| { l.spans.iter().any(|s| s.content.contains(&esperado)) }),
+                "`{nome}` em execução deveria aparecer na atividade"
+            );
+
+            app.tratar_evento(AgentEvent::FerramentaConcluida {
+                id: Some(id.into()),
+                nome: nome.into(),
+                sucesso: true,
+                resumo: "concluído".into(),
+                adicoes: 0,
+                remocoes: 0,
+                diff: String::new(),
+            });
+            app.atualizar_atividade();
+            assert!(
+                !app.linhas
+                    .iter()
+                    .any(|l| { l.spans.iter().any(|s| s.content.contains(&esperado)) }),
+                "`{nome}` concluída não pode continuar na atividade"
+            );
+        }
     }
 
     #[test]
