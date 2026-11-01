@@ -1,6 +1,6 @@
 //! Ferramentas de skills: listar e carregar instruções completas.
 
-use super::{Tool, ToolContext, ToolError, ToolOutput, arg_str};
+use super::{Tool, ToolContext, ToolError, ToolOutput, arg_str, recortar_saida};
 use crate::provider::ToolSpec;
 use serde_json::{Value, json};
 
@@ -88,7 +88,10 @@ impl Tool for LoadSkill {
         let nome = arg_str(&args, "nome")?;
         match ctx.skills.load(&nome) {
             Ok(conteudo) => Ok(ToolOutput::texto(format!(
-                "Instruções da skill `{nome}`:\n\n{conteudo}"
+                // Skills grandes (SKILL.md verboso) entrariam sem limite no
+                // contexto: aplica o mesmo recorte das outras ferramentas.
+                "Instruções da skill `{nome}`:\n\n{}",
+                recortar_saida(&conteudo, ctx.max_saida)
             ))
             .com_resumo(format!("carregou skill {nome}"))),
             Err(e) => {
@@ -116,5 +119,41 @@ mod tests {
         assert_eq!(ListSkills.nome(), "list_skills");
         assert_eq!(LoadSkill.nome(), "load_skill");
         assert_eq!(LoadSkill.spec().parameters["required"][0], "nome");
+    }
+
+    /// Conteúdo de skill grande precisa ser recortado antes de entrar no
+    /// contexto, como as outras ferramentas.
+    #[tokio::test]
+    async fn load_skill_recorta_conteudo_gigante() {
+        use super::*;
+        use crate::tools::Tool;
+        let raiz =
+            std::env::temp_dir().join(format!("kestrel-skill-trunc-{}", uuid::Uuid::new_v4()));
+        let projeto = raiz.join("projeto");
+        std::fs::create_dir_all(projeto.join(".kestrel/skills/gigante")).unwrap();
+        let corpo = "linha de skill muito longa ".repeat(5000); // bem acima de max_saida
+        std::fs::write(
+            projeto.join(".kestrel/skills/gigante/SKILL.md"),
+            format!("---\nname: gigante\ndescription: teste\n---\n\n{corpo}"),
+        )
+        .unwrap();
+        let paths = crate::util::Paths::with_root(&raiz);
+        let reg = std::sync::Arc::new(crate::skills::SkillRegistry::discover(&paths, &projeto));
+        let mut ctx = crate::tools::git::tests::contexto(&projeto);
+        ctx.skills = reg;
+        let saida = LoadSkill
+            .executar(serde_json::json!({"nome": "gigante"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            saida.conteudo.contains("saída truncada"),
+            "o conteúdo da skill deveria vir truncado: {}",
+            saida.conteudo
+        );
+        assert!(
+            saida.conteudo.chars().count() < 40_000,
+            "a skill não pode entrar inteira no contexto"
+        );
+        let _ = std::fs::remove_dir_all(&raiz);
     }
 }

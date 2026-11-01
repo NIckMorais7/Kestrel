@@ -231,6 +231,15 @@ impl Renderizador {
                 }
             }
             Event::Code(texto) => {
+                // Dentro de tabela o código inline é conteúdo de célula: sem
+                // esta ramificação ele era empurrado em `atual` como parágrafo
+                // e a célula perdia o valor — `` | `a` | b | `` mostrava a
+                // tabela furada e um "a" solto depois dela.
+                if let Some(t) = &mut self.tabela {
+                    t.celula
+                        .push_str(&crate::html::decodificar_entidades(&texto));
+                    return;
+                }
                 self.estilo.codigo = true;
                 self.empurrar_texto(&texto);
                 self.estilo.codigo = false;
@@ -344,6 +353,12 @@ impl Renderizador {
             Tag::TableHead => {
                 if let Some(t) = &mut self.tabela {
                     t.cabecalho = true;
+                    // O cabeçalho também é uma linha: sem este push as células
+                    // do cabeçalho chegavam em `TagEnd::TableCell` sem linha
+                    // nenhuma para recebê-las (o `last_mut()` era `None`) e a
+                    // primeira linha da tabela — a que sai em negrito com a
+                    // régua logo abaixo — mostrava os dados do corpo.
+                    t.linhas.push(Vec::new());
                 }
             }
             Tag::TableRow => {
@@ -435,10 +450,21 @@ impl Renderizador {
         if tabela.linhas.is_empty() {
             return;
         }
-        let colunas = tabela.linhas.iter().map(Vec::len).max().unwrap_or(0);
+        // A contagem de colunas é a do CABEÇALHO: linhas irregulares (com
+        // menos células, ou com células extras depois do último separador) são
+        // padronizadas para ela. Com o máximo entre as linhas, uma única linha
+        // mais cheia alargava a régua além do cabeçalho e a tabela inteira
+        // desalinhavam. Cabeçalho vazio (tabela degenerada) cai no maior.
+        let colunas = tabela
+            .linhas
+            .first()
+            .map(Vec::len)
+            .filter(|n| *n > 0)
+            .or_else(|| tabela.linhas.iter().map(Vec::len).max())
+            .unwrap_or(0);
         let mut larguras = vec![0usize; colunas];
         for linha in &tabela.linhas {
-            for (i, celula) in linha.iter().enumerate() {
+            for (i, celula) in linha.iter().take(colunas).enumerate() {
                 // Largura de terminal, não número de `char`s: CJK/emoji ocupam
                 // duas colunas e desalinhavam a tabela inteira.
                 larguras[i] = larguras[i].max(celula.width());
@@ -596,5 +622,32 @@ mod tests {
         assert!(renderizar("").is_empty());
         // Linhas em branco não têm conteúdo renderizável.
         assert!(renderizar("\n\n\n").is_empty());
+    }
+    /// Tabela com linhas irregulares (menos células, ou células extras depois
+    /// do cabeçalho): as linhas não podem desalinhar. A contagem de colunas é
+    /// a do cabeçalho — com o máximo entre as linhas, uma linha mais cheia
+    /// alargava a régua e a tabela inteira desencontrava.
+    #[test]
+    fn tabela_irregular_permanece_alinhada() {
+        let linhas =
+            renderizar("| a | b | c |\n|---|---|---|\n| 1 | 2 |\n| 4 | 5 | 6 | 7 |\n| x | y | z |");
+        let textos: Vec<String> = linhas
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert!(
+            textos.len() >= 5,
+            "cabeçalho, régua e três linhas de dados: {textos:?}"
+        );
+        let larguras: Vec<usize> = textos.iter().map(|t| t.width()).collect();
+        assert!(
+            larguras.windows(2).all(|par| par[0] == par[1]),
+            "todas as linhas da tabela deveriam ter a mesma largura: {larguras:?}"
+        );
+        // Célula extra além do cabeçalho não aparece na linha.
+        assert!(
+            !textos.iter().any(|t| t.contains('7')),
+            "a quarta célula da linha irregular não deveria ser renderizada: {textos:?}"
+        );
     }
 }

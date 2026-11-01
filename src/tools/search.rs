@@ -134,6 +134,7 @@ impl Tool for SearchCode {
             "definicoes" | "definições" | "definitions" => Modo::Definicoes,
             _ => Modo::Texto,
         };
+        let regex_explicito = args.get("regex").is_some();
         let usar_regex = arg_bool(
             &args,
             "regex",
@@ -166,108 +167,138 @@ impl Tool for SearchCode {
             )));
         }
 
-        let mut resultados: Vec<String> = Vec::new();
-        let mut arquivos_com_match = 0usize;
-        let mut total = 0usize;
-
         let inicio_caminhada = arquivo_unico.as_deref().unwrap_or(&raiz);
-        let walker = ignore::WalkBuilder::new(inicio_caminhada)
-            .hidden(false)
-            .git_ignore(true)
-            .max_depth(Some(20))
-            .build();
-        'arquivos: for entrada in walker.flatten() {
-            if !entrada.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            let caminho = entrada.path();
-            if let Some(alvo) = &arquivo_unico
-                && caminho != alvo
-            {
-                continue;
-            }
-            let ext = caminho
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if let Some(filtro) = &glob {
-                let sufixo = filtro.trim_start_matches('*');
-                let sufixo = sufixo.trim_start_matches('.');
-                if !ext.ends_with(sufixo) {
+
+        // Uma tentativa de busca com uma dada interpretação (regex x literal).
+        // Isolada numa closure para que o fallback literal possa repetir a
+        // varredura sem duplicar o corpo.
+        let buscar = |usar_regex: bool| -> Result<(Vec<String>, usize, usize), ToolError> {
+            let mut resultados: Vec<String> = Vec::new();
+            let mut arquivos_com_match = 0usize;
+            let mut total = 0usize;
+            let walker = ignore::WalkBuilder::new(inicio_caminhada)
+                .hidden(false)
+                .git_ignore(true)
+                .max_depth(Some(20))
+                .build();
+            'arquivos: for entrada in walker.flatten() {
+                if !entrada.file_type().is_some_and(|t| t.is_file()) {
                     continue;
                 }
-            }
-            // O limite precisa ser checado antes da leitura: antes o arquivo
-            // inteiro era carregado em memória para só então ser descartado.
-            let Ok(meta) = std::fs::metadata(caminho) else {
-                continue;
-            };
-            if meta.len() > 2_000_000 {
-                continue; // arquivo grande demais para busca em memória
-            }
-            let Ok(bytes) = std::fs::read(caminho) else {
-                continue;
-            };
-            if bytes.iter().take(4096).any(|b| *b == 0) {
-                continue; // binário
-            }
-            let texto = String::from_utf8_lossy(&bytes);
-
-            let padrao = match modo {
-                Modo::Texto => compilar_busca(&consulta, usar_regex, case_sensitive),
-                Modo::Definicoes => {
-                    let escapado = regex::escape(&consulta);
-                    let alternativas: Vec<String> = padroes_definicao(&ext)
-                        .into_iter()
-                        .map(|p| p.replace("{q}", &escapado))
-                        .collect();
-                    if alternativas.is_empty() {
-                        // Linguagem sem padrões: cai para busca textual.
-                        compilar_busca(&consulta, false, case_sensitive)
-                    } else {
-                        // O modo de definições também respeita
-                        // `case_sensitive`; antes ele sempre diferenciava
-                        // maiúsculas mesmo com a opção padrão (insensível).
-                        let flags = if case_sensitive { "(?m)" } else { "(?im)" };
-                        Regex::new(&format!("{flags}{}", alternativas.join("|")))
-                            .map_err(|e| ToolError::msg(format!("padrão inválido: {e}")))
+                let caminho = entrada.path();
+                if let Some(alvo) = &arquivo_unico
+                    && caminho != alvo
+                {
+                    continue;
+                }
+                let ext = caminho
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if let Some(filtro) = &glob {
+                    let sufixo = filtro.trim_start_matches('*');
+                    let sufixo = sufixo.trim_start_matches('.');
+                    if !ext.ends_with(sufixo) {
+                        continue;
                     }
                 }
-            }?;
+                // O limite precisa ser checado antes da leitura: antes o arquivo
+                // inteiro era carregado em memória para só então ser descartado.
+                let Ok(meta) = std::fs::metadata(caminho) else {
+                    continue;
+                };
+                if meta.len() > 2_000_000 {
+                    continue; // arquivo grande demais para busca em memória
+                }
+                let Ok(bytes) = std::fs::read(caminho) else {
+                    continue;
+                };
+                if bytes.iter().take(4096).any(|b| *b == 0) {
+                    continue; // binário
+                }
+                let texto = String::from_utf8_lossy(&bytes);
 
-            let linhas: Vec<&str> = texto.lines().collect();
-            let mut achados_no_arquivo = 0usize;
-            for (i, linha) in linhas.iter().enumerate() {
-                if padrao.is_match(linha) {
-                    achados_no_arquivo += 1;
-                    let rel = crate::util::display_path(&ctx.workdir, caminho);
-                    if contexto == 0 {
-                        resultados.push(format!("{}:{}: {}", rel, i + 1, linha.trim_end()));
-                    } else {
-                        let inicio = i.saturating_sub(contexto);
-                        let fim = (i + contexto + 1).min(linhas.len());
-                        let mut bloco = vec![format!("{}:{}: {}", rel, i + 1, linha.trim_end())];
-                        for (j, l) in linhas.iter().enumerate().take(fim).skip(inicio) {
-                            if j != i {
-                                bloco.push(format!("{}:{}: {}", rel, j + 1, l.trim_end()));
-                            }
+                let padrao = match modo {
+                    Modo::Texto => compilar_busca(&consulta, usar_regex, case_sensitive),
+                    Modo::Definicoes => {
+                        let escapado = regex::escape(&consulta);
+                        let alternativas: Vec<String> = padroes_definicao(&ext)
+                            .into_iter()
+                            .map(|p| p.replace("{q}", &escapado))
+                            .collect();
+                        if alternativas.is_empty() {
+                            // Linguagem sem padrões: cai para busca textual.
+                            compilar_busca(&consulta, false, case_sensitive)
+                        } else {
+                            // O modo de definições também respeita
+                            // `case_sensitive`; antes ele sempre diferenciava
+                            // maiúsculas mesmo com a opção padrão (insensível).
+                            let flags = if case_sensitive { "(?m)" } else { "(?im)" };
+                            Regex::new(&format!("{flags}{}", alternativas.join("|")))
+                                .map_err(|e| ToolError::msg(format!("padrão inválido: {e}")))
                         }
-                        resultados.push(bloco.join("\n"));
                     }
-                    total += 1;
-                    if total >= max {
-                        resultados.push(format!(
-                            "… limite de {max} ocorrências atingido; refine a busca"
-                        ));
-                        break 'arquivos;
+                }?;
+
+                let linhas: Vec<&str> = texto.lines().collect();
+                let mut achados_no_arquivo = 0usize;
+                for (i, linha) in linhas.iter().enumerate() {
+                    if padrao.is_match(linha) {
+                        achados_no_arquivo += 1;
+                        let rel = crate::util::display_path(&ctx.workdir, caminho);
+                        if contexto == 0 {
+                            resultados.push(format!("{}:{}: {}", rel, i + 1, linha.trim_end()));
+                        } else {
+                            let inicio = i.saturating_sub(contexto);
+                            let fim = (i + contexto + 1).min(linhas.len());
+                            let mut bloco =
+                                vec![format!("{}:{}: {}", rel, i + 1, linha.trim_end())];
+                            for (j, l) in linhas.iter().enumerate().take(fim).skip(inicio) {
+                                if j != i {
+                                    bloco.push(format!("{}:{}: {}", rel, j + 1, l.trim_end()));
+                                }
+                            }
+                            resultados.push(bloco.join("\n"));
+                        }
+                        total += 1;
+                        if total >= max {
+                            resultados.push(format!(
+                                "… limite de {max} ocorrências atingido; refine a busca"
+                            ));
+                            break 'arquivos;
+                        }
                     }
                 }
+                if achados_no_arquivo > 0 {
+                    arquivos_com_match += 1;
+                }
             }
-            if achados_no_arquivo > 0 {
-                arquivos_com_match += 1;
-            }
+            Ok((resultados, arquivos_com_match, total))
+        };
+
+        // A heurística automática escolhe regex para qualquer consulta com `[`,
+        // `*`, `^`… — e `items[0]` como regex casa `items0`, não o literal
+        // `items[0]`, devolvendo um falso negativo. Quando a interpretação
+        // automática (regex) não acha nada, repetimos como texto literal antes
+        // de concluir "nenhuma ocorrência". `regex: true` explícito não cai no
+        // fallback: quem pediu regex quer regex.
+        let mut tentativas = vec![usar_regex];
+        if usar_regex && !regex_explicito && modo == Modo::Texto {
+            tentativas.push(false);
         }
+        let (resultados, arquivos_com_match, total) = {
+            let mut ultima: (Vec<String>, usize, usize) = (Vec::new(), 0, 0);
+            for (i, ur) in tentativas.iter().copied().enumerate() {
+                let res = buscar(ur)?;
+                let achou = res.2 > 0;
+                ultima = res;
+                if achou || i + 1 >= tentativas.len() {
+                    break;
+                }
+            }
+            ultima
+        };
 
         if resultados.is_empty() {
             return Ok(ToolOutput::texto(format!(
@@ -402,6 +433,38 @@ mod tests {
         assert!(
             !saida.conteudo.contains("vizinho.txt"),
             "a busca vazou para o diretório: {}",
+            saida.conteudo
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A heurística automática vê `[` e liga modo regex: `items[0]` como regex
+    /// casa `items0`, não o literal `items[0]`. Sem o fallback literal, buscar o
+    /// trecho exato devolvia "nenhuma ocorrência" — falso negativo que engana o
+    /// agente.
+    #[tokio::test]
+    async fn busca_literal_com_colchetes_nao_vira_falso_negativo() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-busca-col-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("codigo.txt"),
+            "let a = items[0];\nlet b = items[1];\n",
+        )
+        .unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        let saida = SearchCode
+            .executar(serde_json::json!({"consulta": "items[0]"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            saida.conteudo.contains("items[0]"),
+            "o literal `items[0]` deveria ser encontrado: {}",
+            saida.conteudo
+        );
+        assert!(
+            !saida.conteudo.contains("Nenhuma ocorrência"),
+            "a busca retornou um falso negativo: {}",
             saida.conteudo
         );
         let _ = std::fs::remove_dir_all(&dir);

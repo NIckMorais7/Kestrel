@@ -61,6 +61,10 @@ pub struct ModelEntry {
     pub notes: Option<String>,
     #[serde(default)]
     pub owned_by: Option<String>,
+    /// Tokenizer do modelo (`o200k_base`, `cl100k_base`, `p50k_base`,
+    /// `r50k_base` ou `heuristica`). Vazio tenta reconhecer pelo id.
+    #[serde(default)]
+    pub tokenizer: Option<String>,
 }
 
 impl ModelEntry {
@@ -77,6 +81,7 @@ impl ModelEntry {
             reasoning_efforts: Vec::new(),
             notes: None,
             owned_by: None,
+            tokenizer: None,
         }
     }
 
@@ -103,6 +108,9 @@ pub struct ProviderConfig {
     pub stream: bool,
     /// Modelos conhecidos (descobertos via API e cadastrados manualmente).
     pub models: Vec<ModelEntry>,
+    /// Modelos tentados, na ordem, se o principal falhar de forma transitória
+    /// ou ficar indisponível. O modelo escolhido não é trocado no disco.
+    pub fallback_models: Vec<String>,
 }
 
 impl Default for ProviderConfig {
@@ -119,8 +127,22 @@ impl Default for ProviderConfig {
             max_retries: 3,
             stream: true,
             models: Vec::new(),
+            fallback_models: Vec::new(),
         }
     }
+}
+
+/// Modo do sandbox de execução (Landlock no Linux).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxMode {
+    /// Aplica o sandbox quando o kernel suporta; avisa e segue sem ele.
+    #[default]
+    Auto,
+    /// Não aplica confinamento (as permissões continuam valendo).
+    Off,
+    /// Exige o sandbox; falha ao iniciar se o kernel não suportar.
+    Require,
 }
 
 /// Modo de operação do agente.
@@ -195,6 +217,14 @@ pub struct AgentConfig {
     pub recovery_timeout_secs: u64,
     /// Tentativas máximas de correção por incidente.
     pub recovery_max_attempts: u32,
+    /// Confinamento real dos processos filhos (Landlock).
+    pub sandbox: SandboxMode,
+    /// Permite rede dentro do sandbox. O padrão mantém builds/downloads
+    /// funcionando; desligue para sessões de análise.
+    pub sandbox_allow_network: bool,
+    /// Diretórios extras graváveis dentro do sandbox (além do projeto,
+    /// `external_dirs`, `/tmp`, cache do usuário e `CARGO_HOME`).
+    pub sandbox_extra_writable: Vec<PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -212,6 +242,9 @@ impl Default for AgentConfig {
             max_history_messages: 200,
             recovery_timeout_secs: 1200,
             recovery_max_attempts: 15,
+            sandbox: SandboxMode::Auto,
+            sandbox_allow_network: true,
+            sandbox_extra_writable: Vec::new(),
         }
     }
 }
@@ -227,6 +260,10 @@ pub struct UiConfig {
     pub skin: String,
     /// Comp (personalidade) ativo; `None` usa o tom padrão do Kestrel.
     pub active_comp: Option<String>,
+    /// Reduz animações (Pip parado e indicador sem piscar).
+    pub reduced_motion: bool,
+    /// Atalhos personalizados: ação → combinação (`ctrl+f`, `shift+tab`, `f2`).
+    pub keybindings: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for UiConfig {
@@ -238,6 +275,8 @@ impl Default for UiConfig {
             language: "pt-BR".to_string(),
             skin: "mono".to_string(),
             active_comp: None,
+            reduced_motion: false,
+            keybindings: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -248,6 +287,10 @@ pub struct WebConfig {
     /// Mecanismo de pesquisa padrão: `duckduckgo` (sem chave) ou `searx`.
     pub engine: String,
     pub searx_url: Option<String>,
+    /// Variável de ambiente com a chave da API do Exa (fallback de busca).
+    pub exa_api_key_env: String,
+    /// Endpoint do Exa (padrão: `https://api.exa.ai/search`).
+    pub exa_url: Option<String>,
     pub user_agent: String,
     pub max_download_bytes: u64,
     /// Navegador para páginas que exigem JavaScript (detectado automaticamente).
@@ -260,9 +303,11 @@ impl Default for WebConfig {
         Self {
             engine: "duckduckgo".to_string(),
             searx_url: None,
+            exa_api_key_env: "EXA_API_KEY".to_string(),
+            exa_url: None,
             user_agent: format!(
                 "Mozilla/5.0 (X11; Linux x86_64) Kestrel/{} (agente de codificação; +terminal)",
-                env!("CARGO_PKG_VERSION")
+                crate::VERSAO
             ),
             max_download_bytes: 50 * 1024 * 1024,
             browser_bin: None,
@@ -281,6 +326,14 @@ pub struct Config {
     pub web: WebConfig,
     /// Servidores MCP locais (subprocessos que expõem ferramentas).
     pub mcp: Vec<McpServidor>,
+    /// Chaves públicas Ed25519 confiáveis para assinar servidores MCP:
+    /// `id = "<hex da chave pública>"`.
+    pub mcp_trusted_keys: std::collections::BTreeMap<String, String>,
+    /// Nível persistido antes de um override de sessão (`-p`). Nunca vai para
+    /// o TOML: garante que salvar outras opções não transforme o override em
+    /// configuração permanente.
+    #[serde(skip)]
+    pub permission_override: Option<PermissionLevel>,
 }
 
 impl Config {
@@ -439,17 +492,57 @@ impl Config {
         if self.web.max_download_bytes == 0 {
             avisos.push("web.max_download_bytes = 0 (nenhum download seria possível)".into());
         }
+        if self.web.exa_api_key_env.trim().is_empty() {
+            avisos.push("web.exa_api_key_env vazio (fallback do Exa ficará indisponível)".into());
+        }
+        if let Some(url) = self.web.exa_url.as_deref()
+            && url.trim().is_empty()
+        {
+            avisos.push("web.exa_url vazio; usando o endpoint padrão do Exa".into());
+        }
         if self.web.request_timeout_secs == 0 {
             avisos.push("web.request_timeout_secs = 0".into());
         }
         let mut vistos = std::collections::HashSet::new();
         for servidor in &self.mcp {
-            if servidor.comando.trim().is_empty() {
+            let http = servidor.transporte == McpTransporte::Http;
+            if http {
+                if servidor
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    avisos.push(format!(
+                        "servidor MCP `{}` HTTP sem `url`: ele não será iniciado",
+                        servidor.nome
+                    ));
+                }
+            } else if servidor.comando.trim().is_empty() {
                 avisos.push(format!(
                     "servidor MCP `{}` sem `comando`: ele não será iniciado",
                     servidor.nome
                 ));
                 continue;
+            }
+            if servidor.assinatura.is_some() && servidor.chave_id.is_none() {
+                avisos.push(format!(
+                    "servidor MCP `{}` tem assinatura sem `chave_id`; será recusado",
+                    servidor.nome
+                ));
+            }
+            if servidor.transporte == McpTransporte::Http
+                && servidor.oauth.is_some()
+                && servidor
+                    .oauth
+                    .as_ref()
+                    .is_some_and(|o| o.token_url.trim().is_empty())
+            {
+                avisos.push(format!(
+                    "servidor MCP `{}` com OAuth sem `token_url`",
+                    servidor.nome
+                ));
             }
             if servidor.nome.trim().is_empty() {
                 avisos.push("servidor MCP sem `nome`: use um nome curto e único".into());
@@ -468,12 +561,33 @@ impl Config {
 
     pub fn save(&self, paths: &Paths) -> anyhow::Result<()> {
         paths.ensure()?;
-        let text = toml::to_string_pretty(self)?;
+        // O override de sessão não pode ser gravado. Salva uma cópia com o
+        // nível que estava persistido antes dele.
+        let mut persistida = self.clone();
+        if let Some(anterior) = self.permission_override {
+            persistida.agent.permission = anterior;
+        }
+        let text = toml::to_string_pretty(&persistida)?;
         let file = paths.config_file();
         let tmp = file.with_extension("toml.tmp");
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, &file)?;
         Ok(())
+    }
+
+    /// Aplica o nível pedido em `-p` só a esta execução.
+    pub fn aplicar_permissao_sessao(&mut self, nivel: PermissionLevel) {
+        if self.agent.permission != nivel {
+            self.permission_override = Some(self.agent.permission);
+        }
+        self.agent.permission = nivel;
+    }
+
+    /// Alteração explícita do usuário (interface): vale para as próximas
+    /// execuções e encerra qualquer override de sessão.
+    pub fn definir_permissao(&mut self, nivel: PermissionLevel) {
+        self.permission_override = None;
+        self.agent.permission = nivel;
     }
 
     /// Valor atual da chave de API (nunca exibida na interface nem em logs).
@@ -555,17 +669,35 @@ impl Config {
     }
 }
 
-/// Um servidor MCP local que o Kestrel deve subir ao iniciar.
-///
-/// O servidor é um processo filho que fala JSON-RPC 2.0 por stdio — é o
-/// transporte que o protocolo define. Nada aqui cria superfície de rede:
-/// sem URL, sem porta.
+/// Transporte de um servidor MCP.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransporte {
+    /// JSON-RPC por stdio (processo filho).
+    #[default]
+    Stdio,
+    /// JSON-RPC por HTTP (Streamable HTTP/SSE).
+    Http,
+}
+
+/// OAuth2 client-credentials para um servidor MCP HTTP.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct McpOAuth {
+    pub token_url: String,
+    pub client_id: String,
+    /// Nome da variável de ambiente com o client secret (nunca no TOML).
+    pub client_secret_env: String,
+    pub scopes: Vec<String>,
+}
+
+/// Um servidor MCP local ou remoto.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct McpServidor {
     /// Nome curto que identifica o servidor (vira parte do nome da ferramenta).
     pub nome: String,
-    /// Executável (`npx`, `uvx`, um caminho absoluto…).
+    /// Executável (`npx`, `uvx`, um caminho absoluto…) para stdio.
     pub comando: String,
     pub args: Vec<String>,
     /// Variáveis de ambiente adicionais do servidor.
@@ -573,6 +705,23 @@ pub struct McpServidor {
     pub env: std::collections::HashMap<String, String>,
     /// Diretório de trabalho do servidor (padrão: o do Kestrel).
     pub cwd: Option<PathBuf>,
+    /// Transporte (stdio ou HTTP).
+    pub transporte: McpTransporte,
+    /// URL do endpoint JSON-RPC quando `transporte = "http"`.
+    pub url: Option<String>,
+    /// Cabeçalhos HTTP extras (a autorização pode vir daqui ou do OAuth).
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Variável de ambiente com um bearer token para HTTP.
+    pub token_env: Option<String>,
+    /// Credenciais OAuth2 client-credentials para HTTP.
+    pub oauth: Option<McpOAuth>,
+    /// Assinatura Ed25519 (hex) do manifesto canônico do servidor.
+    pub assinatura: Option<String>,
+    /// Id da chave em `mcp_trusted_keys`.
+    pub chave_id: Option<String>,
+    /// Digest SHA-256 (hex) esperado do executável (stdio).
+    pub sha256: Option<String>,
 }
 
 /// Config corrompido: o original é preservado e o usuário é avisado, em vez de
@@ -728,5 +877,33 @@ mod tests {
                 .expect("chaves antigas devem ser ignoradas");
         assert_eq!(cfg.agent.permission, PermissionLevel::Semi);
         assert!(cfg.ui.show_mascot);
+    }
+
+    #[test]
+    fn override_de_sessao_nao_e_persistido() {
+        let raiz = std::env::temp_dir().join(format!(
+            "kestrel-config-teste-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = Paths::custom(Some(raiz.join("cfg")), Some(raiz.join("data")));
+        let mut cfg = Config::default();
+        cfg.agent.permission = PermissionLevel::Write;
+
+        // `-p full` muda só a execução atual; salvar outra opção não pode
+        // transformar o override em configuração permanente.
+        cfg.aplicar_permissao_sessao(PermissionLevel::Full);
+        assert_eq!(cfg.agent.permission, PermissionLevel::Full);
+        cfg.save(&paths).unwrap();
+        let lido: Config =
+            toml::from_str(&std::fs::read_to_string(paths.config_file()).unwrap()).unwrap();
+        assert_eq!(lido.agent.permission, PermissionLevel::Write);
+
+        // Escolha explícita na interface persiste e encerra o override.
+        cfg.definir_permissao(PermissionLevel::Semi);
+        cfg.save(&paths).unwrap();
+        let lido: Config =
+            toml::from_str(&std::fs::read_to_string(paths.config_file()).unwrap()).unwrap();
+        assert_eq!(lido.agent.permission, PermissionLevel::Semi);
+        let _ = std::fs::remove_dir_all(&raiz);
     }
 }

@@ -24,10 +24,177 @@ use crossterm::event::{
 };
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Uma combinação de tecla configurável.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Atalho {
+    pub code: KeyCode,
+    pub mods: KeyModifiers,
+}
+
+/// Mapa ação → tecla, com padrões substituíveis por `ui.keybindings`.
+#[derive(Clone, Debug)]
+pub struct Keymap {
+    mapa: HashMap<String, Atalho>,
+}
+
+impl Default for Keymap {
+    fn default() -> Self {
+        Self::novo(&std::collections::BTreeMap::new())
+    }
+}
+
+impl Keymap {
+    pub const ACOES: &'static [(&'static str, &'static str, &'static str)] = &[
+        ("buscar", "ctrl+f", "buscar na conversa"),
+        ("copiar", "ctrl+y", "copiar a última resposta (OSC 52)"),
+        ("ajuda", "f1", "abrir a ajuda"),
+        ("raciocinio", "f2", "mostrar/ocultar raciocínio"),
+        ("permissoes", "backtab", "ciclar o nível de permissão"),
+        ("rolar_cima", "pageup", "rolar para cima"),
+        ("rolar_baixo", "pagedown", "rolar para baixo"),
+        (
+            "interromper",
+            "esc",
+            "interromper o turno / limpar o rascunho",
+        ),
+    ];
+
+    pub fn novo(overrides: &std::collections::BTreeMap<String, String>) -> Self {
+        let mut mapa = HashMap::new();
+        for (acao, spec, _) in Self::ACOES {
+            if let Some(atalho) = parse_atalho(spec) {
+                mapa.insert((*acao).to_string(), atalho);
+            }
+        }
+        for (acao, spec) in overrides {
+            let acao = acao.trim().to_lowercase();
+            if !Self::ACOES.iter().any(|(nome, _, _)| *nome == acao) {
+                continue;
+            }
+            if let Some(atalho) = parse_atalho(spec) {
+                // Teclas de caractere sem Ctrl/Alt colidiriam com a digitação
+                // no campo de mensagem; o padrão da ação é mantido.
+                let seguro = !matches!(atalho.code, KeyCode::Char(_))
+                    || atalho
+                        .mods
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                if seguro {
+                    mapa.insert(acao, atalho);
+                }
+            } else {
+                mapa.remove(&acao);
+            }
+        }
+        Self { mapa }
+    }
+
+    pub fn acao(&self, tecla: &KeyEvent) -> Option<&str> {
+        self.mapa.iter().find_map(|(acao, atalho)| {
+            (tecla.code == atalho.code && tecla.modifiers == atalho.mods).then_some(acao.as_str())
+        })
+    }
+
+    pub fn descricao(&self, acao: &str) -> String {
+        self.mapa
+            .get(acao)
+            .map(descrever_atalho)
+            .unwrap_or_else(|| "(desativado)".into())
+    }
+}
+
+fn descrever_atalho(atalho: &Atalho) -> String {
+    let mut partes = Vec::new();
+    if atalho.mods.contains(KeyModifiers::CONTROL) {
+        partes.push("ctrl".to_string());
+    }
+    if atalho.mods.contains(KeyModifiers::ALT) {
+        partes.push("alt".to_string());
+    }
+    if atalho.mods.contains(KeyModifiers::SHIFT) {
+        partes.push("shift".to_string());
+    }
+    let tecla = match atalho.code {
+        KeyCode::F(n) => format!("f{n}"),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::PageUp => "pageup".into(),
+        KeyCode::PageDown => "pagedown".into(),
+        KeyCode::Tab => "tab".into(),
+        KeyCode::BackTab => "shift+tab".into(),
+        KeyCode::Enter => "enter".into(),
+        KeyCode::Esc => "esc".into(),
+        KeyCode::Backspace => "backspace".into(),
+        KeyCode::Up => "up".into(),
+        KeyCode::Down => "down".into(),
+        KeyCode::Left => "left".into(),
+        KeyCode::Right => "right".into(),
+        KeyCode::Home => "home".into(),
+        KeyCode::End => "end".into(),
+        outro => format!("{outro:?}").to_lowercase(),
+    };
+    partes.push(tecla);
+    partes.join("+")
+}
+
+fn parse_atalho(spec: &str) -> Option<Atalho> {
+    let partes: Vec<String> = spec
+        .split('+')
+        .map(|p| p.trim().to_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let (nome, mods) = partes.split_last()?;
+    let mut modificadores = KeyModifiers::NONE;
+    for parte in mods {
+        match parte.as_str() {
+            "ctrl" | "control" => modificadores |= KeyModifiers::CONTROL,
+            "alt" => modificadores |= KeyModifiers::ALT,
+            "shift" => modificadores |= KeyModifiers::SHIFT,
+            _ => return None,
+        }
+    }
+    let tecla = match nome.as_str() {
+        "esc" | "escape" => KeyCode::Esc,
+        "enter" | "return" => KeyCode::Enter,
+        "backtab" => KeyCode::BackTab,
+        "tab" if modificadores.contains(KeyModifiers::SHIFT) => {
+            // Shift+Tab chega como BackTab no crossterm.
+            modificadores.remove(KeyModifiers::SHIFT);
+            KeyCode::BackTab
+        }
+        "tab" => KeyCode::Tab,
+        "backspace" => KeyCode::Backspace,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" | "pgup" => KeyCode::PageUp,
+        "pagedown" | "pgdn" => KeyCode::PageDown,
+        "space" => KeyCode::Char(' '),
+        "delete" | "del" => KeyCode::Delete,
+        outra => {
+            if let Some(numero) = outra.strip_prefix('f')
+                && let Ok(n) = numero.parse::<u8>()
+                && (1..=12).contains(&n)
+            {
+                KeyCode::F(n)
+            } else if outra.chars().count() == 1 {
+                KeyCode::Char(outra.chars().next()?)
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(Atalho {
+        code: tecla,
+        mods: modificadores,
+    })
+}
 
 /// Um bloco da conversa exibida.
 #[derive(Debug)]
@@ -627,6 +794,11 @@ pub enum Modal {
     ConfirmarComp {
         nome: String,
     },
+    /// Busca textual na conversa, com salto entre ocorrências.
+    Busca {
+        consulta: String,
+        indice: usize,
+    },
 }
 
 /// Estado completo da interface.
@@ -672,8 +844,6 @@ pub struct App {
     /// PNG do Pip já codificado no protocolo gráfico do terminal. `None`
     /// quando o mascote está desligado ou o terminal não pôde ser consultado.
     pub pip_grafico: Option<PipGrafico>,
-    /// Ícone do Kestrel já codificado nas versões clara/escura.
-    pub icone: Option<crate::ui::icone::IconeKestrel>,
     pip_piscada_ate: u64,
     pip_proxima_piscada: u64,
     pip_sorteio: u64,
@@ -698,6 +868,16 @@ pub struct App {
     pub scroll_alvo: u16,
     /// Tick em que o modal atual foi aberto (animação de crescimento).
     pub modal_desde: Option<u64>,
+    /// Versão das linhas renderizadas; invalida caches de altura/quebra.
+    pub versao_linhas: u64,
+    /// Cache de alturas: (largura, versão, prefixo de linhas renderizadas).
+    pub cache_alturas: Option<(usize, u64, Vec<usize>)>,
+    /// Atalhos efetivos (padrões + `ui.keybindings`).
+    pub keymap: Keymap,
+    /// Idioma da interface.
+    pub idioma: crate::i18n::Idioma,
+    /// Animações reduzidas.
+    pub movimento_reduzido: bool,
 }
 
 impl App {
@@ -718,6 +898,9 @@ impl App {
             entrada.carregar_historico(itens);
         }
         let mostrar_raciocinio = config.ui.show_reasoning;
+        let movimento_reduzido = config.ui.reduced_motion;
+        let idioma = crate::i18n::Idioma::de_config(&config.ui.language);
+        let keymap = Keymap::novo(&config.ui.keybindings);
         let modelo = config.provider.model.clone();
         let esforco = config.provider.reasoning_effort.clone();
         let nivel = config.agent.permission;
@@ -758,7 +941,6 @@ impl App {
             modo,
             pip: AnimacaoPip::default(),
             pip_grafico: None,
-            icone: None,
             pip_piscada_ate: 0,
             pip_proxima_piscada: 20,
             pip_sorteio: 0x9E37_79B9_7F4A_7C15,
@@ -772,6 +954,11 @@ impl App {
             contexto_exibido: 0,
             scroll_alvo: 0,
             modal_desde: None,
+            versao_linhas: 0,
+            cache_alturas: None,
+            keymap,
+            idioma,
+            movimento_reduzido,
         }
     }
 
@@ -833,6 +1020,7 @@ impl App {
 
     /// Reconstrói as linhas a partir do bloco `inicio` (os anteriores não mudam).
     pub fn reconstruir_do(&mut self, inicio: usize) {
+        self.versao_linhas = self.versao_linhas.wrapping_add(1);
         if inicio >= self.blocos.len() {
             self.linhas.clear();
             self.marcos.clear();
@@ -875,10 +1063,21 @@ impl App {
     }
 
     fn limpar_conversa(&mut self) {
+        self.versao_linhas = self.versao_linhas.wrapping_add(1);
         self.blocos.clear();
         self.linhas.clear();
         self.marcos.clear();
+        // `recolhidos` guarda índices POSICIONAIS em `blocos`: sem zerar, os
+        // índices da conversa anterior passam a valer para a nova e um bloco
+        // que o usuário nunca fechou aparece com uma linha só (o resumo e o
+        // diff desaparecem) depois de um `/clear` ou troca de projeto.
+        self.recolhidos.clear();
         self.scroll = 0;
+        // O alvo precisa nascer alinhado à posição: um valor antigo (ex.: 300)
+        // fazia `tiquetaquear` puxar o scroll de volta todo quadro, e o
+        // desenho o clampava de novo — nunca convergindo, com redesenho
+        // forçado em todos os quadros.
+        self.scroll_alvo = self.scroll;
         self.seguir_fim = true;
     }
 
@@ -1102,6 +1301,61 @@ impl App {
                 );
             }
             "/person" | "/pessoa" | "/comp" => self.executar_person(&argumento),
+            "/branch" | "/ramificar" | "/checkpoint" => {
+                let titulo = if argumento.trim().is_empty() {
+                    None
+                } else {
+                    Some(argumento.trim().to_string())
+                };
+                let _ = self.cmd_tx.send(UiCommand::Ramificar { titulo });
+                self.avisar_rapido("criando ramo da sessão…".into(), 20);
+            }
+            "/keys" | "/atalhos" => {
+                let mut linhas = vec![
+                    "Atalhos configuráveis (em `ui.keybindings`, ação = \"tecla\"):".to_string(),
+                ];
+                for (acao, _, descricao) in Keymap::ACOES {
+                    linhas.push(format!(
+                        "  {:<14} {}  — {descricao}",
+                        self.keymap.descricao(acao),
+                        acao
+                    ));
+                }
+                linhas.push(String::new());
+                linhas.push("Padrões: ctrl+f busca, ctrl+y copia a última resposta, f1 ajuda, f2 raciocínio, shift+tab permissões, pageup/pagedown rolam.".into());
+                self.abrir_modal(Modal::Texto {
+                    titulo: self.idioma.t(crate::i18n::Chave::Atalhos).to_string(),
+                    linhas: linhas.into_iter().map(Line::from).collect(),
+                    scroll: 0,
+                });
+            }
+            "/lang" | "/language" | "/idioma" => match argumento.trim().to_lowercase().as_str() {
+                "" => self.avisar(format!(
+                    "idioma atual: {}. Use `/lang pt` ou `/lang en`.",
+                    self.idioma.codigo()
+                )),
+                "pt" | "pt-br" | "portugues" | "português" => {
+                    self.idioma = crate::i18n::Idioma::PtBr;
+                    self.config.ui.language = "pt-BR".into();
+                    if let Err(e) = self.config.save(&self.paths) {
+                        self.avisar(format!("idioma aplicado, mas não foi salvo: {e}"));
+                    } else {
+                        self.construir_tudo();
+                        self.avisar_rapido("idioma: pt-BR".into(), 20);
+                    }
+                }
+                "en" | "en-us" | "english" | "ingles" | "inglês" => {
+                    self.idioma = crate::i18n::Idioma::EnUs;
+                    self.config.ui.language = "en-US".into();
+                    if let Err(e) = self.config.save(&self.paths) {
+                        self.avisar(format!("language applied but not saved: {e}"));
+                    } else {
+                        self.construir_tudo();
+                        self.avisar_rapido("language: en-US".into(), 20);
+                    }
+                }
+                outro => self.avisar(format!("idioma `{outro}` inválido; use `pt` ou `en`.")),
+            },
             "/skin" | "/tema" => {
                 // Recarrega do disco: skins próprias criadas depois da sessão
                 // entrarem aparecem sem reiniciar o Kestrel.
@@ -1130,13 +1384,27 @@ impl App {
                             // Markdown e outros widgets guardam estilos já
                             // resolvidos; reconstruir aplica a nova paleta.
                             self.construir_tudo();
-                            self.avisar_rapido(
-                                format!(
-                                    "skin `{}` aplicada. Use /skin sem argumento para ver as opções.",
+                            // A moldura do Pip é opaca na cor do app: sem
+                            // recodificar, a skin antiga ficaria como um
+                            // retângulo ao redor dele.
+                            let erro_pip = self
+                                .pip_grafico
+                                .as_mut()
+                                .and_then(|pip| pip.atualizar_tema().err());
+                            if let Some(e) = erro_pip {
+                                self.avisar(format!(
+                                    "skin `{}` aplicada, mas o Pip não pôde ser recriado: {e}",
                                     theme::skin_atual()
-                                ),
-                                20,
-                            );
+                                ));
+                            } else {
+                                self.avisar_rapido(
+                                    format!(
+                                        "skin `{}` aplicada. Use /skin sem argumento para ver as opções.",
+                                        theme::skin_atual()
+                                    ),
+                                    20,
+                                );
+                            }
                         }
                         Err(e) => self.avisar(e),
                     }
@@ -1147,6 +1415,7 @@ impl App {
                     self.abrir_modal(Modal::Permissoes(seletor_permissoes(self.nivel)));
                 } else if let Some(nivel) = PermissionLevel::parse(&argumento) {
                     self.nivel = nivel;
+                    self.config.definir_permissao(nivel);
                     let _ = self.cmd_tx.send(UiCommand::DefinirPermissao(nivel));
                     self.avisar_rapido(
                         format!(
@@ -1176,6 +1445,20 @@ impl App {
                 )),
             },
             "/skills" | "/habilidades" => {
+                if matches!(
+                    argumento.trim().to_lowercase().as_str(),
+                    "reload" | "recarregar" | "atualizar"
+                ) {
+                    self.skills =
+                        Arc::new(SkillRegistry::discover(&self.paths, &self.config.workdir()));
+                    let _ = self.cmd_tx.send(UiCommand::RecarregarSkills);
+                    self.construir_tudo();
+                    self.avisar_rapido(
+                        format!("{} skill(s) recarregada(s)", self.skills.all().len()),
+                        20,
+                    );
+                    return;
+                }
                 if self.skills.is_empty() {
                     self.avisar(format!(
                         "nenhuma skill instalada. Diretórios monitorados:\n- {}\n- {}/.kestrel/skills",
@@ -1707,6 +1990,25 @@ impl App {
                     self.avisar(format!("Falha ao escrever {}", absoluto.display()));
                     return;
                 }
+                if let Err(e) = self.store.marcar_alteracao_desfeita(alt.id) {
+                    // O arquivo já foi restaurado; sem a marca, o próximo
+                    // `/undo` tentaria reaplicar este mesmo diff (que não bate
+                    // mais) e travaria a pilha. Desfaz a escrita para manter
+                    // arquivo e banco consistentes: o usuário pode tentar de
+                    // novo em vez de perder a possibilidade de desfazer.
+                    if let Err(revert) = std::fs::write(&absoluto, &atual) {
+                        self.avisar(format!(
+                            "Arquivo restaurado, mas não foi possível registrar o desfazer ({e}) \
+                             nem reverter a escrita ({revert}). Verifique {} manualmente.",
+                            absoluto.display()
+                        ));
+                    } else {
+                        self.avisar(format!(
+                            "Não foi possível registrar o desfazer: {e}. O arquivo foi mantido como estava."
+                        ));
+                    }
+                    return;
+                }
                 self.avisar(format!(
                     "Desfeito: {} voltou ao estado anterior ({} caracteres).",
                     alt.path,
@@ -2082,6 +2384,10 @@ impl App {
             }
             ValorSeletor::Permissao(nivel) => {
                 self.nivel = nivel;
+                // Mantém a cópia da interface em sincronia: os outros `save`
+                // (skin, raciocínio) gravam o Config inteiro e, sem isto,
+                // revertiam o nível recém-escolhido no disco.
+                self.config.definir_permissao(nivel);
                 let _ = self.cmd_tx.send(UiCommand::DefinirPermissao(nivel));
             }
             ValorSeletor::Sessao(id) => {
@@ -2318,6 +2624,7 @@ impl App {
                     || modelos
                         .iter()
                         .any(|m| !self.config.provider.models.iter().any(|e| e.id == m.id));
+                crate::tokenizer::registrar_modelos(&modelos);
                 self.config.provider.models = modelos;
                 if mudou && let Err(e) = self.config.save(&self.paths) {
                     self.avisar(format!("catálogo atualizado, mas falha ao salvar: {e}"));
@@ -2427,6 +2734,21 @@ impl App {
                     }
                 }
                 self.estado_texto = com_maiuscula(mensagem);
+            }
+            AgentEvent::Ramificada {
+                id,
+                titulo,
+                mensagens,
+            } => {
+                self.sessao_id = id;
+                self.sessao_titulo = titulo.clone();
+                self.avisar_rapido(
+                    format!(
+                        "ramo criado: «{}» ({mensagens} mensagens copiadas)",
+                        crate::util::truncate(&titulo, 50)
+                    ),
+                    30,
+                );
             }
             AgentEvent::SessaoAtiva {
                 id,
@@ -2659,14 +2981,17 @@ impl App {
     fn tratar_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.rolar_para(self.scroll.saturating_sub(3));
-                self.seguir_fim = false;
+                let alvo = self.scroll_alvo.saturating_sub(3);
+                self.rolar_para(alvo);
             }
             MouseEventKind::ScrollDown => {
-                self.rolar_para(self.scroll.saturating_add(3));
-                // Chegar ao fim pelo mouse volta a acompanhar o estado mais
-                // recente: a conferência final é feita em
-                // `ui::desenhar_conversa`, que conhece a altura real da área.
+                // No fim, descer não precisa desligar o acompanhamento; fora
+                // dele, o alvo parte da posição desejada (não da animada), para
+                // vários giros seguidos não se perderem.
+                if !self.seguir_fim {
+                    let alvo = self.scroll_alvo.saturating_add(3);
+                    self.rolar_para(alvo);
+                }
             }
             MouseEventKind::Down(botao) => {
                 // Clique no atalho "voltar para o último".
@@ -2702,11 +3027,200 @@ impl App {
         }
     }
 
+    /// Converte uma linha lógica para o deslocamento renderizado, quando o
+    /// cache de quebra está disponível.
+    fn app_scroll_da_linha(&self, linha: usize) -> usize {
+        self.cache_alturas
+            .as_ref()
+            .and_then(|(_, _, prefixo)| prefixo.get(linha).copied())
+            .unwrap_or(linha)
+    }
+
+    /// Executa uma ação configurável. Devolve `false` se a ação não existe.
+    fn executar_acao(&mut self, acao: &str) -> bool {
+        match acao {
+            "buscar" => {
+                self.abrir_busca();
+                true
+            }
+            "copiar" => {
+                self.copiar_ultima_resposta();
+                true
+            }
+            "ajuda" => {
+                self.abrir_modal(Modal::Ajuda {
+                    linhas: texto_de_ajuda(),
+                    scroll: 0,
+                });
+                true
+            }
+            "raciocinio" => {
+                self.definir_raciocinio(!self.mostrar_raciocinio);
+                let estado = if self.mostrar_raciocinio {
+                    "raciocínio visível"
+                } else {
+                    "raciocínio oculto"
+                };
+                self.avisar_rapido(estado.to_string(), 20);
+                true
+            }
+            "permissoes" => {
+                self.ciclar_permissao();
+                true
+            }
+            "rolar_cima" => {
+                let alvo = self.scroll_alvo.saturating_sub(15);
+                self.rolar_para(alvo);
+                true
+            }
+            "rolar_baixo" => {
+                if !self.seguir_fim {
+                    let alvo = self.scroll_alvo.saturating_add(15);
+                    self.rolar_para(alvo);
+                }
+                true
+            }
+            "interromper" => {
+                if self.turno_ativo {
+                    let _ = self.cmd_tx.send(UiCommand::Interromper);
+                    self.empurrar_bloco(Bloco::Aviso(
+                        "interrupção solicitada; as alterações já feitas serão preservadas".into(),
+                    ));
+                } else {
+                    self.entrada.limpar();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn ciclar_permissao(&mut self) {
+        self.nivel = self.nivel.cycle();
+        self.config.definir_permissao(self.nivel);
+        let _ = self.cmd_tx.send(UiCommand::DefinirPermissao(self.nivel));
+        self.avisar_rapido(
+            format!(
+                "nível de permissão: {} — {}",
+                self.nivel.label(),
+                self.nivel.description()
+            ),
+            20,
+        );
+    }
+
+    /// Copia a última resposta do assistente via OSC 52 (funciona em terminais
+    /// e em SSH que aceitam a sequência; tmux pode exigir `set-clipboard on`).
+    fn copiar_ultima_resposta(&mut self) {
+        let texto = self.blocos.iter().rev().find_map(|bloco| match bloco {
+            Bloco::Assistente(texto) if !texto.trim().is_empty() => Some(texto.clone()),
+            _ => None,
+        });
+        let Some(texto) = texto else {
+            self.avisar(self.idioma.t(crate::i18n::Chave::SemResposta).to_string());
+            return;
+        };
+        let codificado = crate::util::base64(texto.as_bytes());
+        use std::io::Write;
+        let mut saida = std::io::stdout();
+        if saida
+            .write_all(format!("\x1b]52;c;{codificado}\x07").as_bytes())
+            .is_ok()
+        {
+            self.avisar_rapido(self.idioma.t(crate::i18n::Chave::Copiada).to_string(), 20);
+        } else {
+            self.avisar("não foi possível enviar a cópia ao terminal".into());
+        }
+    }
+
+    fn abrir_busca(&mut self) {
+        self.abrir_modal(Modal::Busca {
+            consulta: String::new(),
+            indice: 0,
+        });
+    }
+
+    pub(crate) fn linhas_com(&self, consulta: &str) -> Vec<usize> {
+        let consulta = consulta.trim().to_lowercase();
+        if consulta.is_empty() {
+            return Vec::new();
+        }
+        self.linhas
+            .iter()
+            .enumerate()
+            .filter(|(_, linha)| {
+                let texto: String = linha
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .to_lowercase();
+                texto.contains(&consulta)
+            })
+            .map(|(indice, _)| indice)
+            .collect()
+    }
+
+    fn buscar_saltar(&mut self, passo: isize) {
+        let (consulta, indice_atual) = match &self.modal {
+            Some(Modal::Busca { consulta, indice }) => (consulta.clone(), *indice),
+            _ => return,
+        };
+        let achados = self.linhas_com(&consulta);
+        if achados.is_empty() {
+            return;
+        }
+        let novo = if passo == 0 {
+            indice_atual.min(achados.len() - 1)
+        } else if passo > 0 {
+            (indice_atual + passo as usize) % achados.len()
+        } else {
+            let volta = (-passo) as usize % achados.len();
+            (indice_atual + achados.len() - volta) % achados.len()
+        };
+        if let Some(Modal::Busca { indice, .. }) = &mut self.modal {
+            *indice = novo;
+        }
+        let linha = achados[novo];
+        // Converte a linha lógica para a posição renderizada usando o cache de
+        // alturas (quando disponível): linhas longas quebram em várias e o
+        // salto precisa cair na linha certa, não no índice lógico.
+        let alvo_renderizado = self.app_scroll_da_linha(linha);
+        self.seguir_fim = false;
+        self.scroll_alvo = alvo_renderizado.min(u16::MAX as usize) as u16;
+    }
+
+    fn tratar_busca(&mut self, tecla: KeyEvent) {
+        let controle = tecla.modifiers.contains(KeyModifiers::CONTROL);
+        match tecla.code {
+            KeyCode::Esc => self.fechar_modal(),
+            KeyCode::Enter | KeyCode::Down => self.buscar_saltar(1),
+            KeyCode::Up => self.buscar_saltar(-1),
+            KeyCode::Backspace => {
+                if let Some(Modal::Busca { consulta, indice }) = &mut self.modal {
+                    consulta.pop();
+                    *indice = 0;
+                }
+                self.buscar_saltar(0);
+            }
+            KeyCode::Char(c) if !controle => {
+                if let Some(Modal::Busca { consulta, indice }) = &mut self.modal {
+                    consulta.push(c);
+                    *indice = 0;
+                }
+                self.buscar_saltar(0);
+            }
+            _ => {}
+        }
+    }
+
     /// Volta a acompanhar o estado mais recente da conversa.
     fn ir_para_o_fim(&mut self) {
         // O desenho posiciona `scroll` no máximo quando `seguir_fim` é true.
+        // Um alvo em `u16::MAX` nunca convergia: o desenho clampava `scroll`
+        // para `max_scroll`, `tiquetaquear` o puxava de volta para cima e a
+        // interface redesenhanvava para sempre sem chegar ao fim.
         self.seguir_fim = true;
-        self.scroll = u16::MAX;
         self.scroll_alvo = self.scroll;
     }
 
@@ -2753,6 +3267,14 @@ impl App {
         }
         if self.modal.is_some() {
             self.tratar_tecla_modal(tecla);
+            return;
+        }
+        // Atalhos configuráveis (padrões ou `ui.keybindings`). Só sem modal;
+        // dentro de um modal as teclas pertencem ao editor do modal.
+        if tecla.kind == KeyEventKind::Press
+            && let Some(acao) = self.keymap.acao(&tecla).map(str::to_string)
+            && self.executar_acao(&acao)
+        {
             return;
         }
         let alt = tecla.modifiers.contains(KeyModifiers::ALT);
@@ -2819,26 +3341,6 @@ impl App {
                     self.sugestao_sel = 0;
                 }
             }
-            KeyCode::BackTab => {
-                // Shift+Tab alterna o nível de permissão em ciclo.
-                self.nivel = self.nivel.cycle();
-                let _ = self.cmd_tx.send(UiCommand::DefinirPermissao(self.nivel));
-                self.avisar_rapido(
-                    format!(
-                        "nível de permissão: {} — {}",
-                        self.nivel.label(),
-                        self.nivel.description()
-                    ),
-                    20,
-                );
-            }
-            KeyCode::PageUp => {
-                self.rolar_para(self.scroll.saturating_sub(15));
-                self.seguir_fim = false;
-            }
-            KeyCode::PageDown => {
-                self.rolar_para(self.scroll.saturating_add(15));
-            }
             KeyCode::Esc => {
                 if self.turno_ativo {
                     let _ = self.cmd_tx.send(UiCommand::Interromper);
@@ -2849,26 +3351,15 @@ impl App {
                     self.entrada.limpar();
                 }
             }
-            KeyCode::F(1) => {
-                self.abrir_modal(Modal::Ajuda {
-                    linhas: texto_de_ajuda(),
-                    scroll: 0,
-                });
-            }
-            KeyCode::F(2) => {
-                self.definir_raciocinio(!self.mostrar_raciocinio);
-                let estado = if self.mostrar_raciocinio {
-                    "visível"
-                } else {
-                    "oculto"
-                };
-                self.avisar_rapido(format!("raciocínio do modelo agora está {estado}"), 20);
-            }
             _ => {}
         }
     }
 
     fn tratar_tecla_modal(&mut self, tecla: KeyEvent) {
+        if matches!(self.modal, Some(Modal::Busca { .. })) {
+            self.tratar_busca(tecla);
+            return;
+        }
         let controle = tecla.modifiers.contains(KeyModifiers::CONTROL);
         let alt = tecla.modifiers.contains(KeyModifiers::ALT);
         enum Reacao {
@@ -2884,6 +3375,7 @@ impl App {
         }
         let reacao = match self.modal.as_mut() {
             None => Reacao::Nada,
+            Some(Modal::Busca { .. }) => Reacao::Nada,
             Some(Modal::Confirmacao(_)) if controle || alt => Reacao::Nada,
             Some(Modal::Confirmacao(_)) => match tecla.code {
                 KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Enter => {
@@ -3166,22 +3658,39 @@ impl App {
         }
 
         // Animação do Pip: caminhada, respiração e piscada, quadro a quadro.
-        let anterior = self.pip;
-        let mut novo = mascot::quadro_de(self.tick);
-        // A piscada só acontece no repouso; se o horário chegar durante a
-        // caminhada, ela espera o próximo tique parado.
-        if novo.dx == 0 && self.tick >= self.pip_proxima_piscada {
-            novo.piscando = true;
-            // Dois quadros fechados: uma piscada de 120 ms é quase invisível.
-            self.pip_piscada_ate = self.tick + 2;
-            let intervalo = self.intervalo_de_piscada();
-            self.pip_proxima_piscada = self.tick + intervalo;
-        } else if self.pip.piscando && self.tick > self.pip_piscada_ate {
-            novo.piscando = false;
-        }
-        self.pip = novo;
-        if self.pip != anterior {
-            mudou = true;
+        // Só na recepção: numa conversa longa o mascote nem é desenhado, e
+        // animá-lo forçaria um redesenho completo a cada quadro.
+        if self.movimento_reduzido {
+            if self.pip != AnimacaoPip::default() {
+                self.pip = AnimacaoPip::default();
+                mudou = true;
+            }
+        } else if self.pip_animado() {
+            let anterior = self.pip;
+            let mut novo = mascot::quadro_de(self.tick);
+            // A piscada só acontece no repouso e precisa de quadros parados
+            // suficientes: durante a caminhada não existem quadros piscando
+            // (o olho fechado é gerado só na posição central).
+            if novo.dx == 0 && self.tick >= self.pip_proxima_piscada {
+                if mascot::quadro_de(self.tick + 3).dx == 0 {
+                    novo.piscando = true;
+                    self.pip_piscada_ate = self.tick + 3;
+                    let intervalo = self.intervalo_de_piscada();
+                    self.pip_proxima_piscada = self.tick + intervalo;
+                } else {
+                    // Perto do fim do repouso: espera o próximo.
+                    self.pip_proxima_piscada = self.tick + 1;
+                }
+            }
+            if self.pip.piscando && self.tick <= self.pip_piscada_ate {
+                novo.piscando = true;
+            } else if self.pip.piscando && self.tick > self.pip_piscada_ate {
+                novo.piscando = false;
+            }
+            self.pip = novo;
+            if self.pip != anterior {
+                mudou = true;
+            }
         }
         // Rolagem suave: o alvo é onde se quer chegar, `scroll` caminha até lá.
         if self.scroll != self.scroll_alvo {
@@ -3204,7 +3713,14 @@ impl App {
             .pip_sorteio
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        16 + (self.pip_sorteio >> 33) % 20
+        // Na cadência da recepção (40 ms), 80–140 tiques dão 3,2–5,6 s.
+        80 + (self.pip_sorteio >> 33) % 60
+    }
+
+    /// O Pip só é desenhado na recepção de sessão nova. Fora dela, animar
+    /// gastaria redesenhos sem nada visível.
+    pub fn pip_animado(&self) -> bool {
+        self.config.ui.show_mascot && self.blocos.is_empty()
     }
 
     /// Persiste o histórico de entrada em disco.
@@ -3237,10 +3753,14 @@ fn limitar_texto(texto: &mut String) {
     if texto.len() <= TETO_TEXTO {
         return;
     }
-    let excesso = texto.chars().count().saturating_sub(TETO_TEXTO);
-    if excesso > 0 {
-        *texto = texto.chars().skip(excesso).collect();
+    // Corta por bytes em fronteira de caractere: comparar bytes mas subtrair
+    // contagem de chars deixava texto multibyte acima do teto sem corte — e
+    // ainda varria a string inteira a cada delta (O(n²)).
+    let mut corte = texto.len() - TETO_TEXTO;
+    while corte < texto.len() && !texto.is_char_boundary(corte) {
+        corte += 1;
     }
+    texto.drain(..corte);
 }
 
 fn com_maiuscula(texto: String) -> String {
@@ -3326,6 +3846,7 @@ comandos (âmbar), web (ciano), falha (vermelho) e subagente (violeta).\n\
          - Troque com `/chat` e `/agent`; o modo atual aparece no topo da interface e é registrado na auditoria.\n\n\
          ## Rodapé do turno\n\n\
          - Ao fim de cada turno aparece só uma linha discreta: duração, tokens por segundo, modelo e modo.\n\
+         - O rodapé inferior usa um círculo: apagado ocioso, piscando enquanto trabalha, branco ao concluir e vermelho em erro.\n\
          - O rodapé inferior não mostra skills nem “enter envia”; use `/skills` para ver as skills.\n\n\
          ## Nova sessão e progresso\n\n\
          - Em uma sessão nova, o Pip e instruções curtas aparecem no chat; ambos somem na primeira mensagem.\n\
@@ -3349,19 +3870,31 @@ Prontas: `mono` (padrão), `kestrel`, `daylight`; skins próprias em `~/.config/
          - Up/Down navega no histórico (ou nas sugestões de comando); Tab ou Enter completam um comando parcial\n\
          - Ctrl+C interrompe o turno; pressione de novo para sair\n\
          - Esc interrompe o turno\n\
+         - Ctrl+F busca na conversa (Enter/↓ próximo, ↑ anterior)\n\
+         - Ctrl+Y copia a última resposta via OSC 52\n\
          - Shift+Tab alterna o nível de permissão em ciclo\n\
          - F1 ajuda · F2 mostra/oculta o raciocínio do modelo (o mesmo que `/thinking`)\n\
          - PageUp/PageDown e a roda do mouse rolam a conversa\n\
+         - Todos esses atalhos podem ser trocados em `[ui.keybindings]`; `/keys` mostra os atuais\n\
          - Rolando para cima você pode ler o histórico à vontade; o canto do campo de mensagem \
 ganha o atalho `↓ voltar para o último` (clique ou role até o fim para voltar a acompanhar)\n\n\
-         ## MCP (servidores locais)\n\n\
-         - Servidores declarados em `[[mcp]]` no `config.toml` são iniciados junto com o Kestrel e suas ferramentas entram na lista do modelo com o prefixo `mcp__<servidor>__<ferramenta>`.\n\
-         - Só stdio: o servidor é um processo filho, sem URL nem porta — não há superfície de rede nova.\n\
+         ## Tokens, fallback e sandbox\n\n\
+         - A contagem de contexto usa tokenizer real por modelo (tiktoken) quando disponível e calibra com o `usage` do provedor.\n\
+         - `provider.fallback_models` tenta o próximo modelo em indisponibilidade/limite/rede/5xx, sem trocar o modelo salvo.\n\
+         - `agent.sandbox = \"auto\"` confina processos filhos com Landlock (escrita só no projeto/caches; rede opcional).\n\
+         - `/branch [nome]` cria um ramo da sessão com histórico, plano, tarefas, decisões e alterações.\n\
+         - `search_project` faz retrieval BM25; `apply_patch` aplica patches com validação de contexto.\n\n\
+         ## MCP (servidores locais e remotos)\n\n\
+         - Servidores declarados em `[[mcp]]` no `config.toml` entram na lista do modelo com o prefixo `mcp__<servidor>__<ferramenta>`.\n\
+         - Transporte stdio (processo filho) ou HTTP/SSE com token/OAuth client-credentials.\n\
+         - Recursos e prompts viram `list_resources`, `read_resource`, `list_prompts` e `get_prompt` quando anunciados.\n\
+         - Servidores assinados exigem chave Ed25519 em `mcp_trusted_keys`; o manifesto inclui o SHA-256 do executável.\n\
          - Um servidor que falha não impede os outros; o aviso aparece na conversa.\n\
          - Ferramentas MCP passam pela mesma verificação de permissão e escopo das nativas.\n\n\
          ## Segurança\n\n\
          - Comandos catastróficos são bloqueados em qualquer nível de permissão.\n\
          - Em níveis mais restritos, ações sensíveis pedem confirmação.\n\
+         - O sandbox Landlock (quando ativo) impede escrita fora das raízes autorizadas.\n\
          - Toda alteração de arquivo e execução fica registrada no banco local.\n\
          - A chave de API é lida apenas da variável de ambiente e nunca é exibida.\n",
     );
@@ -3375,8 +3908,8 @@ pub async fn executar(
     paths: Paths,
     store: Store,
     pip_grafico: Option<PipGrafico>,
-    icone: Option<crate::ui::icone::IconeKestrel>,
 ) -> anyhow::Result<()> {
+    crate::tokenizer::registrar_modelos(&config.provider.models);
     let handle: AgenteHandle = iniciar(config.clone(), paths.clone(), store.clone())?;
     let AgenteHandle {
         cmd_tx,
@@ -3386,11 +3919,10 @@ pub async fn executar(
     let skills = Arc::new(SkillRegistry::discover(&paths, &config.workdir()));
     let mut app = App::novo(config, paths, store, cmd_tx, projeto, skills);
     app.pip_grafico = pip_grafico;
-    app.icone = icone;
     let mut eventos_terminal = ui::canal_terminal();
-    // Cadência adaptativa: ágil durante um turno (spinner), espaçada quando
-    // ocioso (respiração/piscada). O desenho é pulado quando nada mudou.
-    let mut intervalo = Duration::from_millis(80);
+    // Cadência adaptativa: 60 fps durante a rolagem, animação na recepção,
+    // spinner no turno e ritmo econômico quando nada visível muda.
+    let mut intervalo = Duration::from_millis(160);
     let mut tique = Box::pin(tokio::time::sleep(intervalo));
     let mut tiques_encerrando = 0u32;
     let mut redesenhar = true;
@@ -3425,8 +3957,15 @@ pub async fn executar(
         if app.saindo && tiques_encerrando > 80 {
             break;
         }
-        let novo = if app.turno_ativo {
+        // Cadência adaptativa: 60 fps enquanto a rolagem anima (resposta
+        // imediata), ritmo de animação na recepção/modal, e econômica quando
+        // nada visível muda.
+        let novo = if app.scroll != app.scroll_alvo {
+            Duration::from_millis(16)
+        } else if app.turno_ativo {
             Duration::from_millis(80)
+        } else if (!app.movimento_reduzido && app.pip_animado()) || app.modal.is_some() {
+            Duration::from_millis(40)
         } else {
             Duration::from_millis(160)
         };
@@ -3578,6 +4117,54 @@ mod tests {
         app.enviar_entrada();
         // O arquivo voltou ao conteúdo anterior.
         assert_eq!(std::fs::read_to_string(&alvo).unwrap(), antes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cada `/undo` avança para a alteração anterior da sessão. Antes, a
+    /// alteração desfeita continuava sendo a "última", então o segundo
+    /// comando reaplicava o mesmo diff (que já não batia) e travava ali.
+    #[test]
+    fn undo_avanca_para_alteracao_anterior() {
+        let dir = std::env::temp_dir().join(format!("kestrel-undo3-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut app, _rx) = app_de_teste();
+        let alvo = dir.join("nota.txt");
+        let v0 = "versao zero\n";
+        let v1 = "versao um\n";
+        let v2 = "versao dois\n";
+        std::fs::write(&alvo, v0).unwrap();
+        let caminho = alvo.display().to_string();
+        for (antes, depois) in [(v0, v1), (v1, v2)] {
+            let d = crate::diff::diff(antes, depois);
+            app.store
+                .record_file_change(
+                    &app.sessao_id,
+                    &caminho,
+                    "editar",
+                    d.stats.additions,
+                    d.stats.deletions,
+                    Some(&d.text),
+                )
+                .unwrap();
+            std::fs::write(&alvo, depois).unwrap();
+        }
+
+        app.entrada.definir_texto("/undo".into());
+        app.enviar_entrada();
+        assert_eq!(std::fs::read_to_string(&alvo).unwrap(), v1);
+
+        app.entrada.definir_texto("/undo".into());
+        app.enviar_entrada();
+        assert_eq!(std::fs::read_to_string(&alvo).unwrap(), v0);
+
+        // Não há mais nada para desfazer: avisa em vez de tentar de novo.
+        app.entrada.definir_texto("/undo".into());
+        app.enviar_entrada();
+        assert_eq!(std::fs::read_to_string(&alvo).unwrap(), v0);
+        match app.blocos.last() {
+            Some(super::Bloco::Aviso(t)) => assert!(t.contains("Nada para desfazer")),
+            outro => panic!("esperava aviso, veio {outro:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4453,6 +5040,153 @@ mod tests {
 
     /// Ao drenar blocos antigos, os índices recolhidos são deslocados: sem
     /// isso um bloco qualquer passaria a abrir/fechar no lugar errado.
+    /// O estado recolhido é por índice posicional: `/clear` (ou troca de
+    /// projeto) zerava `blocos` mas não `recolhidos`, e os índices antigos
+    /// passavam a valer para a conversa nova — um bloco que o usuário nunca
+    /// fechou aparecia com uma linha só, sem resumo nem diff.
+    #[test]
+    fn limpar_conversa_esquece_os_blocos_recolhidos() {
+        let (mut app, _rx) = app_de_teste();
+        // Uma saída de ferramenta com várias linhas: recolhida vira 1 linha.
+        app.tratar_evento(AgentEvent::FerramentaIniciada {
+            id: Some("c1".into()),
+            nome: "read_file".into(),
+            detalhe: "src/main.rs".into(),
+            subagente: None,
+        });
+        for i in 0..8 {
+            app.tratar_evento(AgentEvent::FerramentaSaida {
+                id: Some("c1".into()),
+                nome: "read_file".into(),
+                linha: format!("linha {i}"),
+            });
+        }
+        let cheio = app.linhas.len();
+        assert!(cheio > 5);
+        let recolhido = app.blocos.len() - 1;
+        app.alternar_bloco(recolhido);
+        let linha_unica = app.linhas.len();
+        assert!(
+            linha_unica < cheio,
+            "recolhido deveria ocupar menos linhas: {linha_unica} vs {cheio}"
+        );
+
+        // Nova conversa: o bloco que cair no mesmo índice precisa nascer aberto.
+        app.limpar_conversa();
+        app.tratar_evento(AgentEvent::FerramentaIniciada {
+            id: Some("c2".into()),
+            nome: "read_file".into(),
+            detalhe: "src/lib.rs".into(),
+            subagente: None,
+        });
+        for i in 0..8 {
+            app.tratar_evento(AgentEvent::FerramentaSaida {
+                id: Some("c2".into()),
+                nome: "read_file".into(),
+                linha: format!("linha {i}"),
+            });
+        }
+        assert_eq!(
+            app.linhas.len(),
+            cheio,
+            "o recolhimento da conversa anterior não pode vazar para a nova"
+        );
+    }
+
+    /// Giros seguidos da roda precisam acumular no alvo, não partir da
+    /// posição animada (que ainda não se moveu entre os eventos).
+    #[test]
+    fn roda_acumula_no_alvo_da_rolagem() {
+        let (mut app, _rx) = app_de_teste();
+        app.seguir_fim = false;
+        app.scroll = 10;
+        app.scroll_alvo = 10;
+        for _ in 0..3 {
+            app.tratar_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(app.scroll_alvo, 1, "cada giro deveria somar 3 ao alvo");
+        assert_eq!(app.scroll, 10, "a posição animada só muda no tique");
+        assert!(!app.seguir_fim);
+
+        // Já no fim, PageDown não desliga o acompanhamento.
+        app.seguir_fim = true;
+        app.scroll = 0;
+        app.scroll_alvo = 0;
+        app.tratar_tecla(KeyEvent::from(KeyCode::PageDown));
+        assert!(app.seguir_fim);
+    }
+
+    /// `ir_para_o_fim` precisa deixar scroll e alvo alinhados: um alvo em
+    /// `u16::MAX` nunca convergia com o clamp do desenho e a interface
+    /// redesenhanvava para sempre.
+    #[test]
+    fn atalhos_personalizados_substituem_os_padroes() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("buscar".to_string(), "ctrl+g".to_string());
+        overrides.insert("copiar".to_string(), "f8".to_string());
+        let mapa = Keymap::novo(&overrides);
+        assert_eq!(
+            mapa.acao(&KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            Some("buscar")
+        );
+        assert_eq!(
+            mapa.acao(&KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            None,
+            "o padrão substituído não deveria continuar ativo"
+        );
+        assert_eq!(
+            mapa.acao(&KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE)),
+            Some("copiar")
+        );
+        let mut ruins = std::collections::BTreeMap::new();
+        ruins.insert("buscar".to_string(), "ctrl+tecla-inexistente".to_string());
+        let mapa = Keymap::novo(&ruins);
+        assert_eq!(
+            mapa.acao(&KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(mapa.descricao("buscar"), "(desativado)");
+    }
+
+    #[test]
+    fn busca_salta_entre_linhas_e_nao_liga_no_fim() {
+        let (mut app, _rx) = app_de_teste();
+        for i in 0..10 {
+            app.empurrar_bloco(Bloco::Assistente(format!("linha com alvo {i}")));
+        }
+        app.modal = Some(Modal::Busca {
+            consulta: "alvo".into(),
+            indice: 0,
+        });
+        app.buscar_saltar(0);
+        assert!(!app.seguir_fim);
+        let primeiro = app.scroll_alvo;
+        app.buscar_saltar(1);
+        assert!(
+            app.scroll_alvo > primeiro,
+            "deveria avançar para outra linha"
+        );
+        app.modal = None;
+    }
+
+    #[test]
+    fn ir_para_o_fim_alinha_o_alvo_da_rolagem() {
+        let (mut app, _rx) = app_de_teste();
+        for i in 0..30 {
+            app.empurrar_bloco(Bloco::Assistente(format!("resposta {i}")));
+        }
+        app.rolar_para(4);
+        assert_eq!(app.scroll_alvo, 4);
+        app.ir_para_o_fim();
+        assert_eq!(app.scroll, app.scroll_alvo);
+        assert!(app.seguir_fim);
+    }
+
     #[test]
     fn recolhidos_acompanham_a_drenagem() {
         let (mut app, _rx) = app_de_teste();

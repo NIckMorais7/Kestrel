@@ -189,9 +189,19 @@ impl Recuperacao {
         self.max_tentativas
     }
 
-    /// Marca o incidente como resolvido.
-    pub fn resolver(&mut self, classificacao: Classificacao) {
-        self.incidentes.remove(&classificacao);
+    /// Marca como resolvidos os incidentes que já usaram esta estratégia.
+    ///
+    /// A classe da falha depende da MENSAGEM de erro (`error[E0308]` →
+    /// `Compilacao`, `test result: failed` → `Testes`), e uma chamada que dá
+    /// certo não tem mensagem nenhuma: classificá-la de novo com `""` caía em
+    /// `ExecucaoFerramenta` e o incidente real (de compilação, digamos)
+    /// sobrevivia. Depois de ~15 falhas corrigidas com sucesso uma a uma, o
+    /// turno morria com "Limite de recuperação automática atingido" sem nunca
+    /// ter estourado de fato. A estratégia é a identidade da tentativa nos
+    /// dois caminhos, então é ela que fecha o incidente.
+    pub fn resolver_por_estrategia(&mut self, estrategia: &str) {
+        self.incidentes
+            .retain(|_, incidente| !incidente.estrategias.iter().any(|e| e == estrategia));
     }
 
     pub fn limpar(&mut self) {
@@ -318,7 +328,37 @@ mod tests {
             .unwrap();
         let d = r.diagnosticar(Classificacao::Testes);
         assert_eq!(d.tentativas, 0);
-        r.resolver(Classificacao::Compilacao);
+        r.resolver_por_estrategia("a");
         assert_eq!(r.diagnosticar(Classificacao::Compilacao).tentativas, 0);
+    }
+
+    /// A falha é classificada pela mensagem ("error[E0308]" → `Compilacao`),
+    /// mas a resolução usava a classificação com mensagem VAZIA, que caía em
+    /// `ExecucaoFerramenta`: o incidente real nunca era fechado e o turno
+    /// morria por "Limite de recuperação automática atingido" depois de
+    /// falhas já corrigidas.
+    #[test]
+    fn sucesso_posterior_restaura_o_orcamento_do_incidente_real() {
+        let mut r = Recuperacao::novo(3, Duration::from_secs(1200));
+        // Falha de compilação, classificada pela mensagem do erro.
+        let classe = classificar(Some("run_command"), "error[E0308]: mismatched types", false);
+        assert_eq!(classe, Classificacao::Compilacao);
+        let estrategia = "run_command cargo build";
+        for _ in 0..2 {
+            r.registrar_tentativa(classe, estrategia).unwrap();
+        }
+        assert_eq!(r.diagnosticar(classe).tentativas, 2);
+        assert_eq!(r.diagnosticar(classe).restantes, 1);
+
+        // A estratégia funciona na terceira tentativa: o incidente é resolvido.
+        r.resolver_por_estrategia(estrategia);
+        let depois = r.diagnosticar(classe);
+        assert_eq!(depois.tentativas, 0, "o orçamento deveria ser restaurado");
+        assert_eq!(depois.restantes, 3);
+
+        // Resolver por uma estratégia que não pertence ao incidente não o fecha.
+        r.registrar_tentativa(classe, "outra").unwrap();
+        r.resolver_por_estrategia("run_command cargo test");
+        assert_eq!(r.diagnosticar(classe).tentativas, 1);
     }
 }

@@ -107,11 +107,12 @@ fn estrutura(root: &Path) -> Vec<String> {
             ""
         };
         itens.push(format!("{nome}{sufixo}"));
-        if itens.len() >= MAX_ESTRUTURA {
-            break;
-        }
     }
+    // Primeiro coleta tudo, ordena e só então trunca: cortar na ordem arbitrária
+    // do `readdir` escondia os primeiros nomos (`modulo-000`…`modulo-159`) e
+    // mostrava os últimos, dependendo do sistema de arquivos.
     itens.sort();
+    itens.truncate(MAX_ESTRUTURA);
     itens
 }
 
@@ -136,13 +137,24 @@ fn detectar_por_arquivos(root: &Path) -> Deteccao {
                 if let Some(resto) = linha.strip_prefix("name =") {
                     let _ = resto;
                 }
+                if linha.starts_with('[') {
+                    continue; // cabeçalho de seção (`[dependencies]`)
+                }
+                // O nome da dependência é o que vem antes de `=`. Comparar a
+                // linha inteira com `starts_with` confundia `ratatui-render`
+                // com `ratatui` e `tokio-util` com `tokio`.
+                let dependencia = linha
+                    .split_once('=')
+                    .map(|(nome, _)| nome)
+                    .unwrap_or(linha)
+                    .trim()
+                    .trim_matches('"')
+                    .trim();
                 for marca in [
                     "ratatui", "clap", "tokio", "axum", "actix", "serde", "reqwest", "sqlx",
                     "diesel", "tonic", "bevy",
                 ] {
-                    if (linha.starts_with(marca) || linha.starts_with(&format!("\"{marca}\"")))
-                        && !frameworks.contains(&marca.to_string())
-                    {
+                    if dependencia == marca && !frameworks.contains(&marca.to_string()) {
                         frameworks.push(marca.to_string());
                     }
                 }
@@ -192,13 +204,17 @@ fn detectar_por_arquivos(root: &Path) -> Deteccao {
             }
             if let Some(scripts) = valor.get("scripts").and_then(|s| s.as_object()) {
                 let g = gerenciador.clone().unwrap_or_else(|| "npm".into());
-                if scripts.contains_key("test") {
+                // Só preenche o que ainda não foi decidido: num monorepo com
+                // `Cargo.toml` **e** `package.json`, o bloco JS sobrescrevia
+                // `test`/`build`/`lint` do Rust e o agente rodava a suite
+                // errada.
+                if test.is_none() && scripts.contains_key("test") {
                     test = Some(format!("{g} test"));
                 }
-                if scripts.contains_key("build") {
+                if build.is_none() && scripts.contains_key("build") {
                     build = Some(format!("{g} run build"));
                 }
-                if scripts.contains_key("lint") {
+                if lint.is_none() && scripts.contains_key("lint") {
                     lint = Some(format!("{g} run lint"));
                 }
             }
@@ -214,7 +230,9 @@ fn detectar_por_arquivos(root: &Path) -> Deteccao {
             }
             .to_string(),
         );
-        test = Some("python -m pytest".into());
+        if test.is_none() {
+            test = Some("python -m pytest".into());
+        }
         if let Some(texto) = ler_limitado(&root.join("pyproject.toml"), 40_000) {
             for marco in [
                 "django", "flask", "fastapi", "pydantic", "pytorch", "numpy", "pandas",
@@ -227,33 +245,51 @@ fn detectar_por_arquivos(root: &Path) -> Deteccao {
     }
     if existe("go.mod") {
         linguagens.push("Go".into());
-        build = Some("go build ./...".into());
-        test = Some("go test ./...".into());
+        if build.is_none() {
+            build = Some("go build ./...".into());
+        }
+        if test.is_none() {
+            test = Some("go test ./...".into());
+        }
     }
     if existe("Makefile") && build.is_none() {
         build = Some("make".into());
     }
     if existe("CMakeLists.txt") {
         linguagens.push("C/C++".into());
-        build = Some("cmake --build build".into());
+        if build.is_none() {
+            build = Some("cmake --build build".into());
+        }
     }
     if existe("pom.xml") {
         linguagens.push("Java".into());
-        build = Some("mvn package".into());
-        test = Some("mvn test".into());
+        if build.is_none() {
+            build = Some("mvn package".into());
+        }
+        if test.is_none() {
+            test = Some("mvn test".into());
+        }
     }
     if existe("build.gradle") || existe("build.gradle.kts") {
         linguagens.push("Java/Kotlin".into());
-        build = Some("gradle build".into());
-        test = Some("gradle test".into());
+        if build.is_none() {
+            build = Some("gradle build".into());
+        }
+        if test.is_none() {
+            test = Some("gradle test".into());
+        }
     }
     if existe("composer.json") {
         linguagens.push("PHP".into());
-        test = Some("composer test".into());
+        if test.is_none() {
+            test = Some("composer test".into());
+        }
     }
     if existe("Gemfile") {
         linguagens.push("Ruby".into());
-        test = Some("bundle exec rspec".into());
+        if test.is_none() {
+            test = Some("bundle exec rspec".into());
+        }
     }
     if existe("Dockerfile") {
         frameworks.push("docker".into());
@@ -420,6 +456,82 @@ mod tests {
         assert!(info.frameworks.contains(&"vitest".to_string()));
         assert_eq!(info.test_command.as_deref(), Some("npm test"));
         assert_eq!(info.build_command.as_deref(), Some("npm run build"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O corte da estrutura é feito depois de ordenar: cortar na ordem do
+    /// `readdir` escondia os primeiros nomes e mandava os últimos.
+    #[test]
+    fn estrutura_ordena_antes_de_truncar() {
+        let dir = projeto_temp();
+        for i in 0..50 {
+            std::fs::write(dir.join(format!("modulo-{i:03}.rs")), "").unwrap();
+        }
+        let info = analyze(&dir);
+        assert_eq!(info.structure.len(), MAX_ESTRUTURA);
+        assert_eq!(info.structure[0], "modulo-000.rs");
+        assert!(
+            info.structure.contains(&"modulo-039.rs".to_string()),
+            "{:?}",
+            info.structure
+        );
+        assert!(!info.structure.contains(&"modulo-040.rs".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `tokio-util` não é `tokio`, `ratatui-render` não é `ratatui` e
+    /// `serde_derive` não é `serde`.
+    #[test]
+    fn dependencias_parciais_nao_viram_framework() {
+        let dir = projeto_temp();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\ntokio-util = \"0.7\"\n\
+             ratatui-render = \"0.1\"\nserde_derive = \"1\"\nclap = \"4\"\n",
+        )
+        .unwrap();
+        let info = analyze(&dir);
+        assert!(info.frameworks.contains(&"clap".to_string()));
+        assert!(
+            !info.frameworks.contains(&"tokio".to_string()),
+            "{:?}",
+            info.frameworks
+        );
+        assert!(
+            !info.frameworks.contains(&"ratatui".to_string()),
+            "{:?}",
+            info.frameworks
+        );
+        assert!(
+            !info.frameworks.contains(&"serde".to_string()),
+            "{:?}",
+            info.frameworks
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Monorepo com Rust e JS: o bloco JS não apaga os comandos do Rust
+    /// (o agente rodaria a suite errada).
+    #[test]
+    fn comandos_do_rust_sobrevivem_a_um_package_json() {
+        let dir = projeto_temp();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\n\n[dependencies]\nratatui = \"0.30\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"test":"jest","build":"vite build","lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        let info = analyze(&dir);
+        assert_eq!(info.test_command.as_deref(), Some("cargo test"));
+        assert_eq!(info.build_command.as_deref(), Some("cargo build"));
+        assert_eq!(
+            info.lint_command.as_deref(),
+            Some("cargo clippy --all-targets -- -D warnings")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

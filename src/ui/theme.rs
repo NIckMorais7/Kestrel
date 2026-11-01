@@ -228,21 +228,39 @@ fn nome_valido(nome: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// Converte `#rrggbb` (ou `rrggbb`) em cor. Não aceita nomes: a skin precisa
-/// ser explícita para renderizar igual em qualquer terminal.
+/// Converte `#rrggbb`/`rrggbb` (ou a forma curta `#rgb`/`rgb`) em cor. Não
+/// aceita nomes: a skin precisa ser explícita para renderizar igual em
+/// qualquer terminal.
 fn cor_hex(valor: &str) -> Result<Color, String> {
-    let texto = valor.trim().trim_start_matches('#');
-    if texto.len() != 6 || !texto.chars().all(|c| c.is_ascii_hexdigit()) {
+    let texto = valor.trim();
+    // Um `#` só, e só no início: `trim_start_matches` removia vários, então
+    // `##fff` passava como se estivesse escrito direito.
+    let texto = texto.strip_prefix('#').unwrap_or(texto);
+    // A forma curta é a mais comum em TOML escrito à mão (`fundo = "#fff"`):
+    // cada dígito é expandido (`f` → `ff`). Rejeitá-la fazia a skin própria
+    // ser descartada em silêncio e o `/skin` dizer que ela não existia.
+    let digitos = match texto.len() {
+        6 => texto.to_string(),
+        3 if texto.chars().all(|c| c.is_ascii_hexdigit()) => {
+            texto.chars().flat_map(|c| [c, c]).collect::<String>()
+        }
+        _ => {
+            return Err(format!(
+                "cor `{valor}` inválida: use `#rrggbb` ou `#rgb` (ex.: `#0d0f13`, `#fff`)"
+            ));
+        }
+    };
+    if !digitos.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
-            "cor `{valor}` inválida: use `#rrggbb` (ex.: `#0d0f13`)"
+            "cor `{valor}` inválida: use `#rrggbb` ou `#rgb` (ex.: `#0d0f13`, `#fff`)"
         ));
     }
     let canal = |fatia: &str| -> Result<u8, String> {
         u8::from_str_radix(fatia, 16).map_err(|_| format!("cor `{valor}` inválida"))
     };
-    let r = canal(&texto[0..2])?;
-    let g = canal(&texto[2..4])?;
-    let b = canal(&texto[4..6])?;
+    let r = canal(&digitos[0..2])?;
+    let g = canal(&digitos[2..4])?;
+    let b = canal(&digitos[4..6])?;
     Ok(Color::Rgb(r, g, b))
 }
 
@@ -354,7 +372,10 @@ fn skin_automatica() -> &'static str {
     if fundo_claro_em(std::env::var("COLORFGBG").ok().as_deref()) {
         "daylight"
     } else {
-        "mono"
+        // `kestrel` é a skin padrão (`Paleta::default()` e o alias `padrao`
+        // de `por_nome` apontam para ela): fundo quase preto, acento branco.
+        // `mono` é preto/branco puro — uma escolha, não o padrão.
+        "kestrel"
     }
 }
 
@@ -440,18 +461,6 @@ pub fn superficie_cor() -> Color {
 /// Estilo com o fundo do aplicativo.
 pub fn fundo() -> Style {
     Style::default().bg(fundo_cor())
-}
-
-/// True quando o fundo atual é claro. Usado para escolher entre o ícone preto
-/// e o branco do Kestrel.
-pub fn fundo_e_claro() -> bool {
-    match fundo_cor() {
-        Color::Rgb(r, g, b) => {
-            // Luminância perceptual aproximada (0..255).
-            (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000 > 128
-        }
-        _ => false,
-    }
 }
 
 /// Estilo com a superfície elevada (campo de mensagem, modais).
@@ -820,8 +829,49 @@ mod testes {
     fn cor_hex_aceita_formato_curto_e_recusa_lixo() {
         assert_eq!(cor_hex("#0d0f13").unwrap(), Color::Rgb(13, 15, 19));
         assert_eq!(cor_hex("6cb6c4").unwrap(), Color::Rgb(108, 182, 196));
-        assert!(cor_hex("#123").is_err());
+        // Forma curta: cada dígito é expandido. É a forma mais comum em TOML
+        // escrito à mão e era recusada, derrubando a skin sem aviso.
+        assert_eq!(cor_hex("#fff").unwrap(), Color::Rgb(255, 255, 255));
+        assert_eq!(cor_hex("f0a").unwrap(), Color::Rgb(255, 0, 170));
+        // Só um `#`, e só no início: `##fff` não passa.
+        assert!(cor_hex("##fff").is_err());
         assert!(cor_hex("vermelho").is_err());
+        assert!(cor_hex("#12345").is_err());
+        assert!(cor_hex("#xyz").is_err());
+    }
+
+    /// Skin própria escrita com a forma curta continua sendo carregada: antes
+    /// ela era descartada em silêncio e o `/skin` dizia que não existia.
+    #[test]
+    fn skin_propria_aceita_cor_curta() {
+        let dir = std::env::temp_dir().join(format!("kestrel-skin-curta-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("neve.toml"),
+            "fundo = \"#fff\"\ntexto = \"#010409\"\n",
+        )
+        .unwrap();
+        let paletas = carregar_paletas(&dir);
+        assert_eq!(paletas.len(), 1, "skin com `#fff` deveria carregar");
+        assert_eq!(paletas[0].fundo, Color::Rgb(255, 255, 255));
+        assert_eq!(
+            paleta_de_arquivo(&dir.join("neve.toml")).unwrap().texto,
+            Color::Rgb(1, 4, 9)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sem nenhuma preferência, o automático usa a skin padrão documentada.
+    #[test]
+    fn skin_automatica_escura_e_a_padrao() {
+        // `COLORFGBG` vem do processo, então o ramo escuro só é afirmado
+        // quando não há sinal de fundo claro: a escolha devia ser `kestrel`.
+        if fundo_claro_em(std::env::var("COLORFGBG").ok().as_deref()) {
+            assert_eq!(skin_automatica(), "daylight");
+        } else {
+            assert_eq!(skin_automatica(), "kestrel");
+        }
+        assert_eq!(Paleta::default().nome, "kestrel");
     }
 
     #[test]

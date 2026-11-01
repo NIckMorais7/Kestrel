@@ -176,6 +176,36 @@ impl Drop for ProcessManager {
         // Processos em segundo plano (servidores, watchers) não podem
         // sobreviver ao Kestrel: sem isso o `child` ficava órfão ao sair.
         self.encerrar_todos();
+        // O SIGKILL de segurança de `encerrar_com_motivo` roda numa thread que
+        // dorme 2s; se o Kestrel sair antes, o processo que ignora SIGTERM
+        // sobrevivia. Aqui ele é enviado de forma síncrona, depois de uma
+        // janela curta para o SIGTERM agir.
+        let ativos: Vec<Arc<Processo>> = self
+            .processos
+            .lock()
+            .expect("lock da lista")
+            .iter()
+            .filter(|p| *p.estado.borrow() == EstadoProcesso::Executando)
+            .cloned()
+            .collect();
+        if ativos.is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        for processo in ativos {
+            let pid = *processo.pid.lock().expect("lock do pid");
+            if let Some(pid) = pid {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = pid;
+                }
+            }
+        }
     }
 }
 
@@ -195,7 +225,14 @@ impl ProcessManager {
         cwd: &Path,
         envs: &[(String, String)],
     ) -> Result<String, ToolError> {
-        self.iniciar_com_escopo(comando, cwd, envs, None)
+        self.iniciar_com_escopo(
+            comando,
+            cwd,
+            envs,
+            None,
+            &crate::sandbox::SandboxSettings::default(),
+            &[],
+        )
     }
 
     /// Inicia um processo associado à chamada de ferramenta `escopo`.
@@ -209,6 +246,8 @@ impl ProcessManager {
         cwd: &Path,
         envs: &[(String, String)],
         escopo: Option<&str>,
+        sandbox: &crate::sandbox::SandboxSettings,
+        raizes: &[PathBuf],
     ) -> Result<String, ToolError> {
         let id = format!("proc{}", self.contador.fetch_add(1, Ordering::Relaxed));
         let mut cmd = tokio::process::Command::new("sh");
@@ -227,6 +266,9 @@ impl ProcessManager {
         for (k, v) in envs {
             cmd.env(k, v);
         }
+        // O sandbox é preparado aqui (fora do `pre_exec`) e aplicado no filho.
+        crate::sandbox::aplicar_no_comando(&mut cmd, sandbox, cwd, raizes)
+            .map_err(|e| ToolError::msg(format!("falha ao preparar o sandbox: {e}")))?;
         let mut child = cmd.spawn().map_err(|e| {
             ToolError::msg(format!(
                 "não foi possível iniciar `{comando}` em {}: {e}",
@@ -404,6 +446,13 @@ impl ProcessManager {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
+    }
+
+    /// Quantidade total de linhas guardadas (para avisar sobre truncamento).
+    pub fn total_linhas(&self, id: &str) -> usize {
+        self.buscar(id)
+            .map(|p| p.saida.lock().expect("lock da saída").len())
+            .unwrap_or(0)
     }
 
     /// Inscreve-se para receber linhas em tempo real.
@@ -593,12 +642,18 @@ pub async fn executar_comando(
     ctx: &ToolContext,
     comando: &str,
     cwd: &Path,
+    envs: &[(String, String)],
     timeout: Option<Duration>,
 ) -> Result<(EstadoProcesso, Option<i32>, String, Duration), ToolError> {
     let inicio = std::time::Instant::now();
-    let id = ctx
-        .processos
-        .iniciar_com_escopo(comando, cwd, &[], ctx.escopo_processos())?;
+    let id = ctx.processos.iniciar_com_escopo(
+        comando,
+        cwd,
+        envs,
+        ctx.escopo_processos(),
+        &ctx.sandbox,
+        &ctx.roots,
+    )?;
     let mut fluxo = ctx.processos.inscrever(&id);
 
     // O future de espera é criado uma única vez: recriá-lo a cada linha de
@@ -642,7 +697,25 @@ pub async fn executar_comando(
         Err(e) => return Err(e),
     };
     let codigo = ctx.processos.view(&id).and_then(|v| v.codigo_saida);
-    let saida = ctx.processos.saida(&id, 600).unwrap_or_default();
+    let saida = {
+        // O recorte precisa cobrir tudo o que o buffer guarda: com 600 linhas,
+        // execuções longas de `cargo test`/`pytest` perdiam falhas e o placar
+        // era contado só sobre o trecho final. O limite de exibição continua
+        // sendo aplicado depois por `recortar_saida`.
+        let total = ctx.processos.total_linhas(&id);
+        let texto = ctx
+            .processos
+            .saida(&id, MAX_LINHAS_BUFFER)
+            .unwrap_or_default();
+        if total > MAX_LINHAS_BUFFER {
+            format!(
+                "[... {} linha(s) anteriores omitidas do início da saída ...]\n{texto}",
+                total - MAX_LINHAS_BUFFER
+            )
+        } else {
+            texto
+        }
+    };
     Ok((estado, codigo, saida, duracao))
 }
 
@@ -669,7 +742,11 @@ impl Tool for RunCommand {
                     "cwd": {"type": "string", "description": "Diretório de trabalho (padrão: projeto)"},
                     "timeout_segundos": {"type": "integer", "description": "Tempo limite (padrão 180s em primeiro plano)"},
                     "background": {"type": "boolean", "description": "Inicia sem esperar o término"},
-                    "env": {"type": "object", "description": "Variáveis de ambiente adicionais"}
+                    "env": {
+                        "type": "object",
+                        "description": "Variáveis de ambiente adicionais",
+                        "additionalProperties": {"type": "string"}
+                    }
                 },
                 "required": ["comando"]
             }),
@@ -720,6 +797,19 @@ impl Tool for RunCommand {
             },
         );
         let analise = crate::perm::apply_level(analise, ctx.level);
+        // O `cwd` é uma superfície de escrita que a análise textual não vê:
+        // `run_command {"comando":"tee passwd","cwd":"/etc"}` gravaria em
+        // `/etc/passwd` (permitido em Full), enquanto `env -C /etc tee passwd`
+        // é bloqueado pela análise. Um diretório de sistema só admite leitura,
+        // em qualquer nível.
+        if crate::perm::eh_caminho_de_sistema(&cwd)
+            && analise.category != crate::perm::CommandCategory::Leitura
+        {
+            return Err(ToolError::Permissao(format!(
+                "recusado: o diretório de trabalho `{}` é de sistema e o comando não é de leitura",
+                cwd.display()
+            )));
+        }
         // O comando pode conter segredos (`printenv`, `cat .env`): a auditoria
         // guarda a versão redigida.
         let comando_audit = crate::util::redact_secrets(&comando);
@@ -773,9 +863,14 @@ impl Tool for RunCommand {
             .unwrap_or_default();
 
         if background {
-            let id =
-                ctx.processos
-                    .iniciar_com_escopo(&comando, &cwd, &envs, ctx.escopo_processos())?;
+            let id = ctx.processos.iniciar_com_escopo(
+                &comando,
+                &cwd,
+                &envs,
+                ctx.escopo_processos(),
+                &ctx.sandbox,
+                &ctx.roots,
+            )?;
             // Dá um instante para o processo falhar imediatamente (ex.: comando inexistente).
             tokio::time::sleep(Duration::from_millis(400)).await;
             let view = ctx.processos.view(&id);
@@ -808,7 +903,7 @@ impl Tool for RunCommand {
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(180));
         let (estado, codigo, saida, duracao) =
-            executar_comando(ctx, &comando, &cwd, Some(timeout)).await?;
+            executar_comando(ctx, &comando, &cwd, &envs, Some(timeout)).await?;
         let recorte = super::recortar_saida(&saida, ctx.max_saida);
         let descricao = descrever_resultado(estado, codigo, duracao, Some(timeout.as_secs()));
         let dica = dicas_de_falha(&saida, estado);
@@ -977,7 +1072,7 @@ impl Tool for RunTests {
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(600));
         let (estado, codigo, saida, duracao) =
-            executar_comando(ctx, &comando, &ctx.workdir.clone(), Some(timeout)).await?;
+            executar_comando(ctx, &comando, &ctx.workdir.clone(), &[], Some(timeout)).await?;
 
         let resumo = interpretar_testes(&saida, estado);
         let recorte = super::recortar_saida(&saida, ctx.max_saida);
@@ -1343,10 +1438,15 @@ mod tests {
         // usamos o caminho interno: aguardar com timeout curto em
         // executar_comando, que já encerra o processo.
         let inicio = std::time::Instant::now();
-        let (estado, _codigo, _saida, _duracao) =
-            executar_comando(&ctx, "sleep 30", &dir, Some(Duration::from_millis(600)))
-                .await
-                .unwrap();
+        let (estado, _codigo, _saida, _duracao) = executar_comando(
+            &ctx,
+            "sleep 30",
+            &dir,
+            &[],
+            Some(Duration::from_millis(600)),
+        )
+        .await
+        .unwrap();
         assert_eq!(estado, EstadoProcesso::Timeout);
         assert!(inicio.elapsed() < Duration::from_secs(5), "demorou demais");
 
@@ -1372,7 +1472,7 @@ mod tests {
         let comando = "while true; do echo tick; sleep 0.02; done";
         let externo = tokio::time::timeout(
             Duration::from_secs(5),
-            executar_comando(&ctx, comando, &dir, Some(Duration::from_millis(500))),
+            executar_comando(&ctx, comando, &dir, &[], Some(Duration::from_millis(500))),
         )
         .await
         .expect("o tempo limite interno não foi respeitado")
@@ -1461,10 +1561,24 @@ mod tests {
     async fn limpeza_por_escopo_preserva_processos_paralelos() {
         let pm = ProcessManager::new();
         let a = pm
-            .iniciar_com_escopo("sleep 30", Path::new("/tmp"), &[], Some("escopo-a"))
+            .iniciar_com_escopo(
+                "sleep 30",
+                Path::new("/tmp"),
+                &[],
+                Some("escopo-a"),
+                &crate::sandbox::SandboxSettings::default(),
+                &[],
+            )
             .unwrap();
         let b = pm
-            .iniciar_com_escopo("sleep 30", Path::new("/tmp"), &[], Some("escopo-b"))
+            .iniciar_com_escopo(
+                "sleep 30",
+                Path::new("/tmp"),
+                &[],
+                Some("escopo-b"),
+                &crate::sandbox::SandboxSettings::default(),
+                &[],
+            )
             .unwrap();
         pm.encerrar_do_escopo("escopo-a");
         let estado_a = pm.aguardar(&a, Some(Duration::from_secs(5))).await.unwrap();
@@ -1607,5 +1721,53 @@ mod tests {
         assert!(!ToolOutput::texto("saida").com_sucesso(false).sucesso);
         assert!(ToolOutput::texto("saida").com_sucesso(true).sucesso);
         assert!(ToolOutput::default().sucesso);
+    }
+
+    /// O parâmetro `env` precisa chegar ao modo foreground: `executar_comando`
+    /// passava um slice vazio e a variável era ignorada em silêncio (só o modo
+    /// `background` a aplicava).
+    #[tokio::test]
+    async fn env_chega_ao_comando_em_primeiro_plano() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        let args = serde_json::json!({
+            "comando": "echo \"VAR=$MINHA_VAR_KESTREL\"",
+            "env": {"MINHA_VAR_KESTREL": "chegou_no_foreground"},
+        });
+        let saida = RunCommand.executar(args, &ctx).await.unwrap();
+        assert!(
+            saida.conteudo.contains("chegou_no_foreground"),
+            "a variável de ambiente não chegou ao comando em foreground: {}",
+            saida.conteudo
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `cwd` de sistema com comando que não é leitura precisa ser recusado
+    /// antes de executar, mesmo em nível Full: `run_command {"cwd":"/etc",
+    /// "comando":"touch x"}` gravava em `/etc`, enquanto `env -C /etc tee x`
+    /// era bloqueado pela análise textual.
+    #[tokio::test]
+    async fn cwd_de_sistema_com_escrita_e_recusado() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        let args = serde_json::json!({
+            "comando": "touch kestrel_probe_sistema.txt",
+            "cwd": "/etc",
+        });
+        let erro = RunCommand.executar(args, &ctx).await.unwrap_err();
+        assert!(
+            erro.to_string().contains("sistema"),
+            "deveria recusar por diretório de sistema: {erro}"
+        );
+        assert!(
+            !std::path::Path::new("/etc/kestrel_probe_sistema.txt").exists(),
+            "o comando não deveria ter executado em /etc"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

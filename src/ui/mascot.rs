@@ -78,39 +78,42 @@ impl AnimacaoPip {
     }
 }
 
-/// Deslocamento da respiração para um tique: ciclo lento de 16 tiques,
-/// com uma onda senoidal — o peito sobe na metade positiva da onda e desce
-/// na negativa, sem salto (o `dy` só pode ser 0 ou 1, mas a transição fica
-/// nos zeros da onda, onde o movimento é mínimo).
+/// Deslocamento da respiração: ciclo lento de 32 tiques. Na cadência da
+/// recepção (40 ms) são ~1,3 s por ciclo; o peito sobe e desce sem saltos
+/// bruscos porque a troca acontece nos zeros da onda.
 fn respiracao(tique: u64) -> i8 {
-    let angulo = 2.0 * std::f32::consts::PI * ((tique % 16) as f32) / 16.0;
+    let angulo = 2.0 * std::f32::consts::PI * ((tique % 32) as f32) / 32.0;
     i8::from(angulo.sin() > 0.0)
 }
 
-/// Caminhada leve para um lado: onda senoidal de 32 tiques. A posição
-/// horizontal acompanha o seno (acelera no meio, desacelera nas pontas) em
-/// vez de saltar entre duas posições; o `dy` marca a passada (o corpo sobe
-/// levemente no meio de cada passo).
-fn caminhada(fase: u64, inicio: u64, direcao: i8) -> (i8, i8) {
-    let progresso = (fase - inicio) as f32 / 32.0; // 0..1 (ida e volta)
-    let ondulacao = (std::f32::consts::PI * progresso).sin();
-    let dx = (4.0 * ondulacao * f32::from(direcao)).round() as i8;
-    let passo = ((2.0 * std::f32::consts::PI * progresso).sin() > 0.6) as i8;
-    (dx, passo)
+/// Um passeio de 20 quadros: sai do centro (5), segura na ponta (2), volta
+/// (4) e acomoda (5). Cada quadro move no máximo 1 pixel, então a 40 ms o
+/// deslocamento é contínuo em vez de saltar a cada 300 ms.
+fn passeio(indice: u64, direcao: i8) -> (i8, i8) {
+    let posicao = match indice {
+        0..=4 => indice as i8,
+        5..=6 => 4,
+        7..=10 => 10 - indice as i8,
+        _ => 0,
+    };
+    // Balanço do passo: 0/1 alternando a cada 3 quadros (~120 ms).
+    let passo = ((indice / 3) % 2) as i8;
+    (posicao * direcao, passo)
 }
 
 /// Quadro do ciclo de animação para um tique.
 ///
-/// O ciclo completo tem 128 tiques. Com a cadência de 80 ms do turno ativo,
-/// isso dá cerca de 10 segundos. A caminhada usa 32 tiques para cada lado
-/// (ida e volta), com deslocamento senoidal na imagem redimensionada — o
-/// movimento é contínuo, sem “saltos” entre posições.
+/// O ciclo tem 96 quadros: repouso, passeio à esquerda, pausa, passeio à
+/// direita e repouso. A 40 ms são ~3,8 s por ciclo; todos os quadros usam
+/// deslocamentos de 1 pixel (`-4..=4`), que é a menor unidade da imagem
+/// redimensionada.
 pub fn quadro_de(tique: u64) -> AnimacaoPip {
-    let fase = tique % 128;
+    let fase = tique % 96;
     let (dx, dy) = match fase {
-        32..=63 => caminhada(fase, 32, -1),
-        64..=95 => caminhada(fase, 64, 1),
-        // Repouso antes e depois da caminhada (respiração).
+        0..=19 => (0, respiracao(tique)),
+        20..=39 => passeio(fase - 20, -1),
+        40..=51 => (0, respiracao(tique)),
+        52..=71 => passeio(fase - 52, 1),
         _ => (0, respiracao(tique)),
     };
     AnimacaoPip {
@@ -133,6 +136,9 @@ struct Quadro {
 #[derive(Clone)]
 pub struct PipGrafico {
     quadros: HashMap<Quadro, Protocol>,
+    /// Guardado para recodificar quando a skin troca: o fundo da moldura
+    /// acompanha a cor do aplicativo.
+    picker: Picker,
 }
 
 const PNG: &[u8] = include_bytes!("../../assets/pip.png");
@@ -154,6 +160,25 @@ const MARGEM: u32 = 2;
 impl PipGrafico {
     /// Decodifica o PNG e codifica todos os quadros da animação.
     pub fn novo(picker: &Picker) -> anyhow::Result<Self> {
+        let mut pip = Self {
+            quadros: HashMap::new(),
+            picker: picker.clone(),
+        };
+        pip.recodificar()?;
+        Ok(pip)
+    }
+
+    /// Recodifica todos os quadros com a cor de fundo atual.
+    ///
+    /// A moldura é opaca (evita rastro entre quadros), então trocar de skin
+    /// sem refazer os quadros deixaria um retângulo com a cor antiga ao redor
+    /// do Pip.
+    pub fn atualizar_tema(&mut self) -> anyhow::Result<()> {
+        self.recodificar()
+    }
+
+    fn recodificar(&mut self) -> anyhow::Result<()> {
+        let picker = &self.picker;
         let fonte = picker.font_size();
         let largura = COLUNAS as u32 * u32::from(fonte.width.max(1));
         let altura = LINHAS as u32 * u32::from(fonte.height.max(1));
@@ -187,11 +212,18 @@ impl PipGrafico {
         let mut base = RgbaImage::from_pixel(largura, altura, fundo);
         for y in 0..redimensionada_altura {
             for x in 0..redimensionada_largura {
-                base.put_pixel(
+                // Variante checada, como no `icone.rs`: a crate `image` faz
+                // bounds-check com pânico, e um cast de `i64` negativo daria
+                // uma coordenada gigante. Fora da caixa, o pixel é ignorado.
+                if let Some(pixel) = base.get_pixel_mut_checked(
                     (deslocamento_x + i64::from(x)) as u32,
                     (deslocamento_y + i64::from(y)) as u32,
-                    *redimensionada.get_pixel(x, y),
-                );
+                ) {
+                    // Compõe sobre o fundo em vez de copiar o alpha: cópias
+                    // transparentes deixavam a moldura com buracos que alguns
+                    // protocolos gráficos pintavam de branco.
+                    *pixel = misturar(*pixel, *redimensionada.get_pixel(x, y));
+                }
             }
         }
 
@@ -203,15 +235,26 @@ impl PipGrafico {
             cor_do_pelo(&redimensionada, escala, OLHOS[0]),
             cor_do_pelo(&redimensionada, escala, OLHOS[1]),
         ];
-        let fechado = olhos_fechados(&base, escala, deslocamento_x, deslocamento_y, &cor_pelo);
-        // Sem isso, o buraco transparente do olho mostra o fundo do terminal:
-        // em terminal claro o Pip ficava com “olho branco”.
+        let cor_tinta = [
+            cor_da_tinta(&redimensionada, escala, OLHOS[0]),
+            cor_da_tinta(&redimensionada, escala, OLHOS[1]),
+        ];
+        let fechado = olhos_fechados(
+            &base,
+            escala,
+            deslocamento_x,
+            deslocamento_y,
+            &cor_pelo,
+            &cor_tinta,
+        );
+        // Os furos são pintados com a tinta do contorno, não com o fundo: em
+        // skin clara o fundo deixava o olho claro e ele sumia no pelo branco.
         pintar_olhos(
             &mut base,
             escala,
             deslocamento_x,
             deslocamento_y,
-            cor_de_fundo(),
+            &cor_tinta,
         );
         let mut quadros = HashMap::new();
         for dx in -4..=4 {
@@ -237,13 +280,22 @@ impl PipGrafico {
             );
         }
 
-        Ok(Self { quadros })
+        self.quadros = quadros;
+        Ok(())
     }
 
     /// Desenha o quadro atual na área reservada. A área deve ter pelo menos
     /// [`COLUNAS`] × [`LINHAS`] células; a imagem é desenhada exatamente nesse
     /// tamanho.
     pub fn desenhar(&self, f: &mut Frame, area: Rect, animacao: AnimacaoPip) {
+        // O `clear_area` do Sixel apaga as células com a cor de fundo corrente
+        // antes de desenhar a imagem. Fixar o fundo do tema na área evita uma
+        // faixa clara quando a célula ainda estava no estilo padrão do
+        // terminal (qualquer sobra da limpeza fica na cor do app).
+        f.render_widget(
+            ratatui::widgets::Block::default().style(crate::ui::theme::fundo()),
+            area,
+        );
         let chave = animacao.chave();
         let protocol = self
             .quadros
@@ -282,48 +334,94 @@ fn cor_de_fundo() -> Rgba<u8> {
     }
 }
 
-/// Pinta os furos dos olhos, já na escala de destino, com uma cor opaca.
-fn pintar_olhos(imagem: &mut RgbaImage, escala: f32, ox: i64, oy: i64, cor: Rgba<u8>) {
-    for olho in OLHOS {
-        pintar_olhos_um(imagem, escala, ox, oy, olho, cor);
+/// Pinta os furos dos olhos com a cor de tinta de cada um.
+fn pintar_olhos(imagem: &mut RgbaImage, escala: f32, ox: i64, oy: i64, cores: &[Rgba<u8>; 2]) {
+    for (i, olho) in OLHOS.iter().enumerate() {
+        pintar_olhos_um(imagem, escala, ox, oy, *olho, cores[i]);
     }
 }
 
-/// Cobre os furos dos olhos com a cor do pelo **real** (amostrada ao redor de
-/// cada buraco). A caixa dos olhos é retangular, mas fica inteiramente dentro
-/// da região branca; preenchê-la só fecha o buraco e não altera o contorno. O
-/// olho some por alguns quadros sem depender do fundo do terminal.
+/// Fecha os olhos: cobre o buraco com o pelo e desenha uma pálpebra escura.
+///
+/// Preencher o buraco só com o pelo fazia o olho "sumir" no rosto branco — e
+/// o bloco branco da piscada chamava mais atenção que o olho aberto. A linha
+/// de tinta dá a leitura de olho fechado em qualquer skin.
 fn olhos_fechados(
     base: &RgbaImage,
     escala: f32,
     ox: i64,
     oy: i64,
     cor_pelo: &[Rgba<u8>; 2],
+    cor_tinta: &[Rgba<u8>; 2],
 ) -> RgbaImage {
     let mut fechado = base.clone();
     for (i, olho) in OLHOS.iter().enumerate() {
         pintar_olhos_um(&mut fechado, escala, ox, oy, *olho, cor_pelo[i]);
+        desenhar_pestana(&mut fechado, escala, ox, oy, *olho, cor_tinta[i]);
     }
     fechado
 }
 
-/// Pinta um único furo de olho (usado pela piscada).
+/// Retângulo do olho em pixels de destino, já recortado à imagem.
+fn retangulo_do_olho(
+    largura: i64,
+    altura: i64,
+    escala: f32,
+    ox: i64,
+    oy: i64,
+    (x0, y0, x1, y1): (u32, u32, u32, u32),
+) -> (i64, i64, i64, i64) {
+    let inicio_x = (ox + (x0 as f32 * escala).round() as i64).clamp(0, largura - 1);
+    let inicio_y = (oy + (y0 as f32 * escala).round() as i64).clamp(0, altura - 1);
+    let fim_x = (ox + (x1 as f32 * escala).round() as i64).clamp(0, largura - 1);
+    let fim_y = (oy + (y1 as f32 * escala).round() as i64).clamp(0, altura - 1);
+    (inicio_x, inicio_y, fim_x, fim_y)
+}
+
+/// Pinta um único furo de olho.
 fn pintar_olhos_um(
     imagem: &mut RgbaImage,
     escala: f32,
     ox: i64,
     oy: i64,
-    (x0, y0, x1, y1): (u32, u32, u32, u32),
+    olho: (u32, u32, u32, u32),
     cor: Rgba<u8>,
 ) {
     let largura = imagem.width() as i64;
     let altura = imagem.height() as i64;
-    let inicio_x = (ox + (x0 as f32 * escala).round() as i64).clamp(0, largura - 1);
-    let inicio_y = (oy + (y0 as f32 * escala).round() as i64).clamp(0, altura - 1);
-    let fim_x = (ox + (x1 as f32 * escala).round() as i64).clamp(0, largura - 1);
-    let fim_y = (oy + (y1 as f32 * escala).round() as i64).clamp(0, altura - 1);
+    let (inicio_x, inicio_y, fim_x, fim_y) =
+        retangulo_do_olho(largura, altura, escala, ox, oy, olho);
     for y in inicio_y..=fim_y {
         for x in inicio_x..=fim_x {
+            imagem.put_pixel(x as u32, y as u32, cor);
+        }
+    }
+}
+
+/// Desenha a pálpebra fechada: barra horizontal de tinta no meio do olho.
+fn desenhar_pestana(
+    imagem: &mut RgbaImage,
+    escala: f32,
+    ox: i64,
+    oy: i64,
+    olho: (u32, u32, u32, u32),
+    cor: Rgba<u8>,
+) {
+    let largura = imagem.width() as i64;
+    let altura = imagem.height() as i64;
+    let (inicio_x, inicio_y, fim_x, fim_y) =
+        retangulo_do_olho(largura, altura, escala, ox, oy, olho);
+    let altura_olho = (fim_y - inicio_y + 1).max(1);
+    let espessura = (altura_olho / 4).clamp(1, 3);
+    let meio = (inicio_y + fim_y) / 2;
+    let topo = (meio - espessura / 2).max(inicio_y);
+    let base = (topo + espessura - 1).min(fim_y);
+    // Um pixel além da caixa em cada lado dá a impressão de cílio/pálpebra,
+    // sem tocar no contorno do rosto.
+    let x0 = (inicio_x - 1).max(0);
+    let x1 = (fim_x + 1).min(largura - 1);
+    for y in topo..=base {
+        for x in x0..=x1 {
             imagem.put_pixel(x as u32, y as u32, cor);
         }
     }
@@ -370,8 +468,60 @@ fn cor_do_pelo(imagem: &RgbaImage, escala: f32, olho: (u32, u32, u32, u32)) -> R
     ])
 }
 
-/// Move a imagem dentro da mesma caixa, preenchendo o espaço vazio com
-/// transparência (o fundo do status aparece atrás).
+/// Cor da tinta (contorno/olho) ao redor de um buraco: o pixel opaco mais
+/// escuro do anel externo. É o que dá contraste contra o pelo branco — usar a
+/// cor do pelo na piscada fazia o olho desaparecer.
+fn cor_da_tinta(imagem: &RgbaImage, escala: f32, olho: (u32, u32, u32, u32)) -> Rgba<u8> {
+    let (x0, y0, x1, y1) = olho;
+    let e0 = (x0 as f32 * escala).round() as i64;
+    let e1 = (x1 as f32 * escala).round() as i64;
+    let f0 = (y0 as f32 * escala).round() as i64;
+    let f1 = (y1 as f32 * escala).round() as i64;
+    let margem = 3i64;
+    let inicio_x = (e0 - margem).max(0);
+    let inicio_y = (f0 - margem).max(0);
+    let fim_x = (e1 + margem).min(imagem.width() as i64 - 1);
+    let fim_y = (f1 + margem).min(imagem.height() as i64 - 1);
+    let mut melhor = None;
+    let mut luminancia_min = u32::MAX;
+    for y in inicio_y..=fim_y {
+        for x in inicio_x..=fim_x {
+            if x >= e0 && x <= e1 && y >= f0 && y <= f1 {
+                continue; // só o anel externo
+            }
+            let px = imagem.get_pixel(x as u32, y as u32);
+            if px[3] == 0 {
+                continue;
+            }
+            let luminancia =
+                299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2]);
+            if luminancia < luminancia_min {
+                luminancia_min = luminancia;
+                melhor = Some(Rgba([px[0], px[1], px[2], 255]));
+            }
+        }
+    }
+    melhor.unwrap_or(Rgba([36, 38, 44, 255]))
+}
+
+/// Compõe um pixel RGBA sobre um fundo opaco. O resultado é sempre opaco:
+/// transparência sobrando na moldura virava bloco branco em alguns protocolos.
+fn misturar(fundo: Rgba<u8>, frente: Rgba<u8>) -> Rgba<u8> {
+    let alpha = u32::from(frente[3]);
+    if alpha == 0 {
+        return fundo;
+    }
+    if alpha == 255 {
+        return frente;
+    }
+    let inverso = 255 - alpha;
+    let canal =
+        |i: usize| ((u32::from(frente[i]) * alpha + u32::from(fundo[i]) * inverso) / 255) as u8;
+    Rgba([canal(0), canal(1), canal(2), 255])
+}
+
+/// Move a imagem dentro da mesma caixa, preenchendo o espaço vazio com a cor
+/// de fundo do aplicativo.
 fn deslocar(base: &RgbaImage, dx: i8, dy: i8) -> RgbaImage {
     let (largura, altura) = base.dimensions();
     // Fundo opaco no quadro inteiro: sem transparência sobrando onde a silhueta
@@ -402,7 +552,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ciclo_tem_repouso_caminhada_e_volta() {
+    fn ciclo_tem_repouso_passeio_e_volta() {
         assert_eq!(
             quadro_de(0),
             AnimacaoPip {
@@ -411,34 +561,41 @@ mod tests {
                 piscando: false
             }
         );
-        // Caminhada à esquerda: sai do centro, vai até -4 e volta.
-        assert_eq!(quadro_de(32).dx, 0);
-        assert_eq!(quadro_de(36).dx, -2);
-        assert_eq!(quadro_de(44).dx, -4);
-        assert_eq!(quadro_de(48).dx, -4); // meio da ida
-        assert_eq!(quadro_de(60).dx, -2);
-        assert_eq!(quadro_de(64).dx, 0); // fim da volta
-        // Idem para a direita, simétrica.
-        assert_eq!(quadro_de(68).dx, 2);
-        assert_eq!(quadro_de(76).dx, 4);
-        assert_eq!(quadro_de(84).dx, 4);
-        assert_eq!(quadro_de(92).dx, 2);
-        assert_eq!(quadro_de(96).dx, 0);
-        assert_eq!(quadro_de(100).dx, 0); // repouso
-        assert_eq!(quadro_de(128), quadro_de(0));
+        // Passeio à esquerda: 0 → -4 um pixel por quadro, pausa na ponta e
+        // volta. Nada de saltos de vários pixels no mesmo quadro.
+        assert_eq!(quadro_de(20).dx, 0);
+        assert_eq!(quadro_de(21).dx, -1);
+        assert_eq!(quadro_de(22).dx, -2);
+        assert_eq!(quadro_de(23).dx, -3);
+        assert_eq!(quadro_de(24).dx, -4);
+        assert_eq!(quadro_de(25).dx, -4);
+        assert_eq!(quadro_de(26).dx, -4);
+        assert_eq!(quadro_de(27).dx, -3);
+        assert_eq!(quadro_de(28).dx, -2);
+        assert_eq!(quadro_de(29).dx, -1);
+        assert_eq!(quadro_de(30).dx, 0);
+        assert_eq!(quadro_de(39).dx, 0);
+        // Pausa e passeio simétrico à direita.
+        assert_eq!(quadro_de(40).dx, 0);
+        assert_eq!(quadro_de(52).dx, 0);
+        assert_eq!(quadro_de(53).dx, 1);
+        assert_eq!(quadro_de(56).dx, 4);
+        assert_eq!(quadro_de(62).dx, 0);
+        assert_eq!(quadro_de(96), quadro_de(0));
     }
 
     #[test]
     fn caminhada_e_simetrica_e_continua() {
         // A ida à esquerda é o espelho da ida à direita (mesma onda).
-        for p in 0..=31 {
-            let esquerda = quadro_de(32 + p);
-            let direita = quadro_de(64 + p);
+        for p in 0..20 {
+            let esquerda = quadro_de(20 + p);
+            let direita = quadro_de(52 + p);
             assert_eq!(esquerda.dx, -direita.dx, "passo {p}");
+            assert_eq!(esquerda.dy, direita.dy, "passo {p}");
         }
         // Nenhum salto maior que 1 px entre quadros consecutivos.
-        let mut anterior = quadro_de(31).dx;
-        for tique in 32..=95 {
+        let mut anterior = quadro_de(19).dx;
+        for tique in 20..=71 {
             let atual = quadro_de(tique).dx;
             assert!(
                 (atual - anterior).abs() <= 1,
@@ -449,13 +606,24 @@ mod tests {
         // A passada sobe em algum momento e desce em outro (dy varia).
         let mut viu_zero = false;
         let mut viu_um = false;
-        for tique in 32..=95 {
+        for tique in 20..=71 {
             match quadro_de(tique).dy {
                 0 => viu_zero = true,
                 _ => viu_um = true,
             }
         }
         assert!(viu_zero && viu_um, "a caminhada precisa ter passada");
+    }
+
+    #[test]
+    fn mistura_alpha_sobre_o_fundo_e_sempre_opaca() {
+        let fundo = Rgba([10, 20, 30, 255]);
+        assert_eq!(misturar(fundo, Rgba([0, 0, 0, 0])), fundo);
+        let opaca = Rgba([200, 100, 50, 255]);
+        assert_eq!(misturar(fundo, opaca), opaca);
+        let meio = misturar(fundo, Rgba([200, 100, 50, 128]));
+        assert_eq!(meio[3], 255);
+        assert!(meio[0] > fundo[0] && meio[0] < opaca[0]);
     }
 
     #[test]
@@ -481,6 +649,32 @@ mod tests {
     /// A cor do pelo amostrada ao redor do olho acompanha o tom real da
     /// imagem — não um branco puro fixo. Com o pelo em (220,220,220), a
     /// piscada fecha o olho com ~220, não 255.
+    #[test]
+    fn tinta_do_olho_vem_do_contorno_escuro() {
+        let mut imagem = RgbaImage::from_pixel(30, 30, Rgba([255, 255, 255, 255]));
+        // Contorno escuro ao redor de um buraco 10..=20.
+        for y in 7..=23 {
+            for x in 7..=23 {
+                if !(10..=20).contains(&x) || !(10..=20).contains(&y) {
+                    imagem.put_pixel(x, y, Rgba([70, 74, 82, 255]));
+                }
+            }
+        }
+        let tinta = cor_da_tinta(&imagem, 1.0, (10, 10, 20, 20));
+        assert!(tinta[0] < 100 && tinta[1] < 100, "veio: {tinta:?}");
+        assert_eq!(tinta[3], 255);
+    }
+
+    #[test]
+    fn pestana_escura_fica_no_meio_do_olho() {
+        let mut imagem = RgbaImage::from_pixel(30, 30, Rgba([255, 255, 255, 255]));
+        let tinta = Rgba([30, 32, 38, 255]);
+        desenhar_pestana(&mut imagem, 1.0, 0, 0, (10, 10, 20, 20), tinta);
+        // Meio do olho recebe a pálpebra; topo continua com o pelo.
+        assert_eq!(*imagem.get_pixel(15, 15), tinta);
+        assert_eq!(*imagem.get_pixel(15, 10), Rgba([255, 255, 255, 255]));
+    }
+
     #[test]
     fn cor_do_pelo_amostra_o_anel_externo() {
         let mut imagem = RgbaImage::from_pixel(40, 40, Rgba([0, 0, 0, 0]));

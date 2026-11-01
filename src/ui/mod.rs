@@ -3,7 +3,6 @@
 //! Todo o texto da interface está em português brasileiro. Os números de
 //! alterações exibidos vêm dos diffs reais devolvidos pelas ferramentas.
 
-pub mod icone;
 pub mod input;
 pub mod markdown;
 pub mod mascot;
@@ -102,29 +101,13 @@ pub fn desenhar(f: &mut Frame, app: &mut App) {
 /// Cabeçalho em duas linhas, sem caixa e sem provedor:
 ///
 /// ```text
-///  [ícone] Kestrel v0.5.0   modelo/teste · high
-///          ~/Projetos/Kestrel (master) · build · Semi
+///  Kestrel v0.9.5.5   modelo/teste · high
+///  ~/Projetos/Kestrel (master) · build · Semi
 /// ```
 fn desenhar_cabecalho(f: &mut Frame, app: &App, area: Rect) {
-    // O ícone branco/preto é escolhido pelo tema; sem ícone, cai no losango.
-    let com_icone = app.icone.is_some() && area.width >= icone::COLUNAS + 12;
-    let area_texto = if com_icone {
-        Rect {
-            x: area.x + icone::COLUNAS + 1,
-            y: area.y,
-            width: area.width.saturating_sub(icone::COLUNAS + 1),
-            height: area.height,
-        }
-    } else {
-        area
-    };
     let mut titulo = vec![Span::styled("Kestrel", theme::titulo())];
-    if !com_icone {
-        // Sem ícone (terminal estreito ou PNG indisponível), mantém o símbolo.
-        titulo.insert(0, Span::styled(" ◆ ", theme::titulo()));
-    }
     titulo.push(Span::styled(
-        format!(" v{}", env!("CARGO_PKG_VERSION")),
+        format!(" v{}", crate::VERSAO),
         theme::apagado(),
     ));
     titulo.push(Span::styled("   ", theme::apagado()));
@@ -143,7 +126,10 @@ fn desenhar_cabecalho(f: &mut Frame, app: &App, area: Rect) {
     if let Some(branch) = &app.projeto.git_branch {
         contexto.push(Span::styled(format!(" ({branch})"), theme::apagado()));
     }
-    contexto.push(Span::styled(" · modo ", theme::apagado()));
+    contexto.push(Span::styled(
+        format!(" · {} ", app.idioma.t(crate::i18n::Chave::Modo)),
+        theme::apagado(),
+    ));
     contexto.push(Span::styled(
         app.modo.label().to_string(),
         if app.modo == crate::config::ModoOperacao::Chat {
@@ -152,36 +138,26 @@ fn desenhar_cabecalho(f: &mut Frame, app: &App, area: Rect) {
             theme::acento()
         },
     ));
-    contexto.push(Span::styled(" · permissão ", theme::apagado()));
+    contexto.push(Span::styled(
+        format!(" · {} ", app.idioma.t(crate::i18n::Chave::Permissao)),
+        theme::apagado(),
+    ));
     contexto.push(Span::styled(
         app.nivel.label().to_string(),
         Style::default().fg(theme::cor_nivel(app.nivel)),
     ));
     if let Some(comp) = &app.config.ui.active_comp {
-        contexto.push(Span::styled(" · comp ", theme::apagado()));
+        contexto.push(Span::styled(
+            format!(" · {} ", app.idioma.t(crate::i18n::Chave::Comp)),
+            theme::apagado(),
+        ));
         contexto.push(Span::styled(comp.clone(), theme::apagado()));
     }
 
     f.render_widget(
         Paragraph::new(Text::from(vec![Line::from(titulo), Line::from(contexto)])),
-        area_texto,
+        area,
     );
-
-    // Ícone por último: ele ocupa 2×1 e a cor acompanha o fundo do tema.
-    if com_icone
-        && let Some(icone) = &app.icone
-        && area.height >= icone::LINHAS
-    {
-        icone.desenhar(
-            f,
-            Rect {
-                x: area.x,
-                y: area.y,
-                width: icone::COLUNAS.min(area.width),
-                height: icone::LINHAS.min(area.height),
-            },
-        );
-    }
 }
 
 fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
@@ -203,45 +179,94 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let total = contar_altura(&app.linhas, largura) as u16;
-    let visivel = interno.height;
-    let max_scroll = total.saturating_sub(visivel);
+    // A altura é contada em `usize`: converter para `u16` antes de subtrair
+    // fazia a conta dar a volta em conversas com mais de 65.535 linhas
+    // renderizadas, e o `max_scroll` acabava no meio da conversa — o fim da
+    // resposta ficava inacessível. A conversão acontece só no limite final.
+    preparar_alturas(app, largura);
+    let total = app
+        .cache_alturas
+        .as_ref()
+        .and_then(|(_, _, prefixo)| prefixo.last().copied())
+        .unwrap_or(1);
+    let visivel = interno.height as usize;
+    let max_scroll = total.saturating_sub(visivel).min(u16::MAX as usize) as u16;
     if app.seguir_fim {
         app.scroll = max_scroll;
+        // O alvo precisa acompanhar a posição real: se ficasse no valor antigo,
+        // `tiquetaquear` puxaria a rolagem de volta a cada quadro e a interface
+        // redesenhanva para sempre.
+        app.scroll_alvo = max_scroll;
     } else {
         app.scroll = app.scroll.min(max_scroll);
-        if app.scroll >= max_scroll {
+        // O alvo também precisa respeitar o tamanho: um `scroll_alvo` além do
+        // fim (conteúdo encolheu, ou rolagem pedida para uma posição que não
+        // existe mais) mantinha `tiquetaquear` andando para sempre e a
+        // interface redesenhanvando sem parar.
+        app.scroll_alvo = app.scroll_alvo.min(max_scroll);
+        // Reativar o acompanhamento só quando o conteúdo chegou de fato ao
+        // fim. `0 >= 0` era sempre verdadeiro numa conversa que cabe na tela
+        // (reativava na hora), e durante a rolagem suave `scroll` ainda está
+        // na posição anterior — quem muda primeiro é `scroll_alvo`, de modo
+        // que reativar aqui desgrudava o usuário do histórico que ele tinha
+        // acabado de rolar para cima.
+        if max_scroll > 0 && app.scroll >= max_scroll && app.scroll_alvo >= max_scroll {
             app.seguir_fim = true;
         }
     }
-    let scroll = app.scroll;
+    let scroll = app.scroll as usize;
+    if app.linhas.is_empty() {
+        return;
+    }
 
-    let paragrafo = Paragraph::new(app.linhas.as_slice())
+    // Virtualização: renderiza apenas as linhas lógicas que tocam a viewport.
+    // A altura de cada linha (com embrulho) vem do cache por largura/versão.
+    let prefixo = &app.cache_alturas.as_ref().expect("alturas preparadas").2;
+    let total_linhas = app.linhas.len();
+    let mut inicio = prefixo
+        .partition_point(|p| *p <= scroll)
+        .saturating_sub(1)
+        .min(total_linhas - 1);
+    if prefixo[inicio] > scroll {
+        inicio = inicio.saturating_sub(1);
+    }
+    let local_scroll = scroll.saturating_sub(prefixo[inicio]) as u16;
+    let fim = prefixo
+        .partition_point(|p| *p < scroll + visivel + 1)
+        .min(total_linhas)
+        .max(inicio + 1);
+    let fatia = &app.linhas[inicio..fim];
+    let paragrafo = Paragraph::new(fatia)
         .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        .scroll((local_scroll, 0));
     f.render_widget(paragrafo, interno);
 
-    // Mapa de clique: qual bloco ocupa qual região da tela. Sem isso, o clique
-    // do mouse não teria como saber onde soltar.
+    // Mapa de clique: qual bloco ocupa qual região da tela. A posição usa o
+    // prefixo de alturas (linhas com embrulho), não o índice lógico cru.
     let marcos: Vec<usize> = app.marcos().to_vec();
     let total_linhas = app.linhas.len();
-    for (indice, inicio) in marcos.iter().enumerate() {
-        let altura = marcos
+    for (indice, inicio_logico) in marcos.iter().enumerate() {
+        if *inicio_logico >= total_linhas {
+            continue;
+        }
+        let fim_logico = marcos
             .get(indice + 1)
-            .unwrap_or(&total_linhas)
-            .saturating_sub(*inicio);
-        let y = interno.y as i32 + inicio.saturating_sub(scroll as usize) as i32;
-        if y + altura as i32 <= interno.y as i32 || y >= interno.y as i32 + interno.height as i32 {
+            .copied()
+            .unwrap_or(total_linhas)
+            .min(total_linhas);
+        let altura = prefixo[fim_logico].saturating_sub(prefixo[*inicio_logico]);
+        let y = interno.y as i32 + prefixo[*inicio_logico] as i32 - scroll as i32;
+        let fundo = interno.y as i32 + interno.height as i32;
+        if y + altura as i32 <= interno.y as i32 || y >= fundo {
             continue; // fora da vista: não é clicável
         }
-        let altura_visivel = (altura as i32)
-            .min(interno.y as i32 + interno.height as i32 - y)
-            .max(0) as u16;
+        let topo = y.max(interno.y as i32);
+        let altura_visivel = ((y + altura as i32).min(fundo) - topo).max(0) as u16;
         app.areas_blocos.push((
             indice,
             Rect {
                 x: interno.x,
-                y: y.max(interno.y as i32) as u16,
+                y: topo as u16,
                 width: interno.width,
                 height: altura_visivel,
             },
@@ -250,7 +275,7 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Indicador de rolagem quando o usuário saiu do fim.
     if !app.seguir_fim && max_scroll > 0 {
-        let indicador = format!(" ↑ {scroll}/{max_scroll} ");
+        let indicador = format!(" ↑ {}/{max_scroll} ", app.scroll);
         let largura_ind = unicode_width::UnicodeWidthStr::width(indicador.as_str()) as u16;
         if area.width > largura_ind + 2 {
             let destino = Rect {
@@ -288,18 +313,18 @@ fn desenhar_recepcao(f: &mut Frame, app: &App, interno: Rect) {
         Line::from(vec![
             Span::styled("◆ ", theme::titulo()),
             Span::styled("Kestrel", theme::titulo()),
-            Span::styled(
-                format!("  v{}", env!("CARGO_PKG_VERSION")),
-                theme::apagado(),
-            ),
+            Span::styled(format!("  v{}", crate::VERSAO), theme::apagado()),
         ]),
         Line::default(),
         Line::from(Span::styled(
-            "Nova sessão. Descreva a tarefa em linguagem natural.",
+            app.idioma.t(crate::i18n::Chave::NovaSessao),
             theme::texto(),
         )),
         Line::default(),
-        Line::from(Span::styled("Sugestões para começar:", theme::apagado())),
+        Line::from(Span::styled(
+            app.idioma.t(crate::i18n::Chave::Sugestoes),
+            theme::apagado(),
+        )),
     ];
     // Só o que existe de verdade: prometer um comando que não leva a lugar
     // nenhum é pior que não sugerir.
@@ -320,15 +345,24 @@ fn desenhar_recepcao(f: &mut Frame, app: &App, interno: Rect) {
     }
     linhas.push(Line::from(vec![
         Span::styled("  /help", theme::rotulo()),
-        Span::styled("  todos os comandos", theme::apagado()),
+        Span::styled(
+            format!("  {}", app.idioma.t(crate::i18n::Chave::TodosComandos)),
+            theme::apagado(),
+        ),
     ]));
     linhas.push(Line::from(vec![
         Span::styled("  /agent", theme::rotulo()),
-        Span::styled("  modo build (trabalha no projeto)", theme::apagado()),
+        Span::styled(
+            format!("  {}", app.idioma.t(crate::i18n::Chave::ModoBuild)),
+            theme::apagado(),
+        ),
     ]));
     linhas.push(Line::from(vec![
         Span::styled("  /chat", theme::rotulo()),
-        Span::styled("  modo conversa (somente leitura)", theme::apagado()),
+        Span::styled(
+            format!("  {}", app.idioma.t(crate::i18n::Chave::ModoConversa)),
+            theme::apagado(),
+        ),
     ]));
     if let Some(plano) = &app.plano {
         linhas.push(Line::from(vec![
@@ -393,24 +427,33 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect) {
     let linha_texto = area.y + area.height.saturating_sub(1);
     let deslocamento_texto = 1;
 
-    let estilo_estado = match app.estado {
-        EstadoMascote::Erro => theme::falha(),
-        EstadoMascote::Concluindo => theme::sucesso(),
-        EstadoMascote::Ocioso => theme::apagado(),
-        _ => theme::em_execucao(),
+    // Indicador de atividade minimalista: um círculo. Discreto quando ocioso,
+    // branco (acento) ao concluir, piscando devagar enquanto o modelo trabalha
+    // e vermelho em erro. O texto de estado saiu do rodapé.
+    let (glifo, estilo_indicador) = match app.estado {
+        EstadoMascote::Erro => ("●", theme::falha()),
+        EstadoMascote::Concluindo => ("●", theme::acento()),
+        EstadoMascote::Ocioso => ("●", theme::apagado()),
+        _ => {
+            // ~0,8 s por fase na cadência do turno: pisca sem chamar atenção.
+            if app.movimento_reduzido || (app.tick / 10).is_multiple_of(2) {
+                ("●", theme::em_execucao())
+            } else {
+                ("●", theme::apagado())
+            }
+        }
     };
-    let mut spans = Vec::new();
-    // Indicador de atividade discreto: um ponto pequeno, fixo — sem pulso.
-    // O estado em si (cor e texto) já comunica o que o agente está fazendo.
-    spans.push(Span::styled("· ", estilo_estado));
-    spans.push(Span::styled(app.estado_texto.clone(), estilo_estado));
+    let mut spans = vec![Span::styled(glifo, estilo_indicador)];
     // Contexto real do modelo: usado/total e percentual. Tokens acumulados
     // continuam em `/cost`; somar tudo no rodapé fazia parecer que uma pergunta
     // simples consumia 30 mil tokens.
     if app.contexto.1 > 0 {
         let fracao = app.contexto_animado() as f32 / app.contexto.1.max(1) as f32;
         let cor = theme::cor_contexto(fracao);
-        spans.push(Span::styled("  contexto ", theme::apagado()));
+        spans.push(Span::styled(
+            format!("  {} ", app.idioma.t(crate::i18n::Chave::Contexto)),
+            theme::apagado(),
+        ));
         spans.push(Span::styled(
             format!(
                 "{}/{} ({}%)",
@@ -444,7 +487,7 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect) {
     let estilo_indicadores: Style;
     let mut area_botao: Option<Rect> = None;
     if !app.seguir_fim {
-        indicadores = " ↓ voltar para o último ".to_string();
+        indicadores = app.idioma.t(crate::i18n::Chave::VoltarUltimo).to_string();
         estilo_indicadores = theme::titulo();
         let largura = crate::util::largura_texto(&indicadores) as u16;
         area_botao = Some(Rect {
@@ -454,7 +497,10 @@ fn desenhar_status(f: &mut Frame, app: &mut App, area: Rect) {
             height: 1,
         });
     } else if app.turno_ativo {
-        indicadores = " Ctrl+C interrompe ".to_string();
+        indicadores = app
+            .idioma
+            .t(crate::i18n::Chave::CtrlCInterrompe)
+            .to_string();
         estilo_indicadores = theme::apagado();
     } else {
         // Sem “enter envia”: o campo já é evidente. O canto fica vazio.
@@ -523,16 +569,12 @@ fn desenhar_entrada(f: &mut Frame, app: &mut App, area: Rect) {
     let mut linhas_render: Vec<Line<'static>> = Vec::new();
     if app.entrada.vazio() {
         linhas_render.push(Line::from(Span::styled(
-            "descreva a tarefa em linguagem natural…",
+            app.idioma.t(crate::i18n::Chave::DescrevaTarefa),
             theme::apagado(),
         )));
     } else {
         for linha in &linhas_texto {
-            let recorte: String = linha
-                .chars()
-                .skip(scroll_h)
-                .take(texto_area.width as usize)
-                .collect();
+            let recorte = recorte_em_celulas(linha, scroll_h, texto_area.width as usize);
             linhas_render.push(Line::from(Span::styled(recorte, theme::texto())));
         }
     }
@@ -587,12 +629,38 @@ fn calcular_rolagem(
     } else {
         0
     };
+    // A rolagem horizontal é em células, como a coluna do cursor: por
+    // caractere, uma linha de emoji/CJK rolava antes da hora e o cursor
+    // ficava olhando para um ponto vazio da tela.
     let scroll_h = if coluna_cursor >= largura {
         coluna_cursor - largura + 1
     } else {
         0
     };
     (scroll_v as u16, scroll_h)
+}
+
+/// Recorte horizontal em células de terminal: devolve os caracteres que caem
+/// na faixa `[inicio, inicio + largura)`. Pular `inicio` caracteres em vez de
+/// células cortaria glifos de largura 2 ao meio e desencontraria o texto do
+/// cursor.
+fn recorte_em_celulas(texto: &str, inicio: usize, largura: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let largura = largura.max(1);
+    let fim = inicio + largura;
+    let mut celulas = 0usize;
+    let mut saida = String::new();
+    for c in texto.chars() {
+        let ocupada = UnicodeWidthChar::width(c).unwrap_or(0);
+        if celulas >= fim {
+            break;
+        }
+        if celulas >= inicio {
+            saida.push(c);
+        }
+        celulas += ocupada;
+    }
+    saida
 }
 
 fn desenhar_sugestoes(f: &mut Frame, app: &App, area_entrada: Rect) {
@@ -621,9 +689,13 @@ fn desenhar_sugestoes(f: &mut Frame, app: &App, area_entrada: Rect) {
     // e a lista não acompanhava a setinha.
     let visivel = quantidade as usize;
     let total = sugestoes.len();
+    // A seleção é derivada de uma vez: a lista pode ter encolhido (colagem,
+    // backspace) entre o evento e o desenho, e um `sugestao_sel` maior que a
+    // lista marcava o item errado e cortava o topo da janela.
+    let sel = app.sugestao_sel.min(total.saturating_sub(1));
     let mut linhas = Vec::new();
     for (i, comando) in sugestoes.iter().enumerate() {
-        let selecionado = i == app.sugestao_sel.min(total - 1);
+        let selecionado = i == sel;
         let estilo = if selecionado {
             Style::default()
                 .fg(theme::selecao_texto())
@@ -654,12 +726,11 @@ fn desenhar_sugestoes(f: &mut Frame, app: &App, area_entrada: Rect) {
     }
     // Mantém o escolhido no meio da janela quando der; nas pontas, encosta.
     let centro = visivel / 2;
-    let janela = app
-        .sugestao_sel
+    let janela = sel
         .saturating_sub(centro)
         .min(total.saturating_sub(visivel));
     let posicao = if total > 1 {
-        format!("{}/{} · ", app.sugestao_sel.min(total - 1) + 1, total)
+        format!("{}/{} · ", sel + 1, total)
     } else {
         String::new()
     };
@@ -784,6 +855,17 @@ fn desenhar_modal(f: &mut Frame, app: &mut App, area: Rect) {
         }
         Modal::ConfirmarComp { nome } => {
             desenhar_confirmar_comp(f, nome, retangulo_central(area, 54, 32));
+        }
+        Modal::Busca { consulta, indice } => {
+            let total = app.linhas_com(consulta).len();
+            desenhar_busca(
+                f,
+                app.idioma,
+                consulta,
+                *indice,
+                total,
+                retangulo_central(area, 66, 24),
+            );
         }
         Modal::Texto {
             titulo,
@@ -1028,9 +1110,16 @@ fn desenhar_seletor(
     // lista inteira acompanha a setinha, sem itens "escondidos" abaixo do box.
     let mut linhas: Vec<Line<'static>> = Vec::new();
     let mut faixas: Vec<(usize, usize)> = Vec::with_capacity(filtrados.len());
-    for (indice, (_, item)) in filtrados.iter().enumerate() {
-        let selecionado = indice == seletor.sel;
-        let marcado = marcadas.map(|m| m.contains(&indice)).unwrap_or(false);
+    // A seleção é limitada antes de usar: um filtro que encurtou a lista
+    // (colagem, backspace, escolha) deixava `sel` além do fim e a faixa
+    // simplesmente não existia — o item some da tela sem explicação.
+    let sel = seletor.sel.min(total.saturating_sub(1));
+    for (indice, (original, item)) in filtrados.iter().enumerate() {
+        let selecionado = indice == sel;
+        // `marcadas` guarda índices da lista ORIGINAL (é assim que o app
+        // insere), então o visto precisa do índice original — com filtro
+        // ativo ele aparecia na linha errada.
+        let marcado = marcadas.map(|m| m.contains(original)).unwrap_or(false);
         let inicio = linhas.len();
         let estilo_titulo = if selecionado {
             theme::pulso(tique, true).add_modifier(Modifier::BOLD)
@@ -1074,7 +1163,7 @@ fn desenhar_seletor(
     let visivel = interno.height as usize;
     // Sem item nenhum (catálogo/projetos/processos vazios), não há faixa para
     // indexar: um `[len - 1]` sobre vetor vazio travaria a interface inteira.
-    let (inicio_selecionado, altura_selecionado) = match faixas.get(seletor.sel) {
+    let (inicio_selecionado, altura_selecionado) = match faixas.get(sel) {
         Some(faixa) => *faixa,
         None => (0, 0),
     };
@@ -1126,7 +1215,80 @@ fn retangulo_central(area: Rect, largura_pct: u16, altura_pct: u16) -> Rect {
     }
 }
 
+/// Preenche o cache de alturas (prefixo de linhas renderizadas) para a largura
+/// atual. Recalcula só quando a largura ou a versão das linhas muda.
+fn preparar_alturas(app: &mut App, largura: usize) {
+    let largura = largura.max(1);
+    let versao = app.versao_linhas;
+    let valido = app
+        .cache_alturas
+        .as_ref()
+        .is_some_and(|(w, v, _)| *w == largura && *v == versao);
+    if valido {
+        return;
+    }
+    let mut prefixo = Vec::with_capacity(app.linhas.len() + 1);
+    let mut total = 0usize;
+    prefixo.push(0);
+    for linha in &app.linhas {
+        let texto: String = linha.spans.iter().map(|s| s.content.as_ref()).collect();
+        total += quebrar_em_linhas(&texto, largura);
+        prefixo.push(total);
+    }
+    if prefixo.len() == 1 {
+        prefixo.push(1);
+    }
+    app.cache_alturas = Some((largura, versao, prefixo));
+}
+
+/// Busca na conversa: consulta, posição da ocorrência e dica de navegação.
+fn desenhar_busca(
+    f: &mut Frame,
+    idioma: crate::i18n::Idioma,
+    consulta: &str,
+    indice: usize,
+    total: usize,
+    area: Rect,
+) {
+    let bloco = theme::bloco()
+        .border_style(theme::borda_ativa())
+        .style(theme::superficie())
+        .title(Span::styled(
+            format!(" {} ", idioma.t(crate::i18n::Chave::BuscarTitulo)),
+            theme::rotulo(),
+        ));
+    let interno = bloco.inner(area);
+    f.render_widget(bloco, area);
+    let posicao = if consulta.trim().is_empty() {
+        String::new()
+    } else if total == 0 {
+        idioma.t(crate::i18n::Chave::BuscarNenhum).to_string()
+    } else {
+        format!("{}/{}", indice.min(total - 1) + 1, total)
+    };
+    let linhas = vec![
+        Line::from(vec![
+            Span::styled("❯ ", theme::acento().add_modifier(Modifier::BOLD)),
+            Span::styled(consulta.to_string(), theme::texto()),
+            Span::styled("▏", theme::acento()),
+        ]),
+        Line::default(),
+        Line::from(vec![
+            Span::styled(posicao, theme::acento()),
+            Span::styled(
+                format!("  ·  {}", idioma.t(crate::i18n::Chave::BuscarDica)),
+                theme::apagado(),
+            ),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(Text::from(linhas)).wrap(Wrap { trim: false }),
+        interno,
+    );
+}
+
 /// Estimativa de altura renderizada, considerando embrulho de linha.
+#[cfg(test)]
 pub fn contar_altura(linhas: &[Line<'static>], largura: usize) -> usize {
     let largura = largura.max(1);
     let mut total = 0usize;
@@ -1154,13 +1316,40 @@ fn quebrar_em_linhas(texto: &str, largura: usize) -> usize {
             linhas += 1;
         }
         if restante > largura {
-            let extra = restante.div_ceil(largura) - 1;
-            linhas += extra;
-            restante -= extra * largura;
+            // O `Wrap { trim: false }` do ratatui não corta glifo no meio: um
+            // bloco de `largura` células cheias acomoda MENOS caracteres quando
+            // a palavra tem células de largura 2 (CJK, emoji, URL sem espaço).
+            // Dividir por `largura` cheia subestimava a altura — a conversa
+            // parecia menor que a tela e o fim da resposta ficava fora do
+            // alcance da rolagem.
+            let (blocos, sobra) = blocos_da_palavra(palavra, largura);
+            linhas += blocos - 1;
+            restante = sobra;
         }
         atual = restante;
     }
     linhas
+}
+
+/// Em quantos blocos de no máximo `largura` células uma palavra se divide, e
+/// quantas células o último bloco ocupa. Glifos mais largos que a linha são
+/// ignorados, exatamente como o embrulho do ratatui faz.
+fn blocos_da_palavra(palavra: &str, largura: usize) -> (usize, usize) {
+    use unicode_width::UnicodeWidthChar;
+    let mut blocos = 1usize;
+    let mut usada = 0usize;
+    for c in palavra.chars() {
+        let celulas = UnicodeWidthChar::width(c).unwrap_or(0);
+        if celulas > largura {
+            continue;
+        }
+        if usada + celulas > largura {
+            blocos += 1;
+            usada = 0;
+        }
+        usada += celulas;
+    }
+    (blocos, usada)
 }
 
 #[cfg(test)]

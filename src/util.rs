@@ -199,6 +199,13 @@ pub fn strip_ansi(input: &str) -> String {
 ///
 /// O README promete que chaves nunca são gravadas: esta função é aplicada a
 /// tudo que vai para o banco (auditoria, `tool_runs`, diffs).
+///
+/// `sk-` exige fronteira de palavra (`\b`): sem ela, qualquer palavra que
+/// terminasse em `sk-` casava no meio e a redação começava antes dela —
+/// `risk-assessment` virava `ri[SEGREDO-REDIGIDO]` (idem `task-force`,
+/// `Brisk-walk`, `disk-usage`), destruindo o texto gravado. A fronteira já
+/// impede esses falsos positivos, então o tamanho mínimo pode ser curto o
+/// bastante para cobrir chaves reais pequenas.
 pub fn redact_secrets(input: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
@@ -206,7 +213,7 @@ pub fn redact_secrets(input: &str) -> String {
             r#"(?ix)(
                 -----BEGIN[A-Z\ ]*PRIVATE\ KEY-----[\s\S]*?-----END[A-Z\ ]*PRIVATE\ KEY-----
               | nvapi-[A-Za-z0-9_\-]{4,}
-              | sk-[A-Za-z0-9_\-]{4,}
+              | \bsk-[A-Za-z0-9_\-]{4,}
               | gh[pousr]_[A-Za-z0-9]{16,}
               | github_pat_[A-Za-z0-9_]{20,}
               | AIza[0-9A-Za-z_\-]{20,}
@@ -232,7 +239,10 @@ pub fn formatar_num(n: u64) -> String {
     if n < 1000 {
         return n.to_string();
     }
-    if n < 1_000_000 {
+    // A unidade é decidida **antes** de formatar: 999.999 arredondava para
+    // "1000.0k", uma unidade que não existe (o correto é 1.0M). O limiar é o
+    // maior valor que ainda não estoura a casa do milhar ao arredondar.
+    if n < 999_950 {
         return format!("{:.1}k", n as f64 / 1000.0);
     }
     format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -271,14 +281,21 @@ pub fn human_bytes(bytes: u64) -> String {
 /// Formata uma duração em milissegundos.
 pub fn format_duration_ms(ms: u64) -> String {
     if ms < 1000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        let mins = ms / 60_000;
-        let secs = (ms % 60_000) / 1000;
-        format!("{mins}m{secs:02}s")
+        return format!("{ms}ms");
     }
+    // A unidade sai do valor já arredondado, não do truncado: 59.999ms virava
+    // "60.0s" (perdendo o minuto) e 3.600.000ms virava "60m00s" (sem hora).
+    let decimos = ms.saturating_add(50) / 100;
+    if decimos < 600 {
+        return format!("{}.{}s", decimos / 10, decimos % 10);
+    }
+    let segundos = decimos / 10;
+    if segundos < 3600 {
+        return format!("{}m{:02}s", segundos / 60, segundos % 60);
+    }
+    let horas = segundos / 3600;
+    let resto = segundos % 3600;
+    format!("{horas}h{:02}m{:02}s", resto / 60, resto % 60)
 }
 
 /// Caminho relativo a `base` quando possível, senão o caminho completo.
@@ -364,6 +381,31 @@ pub fn count_lines(text: &str) -> usize {
     }
 }
 
+/// Codifica bytes em Base64 padrão (com padding), usado no OSC 52.
+pub fn base64(bytes: &[u8]) -> String {
+    const TABELA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut saida = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for bloco in bytes.chunks(3) {
+        let b0 = u32::from(bloco[0]);
+        let b1 = bloco.get(1).map(|b| u32::from(*b)).unwrap_or(0);
+        let b2 = bloco.get(2).map(|b| u32::from(*b)).unwrap_or(0);
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        saida.push(TABELA[((n >> 18) & 0x3f) as usize] as char);
+        saida.push(TABELA[((n >> 12) & 0x3f) as usize] as char);
+        if bloco.len() > 1 {
+            saida.push(TABELA[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            saida.push('=');
+        }
+        if bloco.len() > 2 {
+            saida.push(TABELA[(n & 0x3f) as usize] as char);
+        } else {
+            saida.push('=');
+        }
+    }
+    saida
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +422,9 @@ mod tests {
         assert_eq!(formatar_num(999), "999");
         assert_eq!(formatar_num(12400), "12.4k");
         assert_eq!(formatar_num(2_470_000), "2.5M");
+        // O arredondamento não pode estourar para a unidade seguinte.
+        assert_eq!(formatar_num(999_949), "999.9k");
+        assert_eq!(formatar_num(999_999), "1.0M");
     }
 
     #[test]
@@ -389,6 +434,25 @@ mod tests {
         assert_eq!(formatar_tokens(1_000), "1.000");
         assert_eq!(formatar_tokens(390_000), "390.000");
         assert_eq!(formatar_tokens(1_000_000), "1.000.000");
+    }
+
+    #[test]
+    fn base64_codifica_com_padding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64("olá".as_bytes()), "b2zDoQ==");
+    }
+
+    #[test]
+    fn redige_chave_sk_curta_sem_quebrar_palavras() {
+        // Chaves pequenas também não podem ser gravadas...
+        assert!(redact_secrets("sk-abc123").contains("[SEGREDO-REDIGIDO]"));
+        // ...mas a fronteira de palavra continua protegendo palavras comuns.
+        for texto in ["risk-assessment", "task-force", "disk-usage", "brisk-walk"] {
+            assert_eq!(redact_secrets(texto), texto);
+        }
     }
 
     #[test]
@@ -427,6 +491,22 @@ mod tests {
         assert_eq!(
             redact_secrets("cargo build --release"),
             "cargo build --release"
+        );
+        // Palavras que só *terminam* em `sk-` não são segredos: a redação
+        // começava no meio delas e corróia o texto do diff/da tool result.
+        for caso in [
+            "// TODO: risk-assessment do parser",
+            "disk-usage: total=42",
+            "fn task-force main()",
+            "Brisk-walk pelo parque",
+        ] {
+            assert_eq!(redact_secrets(caso), caso, "{caso}");
+        }
+        // Chave realista continua redigida (iniciando a linha ou no meio).
+        let chave = "sk-proj-AbCdEf1234567890abcdefGHIJklmn";
+        assert_eq!(
+            redact_secrets(&format!("key = {chave}")),
+            "key = [SEGREDO-REDIGIDO]"
         );
         // Chaves JSON (com aspas entre o nome e os dois-pontos) e o corpo
         // inteiro de uma chave privada também não podem vazar.
@@ -499,5 +579,13 @@ mod tests {
         assert_eq!(human_bytes(2048), "2.0 KB");
         assert_eq!(format_duration_ms(500), "500ms");
         assert_eq!(format_duration_ms(1500), "1.5s");
+        // A unidade não é perdida na fronteira do arredondamento.
+        assert_eq!(format_duration_ms(59_949), "59.9s");
+        assert_eq!(format_duration_ms(59_999), "1m00s");
+        assert_eq!(format_duration_ms(60_000), "1m00s");
+        assert_eq!(format_duration_ms(3_599_900), "59m59s");
+        // Acima de uma hora usa horas (antes ficava "60m00s").
+        assert_eq!(format_duration_ms(3_600_000), "1h00m00s");
+        assert_eq!(format_duration_ms(5_431_000), "1h30m31s");
     }
 }

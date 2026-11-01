@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 /// Versão atual do esquema. Suba sempre que uma migração for acrescentada.
-pub const VERSAO_ATUAL: i64 = 4;
+pub const VERSAO_ATUAL: i64 = 5;
 
 /// Migrações; o índice 0 corresponde à versão 1.
 const MIGRACOES: &[(i64, &str)] = &[
@@ -57,6 +57,13 @@ const MIGRACOES: &[(i64, &str)] = &[
         DROP TABLE tasks;
         ALTER TABLE tasks_novo RENAME TO tasks;
         CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id, order_idx);",
+    ),
+    // 4 → 5: marca alterações já desfeitas pelo `/undo`. Sem isso, desfazer
+    // duas vezes seguidas reaplicava o mesmo diff em vez de voltar à alteração
+    // anterior (e o segundo diff nem batia mais com o arquivo).
+    (
+        5,
+        "ALTER TABLE file_changes ADD COLUMN undone INTEGER NOT NULL DEFAULT 0;",
     ),
 ];
 

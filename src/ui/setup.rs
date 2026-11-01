@@ -307,6 +307,41 @@ impl Assistente {
     }
 
     fn tratar_tecla_modelo(&mut self, tecla: KeyEvent) {
+        // O modo manual é tratado ANTES do match externo. Com o catálogo em
+        // falha, o match de fora capturava o Esc e voltava uma etapa — o
+        // identificador já digitado era perdido e o ramo "Esc desliga o modo
+        // manual" aqui nunca era alcançado.
+        if self.manual {
+            match tecla.code {
+                KeyCode::Enter => {
+                    let id = self.editor.texto().trim().to_string();
+                    if id.is_empty() {
+                        self.erro = Some(
+                            "informe o identificador do modelo, ex.: meta/llama-3.1-70b-instruct"
+                                .into(),
+                        );
+                    } else {
+                        let entrada = catalog::enrich(ModelEntry::new(id.clone()));
+                        self.config.provider.model = id;
+                        self.config.upsert_model(entrada);
+                        self.manual = false;
+                        self.avancar();
+                    }
+                }
+                // Esc desliga o modo manual (o campo manual é descartado).
+                KeyCode::Esc => {
+                    self.manual = false;
+                }
+                KeyCode::Char(c) => self.editor.inserir_char(c),
+                KeyCode::Backspace => self.editor.backspace(),
+                KeyCode::Left => self.editor.esquerda(),
+                KeyCode::Right => self.editor.direita(),
+                KeyCode::Home => self.editor.home(),
+                KeyCode::End => self.editor.fim(),
+                _ => {}
+            }
+            return;
+        }
         if !matches!(self.modelos, EstadoModelos::Prontos(_)) {
             match tecla.code {
                 KeyCode::Esc => self.voltar(),
@@ -320,33 +355,7 @@ impl Assistente {
                 }
                 _ => {}
             }
-            if self.manual {
-                match tecla.code {
-                    KeyCode::Enter => {
-                        let id = self.editor.texto().trim().to_string();
-                        if id.is_empty() {
-                            self.erro = Some("informe o identificador do modelo, ex.: meta/llama-3.1-70b-instruct".into());
-                        } else {
-                            let entrada = catalog::enrich(ModelEntry::new(id.clone()));
-                            self.config.provider.model = id;
-                            self.config.upsert_model(entrada);
-                            self.manual = false;
-                            self.avancar();
-                        }
-                    }
-                    // Esc desliga o modo manual (o campo manual é descartado).
-                    KeyCode::Esc => {
-                        self.manual = false;
-                    }
-                    KeyCode::Char(c) => self.editor.inserir_char(c),
-                    KeyCode::Backspace => self.editor.backspace(),
-                    KeyCode::Left => self.editor.esquerda(),
-                    KeyCode::Right => self.editor.direita(),
-                    KeyCode::Home => self.editor.home(),
-                    KeyCode::End => self.editor.fim(),
-                    _ => {}
-                }
-            } else if tecla.code == KeyCode::Enter {
+            if tecla.code == KeyCode::Enter {
                 self.avancar();
             }
             return;
@@ -411,7 +420,7 @@ impl Assistente {
                 Line::from(vec![
                     Span::styled(" ◆ ", theme::titulo()),
                     Span::styled("Kestrel", theme::titulo()),
-                    Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), theme::apagado()),
+                    Span::styled(format!(" v{}", crate::VERSAO), theme::apagado()),
                     Span::styled("  configuração inicial", theme::apagado()),
                 ]),
                 Line::from(vec![

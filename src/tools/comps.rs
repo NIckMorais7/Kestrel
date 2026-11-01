@@ -136,6 +136,7 @@ mod testes {
             store: crate::db::Store::open_in_memory().unwrap(),
             session_id: "s".into(),
             processos: Arc::new(crate::tools::shell::ProcessManager::new()),
+            sandbox: Default::default(),
             arquivos: Arc::new(FileRegistry::new()),
             eventos: tx,
             confirmacoes: ctx_tx,

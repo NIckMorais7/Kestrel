@@ -61,7 +61,12 @@ pub fn html_para_texto(html: &str) -> PaginaTexto {
         .unwrap_or_default();
 
     let mut links = Vec::new();
-    for cap in r.links.captures_iter(html) {
+    // Links saem do HTML **depois** da limpeza (comentários, `head`, `script`,
+    // `style`, `template`, `iframe`, `svg`): um link dentro de um comentário ou
+    // de um bloco ignorado aparecia como navegável na lista, embora o corpo do
+    // texto já o descartasse.
+    let sem_blocos = r.blocos_ignorados.replace_all(&sem_comentarios, " ");
+    for cap in r.links.captures_iter(&sem_blocos) {
         let href = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
         let texto = cap
             .get(2)
@@ -72,8 +77,7 @@ pub fn html_para_texto(html: &str) -> PaginaTexto {
         }
     }
 
-    let mut corpo = r.comentarios.replace_all(html, " ").to_string();
-    corpo = r.blocos_ignorados.replace_all(&corpo, " ").to_string();
+    let mut corpo = sem_blocos.to_string();
     corpo = r.itens.replace_all(&corpo, "\n- ").to_string();
     corpo = r.quebras.replace_all(&corpo, "\n").to_string();
     corpo = r.tags.replace_all(&corpo, "").to_string();
@@ -179,19 +183,16 @@ pub fn decodificar_entidades(texto: &str) -> String {
 }
 
 /// Decodifica percent-encoding de URLs (ex.: parâmetros `uddg=`).
+///
+/// `+` **não** é espaço: a conversão só vale para valores de formulário
+/// (`application/x-www-form-urlencoded`), não para URLs. Trocar todo `+`
+/// destruía caminhos e queries — `?q=c+++parser` virava `q=c   parser` e
+/// `/a+b` virava `/a b`. (`%2B` continua sendo um mais literal.)
 pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut saida = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        // `+` só significa espaço quando aparece literalmente na URL. Trocar
-        // todo `+` depois de decodificar transformava `%2B` (um mais literal)
-        // em espaço.
-        if bytes[i] == b'+' {
-            saida.push(b' ');
-            i += 1;
-            continue;
-        }
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
             if let Ok(v) = u8::from_str_radix(hex, 16) {
@@ -230,6 +231,22 @@ mod tests {
         assert_eq!(pagina.links[0].1, "https://exemplo.com/a");
     }
 
+    /// Link dentro de comentário ou de bloco ignorado não é link navegável: o
+    /// corpo do texto já descarta esses trechos, então a lista de links tinha
+    /// de sair do mesmo texto limpo.
+    #[test]
+    fn ignora_links_de_comentarios_e_blocos_ignorados() {
+        let html = r#"<p>x</p><!-- <a href="http://spam.example/x">link comentado</a> -->
+            <script>var a = '<a href="http://spam.example/js">script</a>';</script>
+            <template><a href="http://spam.example/t">template</a></template>
+            <a href="https://exemplo.com/real">Real</a>"#;
+        let pagina = html_para_texto(html);
+        assert_eq!(pagina.links.len(), 1, "{:?}", pagina.links);
+        assert_eq!(pagina.links[0].1, "https://exemplo.com/real");
+        // O texto continua limpo como antes.
+        assert!(pagina.texto.contains('x') && pagina.texto.contains("Real"));
+    }
+
     #[test]
     fn decodifica_entidades() {
         assert_eq!(
@@ -245,8 +262,13 @@ mod tests {
             percent_decode("https%3A%2F%2Fexemplo.com%2F%3Fq%3D1"),
             "https://exemplo.com/?q=1"
         );
-        assert_eq!(percent_decode("a+b"), "a b");
-        // `%2B` é um mais literal, não o `+` de formulário.
+        // `+` é um caractere da URL, não espaço: só em valores de formulário.
+        assert_eq!(percent_decode("a+b"), "a+b");
+        assert_eq!(
+            percent_decode("https%3A%2F%2Fexemplo.com%2Fbusca%3Fq%3Dc%2B%2B%2Bparser"),
+            "https://exemplo.com/busca?q=c+++parser"
+        );
+        // `%2B` é um mais literal.
         assert_eq!(percent_decode("a%2Bb"), "a+b");
         assert_eq!(percent_decode("100%25"), "100%");
     }

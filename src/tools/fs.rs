@@ -68,7 +68,24 @@ fn ler_texto(path: &Path) -> Result<String, ToolError> {
 /// Arquivos binários ou fora do UTF-8 não podem ser reescritos por
 /// ferramentas de texto: tratá-los como vazio apagava o original e gravava um
 /// diff falso (o `/undo` não teria como restaurá-lo).
-fn ler_anterior_para_substituir(path: &Path) -> Result<String, ToolError> {
+pub(crate) fn ler_anterior_para_substituir(path: &Path) -> Result<String, ToolError> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if !meta.is_file() {
+            return Err(ToolError::msg(format!(
+                "{} não é um arquivo regular (FIFO, dispositivo ou socket); reescrita recusada para não travar o agente.",
+                path.display()
+            )));
+        }
+        if meta.len() > LIMITE_LEITURA_BYTES {
+            return Err(ToolError::msg(format!(
+                "{} tem {} e excede o limite de {} para reescrita segura. \
+                 Use run_command com `sed`/`awk` para recortes ou divida o arquivo antes.",
+                path.display(),
+                crate::util::human_bytes(meta.len()),
+                crate::util::human_bytes(LIMITE_LEITURA_BYTES)
+            )));
+        }
+    }
     match std::fs::read(path) {
         Ok(bytes) => {
             if parece_binario(&bytes) {
@@ -98,18 +115,35 @@ fn ler_anterior_para_substituir(path: &Path) -> Result<String, ToolError> {
 /// As permissões do arquivo existente são copiadas para o temporário antes do
 /// `rename`: sem isso, reescrever um script/executável com `write_file` ou
 /// `edit_file` trocava o modo para o padrão do umask e perdia o `+x`.
-fn escrever_atomico(path: &Path, conteudo: &str) -> Result<(), ToolError> {
-    let tmp = path.with_extension(format!(
-        "{}kestrel-tmp",
-        path.extension()
-            .map(|e| format!("{}.", e.to_string_lossy()))
-            .unwrap_or_default()
+pub(crate) fn escrever_atomico(path: &Path, conteudo: &str) -> Result<(), ToolError> {
+    // O temporário precisa ser imprevisível e criado com `create_new`: um nome
+    // fixo permitia que um symlink plantado no repositório
+    // (`arquivo.rs.kestrel-tmp -> ~/.bashrc`) fizesse a escrita seguir o link e
+    // alterar algo fora do projeto.
+    let nome = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "arquivo".into());
+    let tmp = path.with_file_name(format!(
+        ".{nome}.{}.kestrel-tmp",
+        uuid::Uuid::new_v4().simple()
     ));
     let permissoes = std::fs::metadata(path).ok().map(|m| m.permissions());
-    std::fs::write(&tmp, conteudo).map_err(|e| {
+    let mut arquivo = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| ToolError::msg(format!("falha ao criar {}: {e}", tmp.display())))?;
+    use std::io::Write;
+    if let Err(e) = arquivo.write_all(conteudo.as_bytes()) {
+        drop(arquivo);
         let _ = std::fs::remove_file(&tmp);
-        ToolError::msg(format!("falha ao gravar {}: {e}", tmp.display()))
-    })?;
+        return Err(ToolError::msg(format!(
+            "falha ao gravar {}: {e}",
+            tmp.display()
+        )));
+    }
+    drop(arquivo);
     if let Some(perms) = permissoes {
         // Falha em preservar o modo não deve impedir a gravação do conteúdo.
         let _ = std::fs::set_permissions(&tmp, perms);
@@ -337,28 +371,83 @@ fn aplicar_trecho(
     })
 }
 
+/// Terminador de uma peça produzida por `split_inclusive('\n')`: `\r\n`, `\n`
+/// ou vazio quando é a última linha sem quebra.
+fn terminador_da_peca(peca: &str) -> &'static str {
+    let bytes = peca.as_bytes();
+    if bytes.ends_with(b"\r\n") {
+        "\r\n"
+    } else if bytes.ends_with(b"\n") {
+        "\n"
+    } else {
+        ""
+    }
+}
+
 fn substituir_linhas(
     conteudo: &str,
     inicio: usize,
     fim: usize,
     novo: &str,
 ) -> Result<String, ToolError> {
-    let linhas: Vec<&str> = conteudo.lines().collect();
-    if inicio == 0 || inicio > linhas.len() || fim < inicio || fim > linhas.len() {
+    // `split_inclusive('\n')` preserva o terminador de cada linha (`\r\n` ou
+    // `\n`, e nenhum na última sem quebra). A versão anterior usava `.lines()`
+    // + `join("\n")`, o que descartava o `\r` de arquivos CRLF e reescrevia o
+    // arquivo inteiro (diff gigante e falso) ao editar uma única linha.
+    let pecas: Vec<&str> = conteudo.split_inclusive('\n').collect();
+    if inicio == 0 || inicio > pecas.len() || fim < inicio || fim > pecas.len() {
         return Err(ToolError::msg(format!(
             "intervalo de linhas inválido: {inicio}..{fim} (o arquivo tem {} linhas)",
-            linhas.len()
+            pecas.len()
         )));
     }
-    let mut resultado: Vec<String> = linhas[..inicio - 1].iter().map(|s| s.to_string()).collect();
-    resultado.extend(novo.lines().map(|s| s.to_string()));
-    resultado.extend(linhas[fim..].iter().map(|s| s.to_string()));
-    let terminava_com_nova_linha = conteudo.ends_with('\n');
-    let mut texto = resultado.join("\n");
-    if terminava_com_nova_linha {
-        texto.push('\n');
+    let term_primeiro = terminador_da_peca(pecas[inicio - 1]);
+    let term_ultimo = terminador_da_peca(pecas[fim - 1]);
+    // Quando o trecho substituído é a última linha sem quebra, não há
+    // terminador para reaproveitar. Usar o terminador vazio entre as novas
+    // linhas concatenava tudo (`"x\ny"` virava `"xy"`). Herda o EOL da linha
+    // anterior ou, num arquivo de uma linha só, detecta pelo conteúdo.
+    let term_intermediario = if !term_primeiro.is_empty() {
+        term_primeiro
+    } else if inicio >= 2 {
+        let anterior = terminador_da_peca(pecas[inicio - 2]);
+        if anterior.is_empty() {
+            if conteudo.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            }
+        } else {
+            anterior
+        }
+    } else if conteudo.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+
+    let mut saida = String::new();
+    // Linhas anteriores, intocadas, com o terminador original.
+    for peca in &pecas[..inicio - 1] {
+        saida.push_str(peca);
     }
-    Ok(texto)
+    // Conteúdo novo: cada linha recebe o terminador do trecho substituído para
+    // não misturar finais de linha no mesmo arquivo.
+    let novas: Vec<&str> = novo.lines().collect();
+    for (i, linha) in novas.iter().enumerate() {
+        saida.push_str(linha);
+        let term = if i + 1 == novas.len() {
+            term_ultimo
+        } else {
+            term_intermediario
+        };
+        saida.push_str(term);
+    }
+    // Linhas seguintes, intocadas, com o terminador original.
+    for peca in &pecas[fim..] {
+        saida.push_str(peca);
+    }
+    Ok(saida)
 }
 
 // ---------------------------------------------------------------- list_files
@@ -1117,10 +1206,24 @@ impl Tool for DeleteFile {
         })?;
         let eh_link = meta.file_type().is_symlink();
         let alvo = if eh_link { &literal } else { &caminho };
-        let anterior = if meta.file_type().is_file() {
-            std::fs::read_to_string(alvo).unwrap_or_default()
+        // Lê o anterior ANTES de remover. `read_to_string().unwrap_or_default()`
+        // tratava binário/não-UTF8 como vazio e registrava remoção de 0 linhas,
+        // mentindo no histórico e no `/undo`. `ler_anterior_para_substituir`
+        // detecta esses casos; quando não é textual, registramos uma nota
+        // explícita com o tamanho em bytes em vez de silenciar.
+        let (remocoes, nota) = if meta.file_type().is_file() {
+            match ler_anterior_para_substituir(alvo) {
+                Ok(conteudo) => (crate::util::count_lines(&conteudo), None),
+                Err(_) => (
+                    0,
+                    Some(format!(
+                        "(conteúdo não textual removido: {} bytes)",
+                        meta.len()
+                    )),
+                ),
+            }
         } else {
-            String::new()
+            (0, None)
         };
         if meta.is_dir() {
             if !arg_bool(&args, "recursive", false) {
@@ -1135,11 +1238,6 @@ impl Tool for DeleteFile {
             std::fs::remove_file(alvo)
                 .map_err(|e| ToolError::msg(format!("falha ao remover {}: {e}", alvo.display())))?;
         }
-        let remocoes = if meta.file_type().is_file() {
-            crate::util::count_lines(&anterior)
-        } else {
-            0
-        };
         ctx.store
             .record_file_change(
                 &ctx.session_id,
@@ -1147,7 +1245,7 @@ impl Tool for DeleteFile {
                 "remocao",
                 0,
                 remocoes,
-                None,
+                nota.as_deref(),
             )
             .ok();
         Ok(
@@ -1177,6 +1275,38 @@ mod tests {
         assert_eq!(novo, "1\ndois\ntres\n4\n");
         assert!(substituir_linhas(base, 0, 1, "x").is_err());
         assert!(substituir_linhas(base, 3, 99, "x").is_err());
+    }
+
+    /// Editar uma linha no meio de um arquivo CRLF não pode reescrever as
+    /// outras linhas para LF: `.lines()` + `join("\n")` descartava o `\r` e
+    /// produzia um diff que fingia 100% de alteração no git do usuário.
+    #[test]
+    fn substituir_linhas_preserva_crlf_das_linhas_nao_editadas() {
+        let base = "primeira\r\nsegunda\r\nterceira\r\n";
+        let novo = substituir_linhas(base, 2, 2, "SEGUNDA").unwrap();
+        assert_eq!(novo, "primeira\r\nSEGUNDA\r\nterceira\r\n");
+    }
+
+    /// Arquivo sem quebra final e arquivo com múltiplas linhas novas também
+    /// preservam o terminador das linhas intactas.
+    #[test]
+    fn substituir_linhas_preserva_crlf_sem_quebra_final() {
+        let base = "a\r\nb\r\nc"; // última sem quebra
+        let novo = substituir_linhas(base, 2, 2, "B").unwrap();
+        assert_eq!(novo, "a\r\nB\r\nc");
+    }
+
+    #[test]
+    fn substituir_linhas_ultima_linha_sem_quebra_com_multiplas_novas() {
+        // A última linha sem `\n` não tem terminador para reaproveitar; as
+        // novas linhas intermediárias precisam de uma quebra (antes saíam
+        // concatenadas: `x\ny` virava `xy`).
+        assert_eq!(substituir_linhas("a\nb", 2, 2, "x\ny").unwrap(), "a\nx\ny");
+        assert_eq!(
+            substituir_linhas("a\r\nb", 2, 2, "x\ny").unwrap(),
+            "a\r\nx\r\ny"
+        );
+        assert_eq!(substituir_linhas("b", 1, 1, "x\ny").unwrap(), "x\ny");
     }
 
     #[test]
@@ -1478,5 +1608,36 @@ mod tests {
         assert!(projeto.exists(), "o projeto não pode ser removido");
         assert!(base.exists(), "o ancestral não pode ser removido");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Remover um binário/não-UTF8 precisa registrar algo explícito: a versão
+    /// anterior usava `read_to_string().unwrap_or_default()` e gravava remoção
+    /// de 0 linhas com diff `None`, mentindo no histórico e no `/undo`.
+    #[tokio::test]
+    async fn delete_file_de_binario_registra_nota_explicita() {
+        use crate::tools::Tool;
+        let dir = std::env::temp_dir().join(format!("kestrel-fs-delbin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alvo = dir.join("binario.dat");
+        // Byte nulo força a classificação de binário em `ler_anterior_para_substituir`.
+        std::fs::write(&alvo, b"inicio\0fim").unwrap();
+        let ctx = crate::tools::git::tests::contexto(&dir);
+        DeleteFile
+            .executar(serde_json::json!({"path": "binario.dat"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!alvo.exists(), "o arquivo deveria ter sido removido");
+        let alteracao = ctx
+            .store
+            .ultima_alteracao(&ctx.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(alteracao.change_type, "remocao");
+        assert!(
+            alteracao.diff.contains("não textual"),
+            "o histórico deveria marcar o conteúdo não textual: {}",
+            alteracao.diff
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

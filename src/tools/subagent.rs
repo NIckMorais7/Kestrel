@@ -5,7 +5,7 @@
 //! gestão de processos ou recursão. O resultado é um relatório textual que
 //! volta para o modelo principal como resultado da ferramenta.
 
-use super::{Tool, ToolContext, ToolError, ToolOutput, arg_str, arg_str_opt};
+use super::{Tool, ToolContext, ToolError, ToolOutput, arg_str, arg_str_opt, recortar_saida};
 use crate::events::AgentEvent;
 use crate::provider::ToolSpec;
 use serde_json::{Value, json};
@@ -76,7 +76,11 @@ impl Tool for SpawnSubagent {
             .await
         {
             Ok(relatorio) => Ok(ToolOutput::texto(format!(
-                "Relatório do subagente:\n\n{relatorio}"
+                // Um relatório gigante sem limite estouraria o contexto na
+                // próxima chamada do provedor: recorta como as outras
+                // ferramentas, com marcador visível de truncamento.
+                "Relatório do subagente:\n\n{}",
+                recortar_saida(&relatorio, ctx.max_saida)
             ))
             .com_resumo(format!(
                 "subagente concluiu: {}",
@@ -110,5 +114,44 @@ mod tests {
     #[test]
     fn timeout_maior_que_o_padrao() {
         assert!(SpawnSubagent.timeout() > Duration::from_secs(120));
+    }
+
+    struct RunnerGigante;
+
+    #[async_trait::async_trait]
+    impl crate::tools::SubagentRunner for RunnerGigante {
+        async fn executar_subagente(
+            &self,
+            _tarefa: &str,
+            _contexto: &str,
+            _contexto_extra: tokio_util::sync::CancellationToken,
+            _eventos: tokio::sync::mpsc::UnboundedSender<crate::events::AgentEvent>,
+        ) -> Result<String, String> {
+            Ok("relatorio ".repeat(6000)) // dezenas de milhares de caracteres
+        }
+    }
+
+    /// Relatório gigante do subagente precisa ser recortado antes de virar
+    /// contexto: sem o limite, a próxima chamada do provedor estourava.
+    #[tokio::test]
+    async fn relatorio_gigante_do_subagente_e_recortado() {
+        let dir = std::env::temp_dir().join(format!("kestrel-subag-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = crate::tools::git::tests::contexto(&dir);
+        ctx.subagente = Some(std::sync::Arc::new(RunnerGigante));
+        let saida = SpawnSubagent
+            .executar(serde_json::json!({"tarefa": "investigar"}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            saida.conteudo.contains("saída truncada"),
+            "o relatório deveria vir truncado: {}",
+            saida.conteudo
+        );
+        assert!(
+            saida.conteudo.chars().count() < 40_000,
+            "o relatório não pode entrar inteiro no contexto"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

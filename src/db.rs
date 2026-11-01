@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS file_changes (
     deletions   INTEGER NOT NULL DEFAULT 0,
     diff        TEXT,
     validated   INTEGER NOT NULL DEFAULT 0,
+    undone      INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL
 );
 
@@ -278,6 +279,60 @@ impl Store {
         })
     }
 
+    /// Cria um ramo (checkpoint) de uma sessão, copiando histórico, plano,
+    /// tarefas, decisões e alterações de arquivo. O original é marcado como
+    /// ramificado e fica preservado.
+    pub fn branch_session(&self, origem: &str, novo_id: &str, titulo: &str) -> Result<usize> {
+        let now = crate::util::now_rfc3339();
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let inserida = tx.execute(
+                "INSERT INTO sessions (id, project_path, title, model, reasoning_effort, permission, status, parent_id, objective, created_at, updated_at)
+                 SELECT ?1, project_path, ?2, model, reasoning_effort, permission, 'ativa', id, objective, ?3, ?3
+                 FROM sessions WHERE id = ?4",
+                params![novo_id, titulo, now, origem],
+            )?;
+            if inserida == 0 {
+                anyhow::bail!("sessão de origem `{origem}` não existe");
+            }
+            tx.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, tool_name, reasoning, created_at)
+                 SELECT ?1, role, content, tool_calls, tool_call_id, tool_name, reasoning, created_at
+                 FROM messages WHERE session_id = ?2 ORDER BY id",
+                params![novo_id, origem],
+            )?;
+            let mensagens = tx.changes() as usize;
+            tx.execute(
+                "INSERT INTO plans (session_id, objective, version, steps, created_at)
+                 SELECT ?1, objective, version, steps, created_at FROM plans WHERE session_id = ?2",
+                params![novo_id, origem],
+            )?;
+            tx.execute(
+                "INSERT INTO tasks (id, session_id, parent_id, title, description, status, depends_on, order_idx, result, created_at, updated_at)
+                 SELECT id, ?1, parent_id, title, description, status, depends_on, order_idx, result, created_at, updated_at
+                 FROM tasks WHERE session_id = ?2",
+                params![novo_id, origem],
+            )?;
+            tx.execute(
+                "INSERT INTO file_changes (session_id, path, change_type, additions, deletions, diff, validated, undone, created_at)
+                 SELECT ?1, path, change_type, additions, deletions, diff, validated, undone, created_at
+                 FROM file_changes WHERE session_id = ?2",
+                params![novo_id, origem],
+            )?;
+            tx.execute(
+                "INSERT INTO decisions (session_id, kind, summary, detail, created_at)
+                 SELECT ?1, kind, summary, detail, created_at FROM decisions WHERE session_id = ?2",
+                params![novo_id, origem],
+            )?;
+            tx.execute(
+                "UPDATE sessions SET status = 'ramificada', updated_at = ?2 WHERE id = ?1",
+                params![origem, now],
+            )?;
+            tx.commit()?;
+            Ok(mensagens)
+        })
+    }
+
     pub fn update_session_model(
         &self,
         id: &str,
@@ -378,10 +433,30 @@ impl Store {
         if ids.is_empty() {
             return Ok(0);
         }
-        let marcadores = vec!["?"; ids.len()].join(",");
         self.with(|c| {
             c.execute_batch("BEGIN IMMEDIATE")?;
             let delecao = (|| -> Result<usize> {
+                // Sessões filhas (continuações/ramos via `parent_id`) também
+                // pertencem à mãe: sem cascade elas ficariam órfãs apontando
+                // para uma sessão inexistente.
+                let mut todos_ids = ids.to_vec();
+                loop {
+                    let marcadores = vec!["?"; todos_ids.len()].join(",");
+                    let sql = format!("SELECT id FROM sessions WHERE parent_id IN ({marcadores})");
+                    let mut stmt = c.prepare(&sql)?;
+                    let filhas: Vec<String> = stmt
+                        .query_map(rusqlite::params_from_iter(todos_ids.iter()), |r| r.get(0))?
+                        .collect::<Result<_, _>>()?;
+                    let novas: Vec<String> = filhas
+                        .into_iter()
+                        .filter(|f| !todos_ids.contains(f))
+                        .collect();
+                    if novas.is_empty() {
+                        break;
+                    }
+                    todos_ids.extend(novas);
+                }
+                let marcadores = vec!["?"; todos_ids.len()].join(",");
                 // Sem chave estrangeira com cascade, cada tabela filha precisa
                 // ser limpa explicitamente; o banco inteiro fica consistente.
                 let dependentes = [
@@ -398,11 +473,11 @@ impl Store {
                 for tabela in dependentes {
                     let sql = format!("DELETE FROM {tabela} WHERE session_id IN ({marcadores})");
                     let mut stmt = c.prepare(&sql)?;
-                    stmt.execute(rusqlite::params_from_iter(ids.iter()))?;
+                    stmt.execute(rusqlite::params_from_iter(todos_ids.iter()))?;
                 }
                 let sql = format!("DELETE FROM sessions WHERE id IN ({marcadores})");
                 let mut stmt = c.prepare(&sql)?;
-                let excluidas = stmt.execute(rusqlite::params_from_iter(ids.iter()))?;
+                let excluidas = stmt.execute(rusqlite::params_from_iter(todos_ids.iter()))?;
                 Ok(excluidas as usize)
             })();
             match delecao {
@@ -507,32 +582,80 @@ impl Store {
     }
 
     pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        // `%`/`_` são curingas do LIKE: sem escapar, buscar `%` devolvia tudo.
-        let termo = query
-            .to_lowercase()
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let like = format!("%{termo}%");
+        // Consulta ASCII (o caso comum) continua no SQL, com `LIKE` e o teto de
+        // linhas aplicados lá dentro — sem custo extra em histórico grande.
+        if query.is_ascii() {
+            // `%`/`_` são curingas do LIKE: sem escapar, buscar `%` devolvia tudo.
+            let termo = query
+                .to_lowercase()
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let like = format!("%{termo}%");
+            return self.with(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT m.session_id, s.title, m.role, m.content, m.created_at
+                     FROM messages m JOIN sessions s ON s.id = m.session_id
+                     WHERE lower(m.content) LIKE ?1 ESCAPE '\\'
+                     ORDER BY m.id DESC LIMIT ?2",
+                )?;
+                let iter = stmt.query_map(params![like, limit as i64], |r| {
+                    Ok(SearchHit {
+                        session_id: r.get(0)?,
+                        session_title: r.get(1)?,
+                        role: r.get(2)?,
+                        content: r.get(3)?,
+                        created_at: r.get(4)?,
+                    })
+                })?;
+                iter.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            });
+        }
+        // Termo com acento (ou qualquer não-ASCII): o `lower()` do SQLite só
+        // minúsculas ASCII (`lower('AÇÃO')` = `aÇÃo`), então comparar lá
+        // dentro nunca batia — buscar `ação` não encontrava `AÇÃO`. A
+        // normalização Unicode é feita em Rust, sobre as mensagens já trazidas
+        // das mais recentes para as mais antigas, parando ao completar `limit`.
+        let termo = query.to_lowercase();
         self.with(|c| {
-            let mut stmt = c.prepare(
-                "SELECT m.session_id, s.title, m.role, m.content, m.created_at
-                 FROM messages m JOIN sessions s ON s.id = m.session_id
-                 WHERE lower(m.content) LIKE ?1 ESCAPE '\\'
-                 ORDER BY m.id DESC LIMIT ?2",
-            )?;
-            let iter = stmt.query_map(params![like, limit as i64], |r| {
-                Ok(SearchHit {
-                    session_id: r.get(0)?,
-                    session_title: r.get(1)?,
-                    role: r.get(2)?,
-                    content: r.get(3)?,
-                    created_at: r.get(4)?,
-                })
-            })?;
+            // Paginação: a versão anterior varria a tabela inteira numa única
+            // alocação, bloqueando a interface por muito tempo numa busca com
+            // acento que não batia com nada.
+            const PAGINA: usize = 500;
             let mut hits = Vec::new();
-            for r in iter {
-                hits.push(r?);
+            let mut offset = 0usize;
+            loop {
+                let mut stmt = c.prepare(
+                    "SELECT m.session_id, s.title, m.role, m.content, m.created_at
+                     FROM messages m JOIN sessions s ON s.id = m.session_id
+                     ORDER BY m.id DESC LIMIT ?1 OFFSET ?2",
+                )?;
+                let lote: Vec<SearchHit> = stmt
+                    .query_map(params![PAGINA as i64, offset as i64], |r| {
+                        Ok(SearchHit {
+                            session_id: r.get(0)?,
+                            session_title: r.get(1)?,
+                            role: r.get(2)?,
+                            content: r.get(3)?,
+                            created_at: r.get(4)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let tamanho = lote.len();
+                for linha in lote {
+                    if !linha.content.to_lowercase().contains(&termo) {
+                        continue;
+                    }
+                    hits.push(linha);
+                    if hits.len() >= limit {
+                        return Ok(hits);
+                    }
+                }
+                if tamanho < PAGINA {
+                    break;
+                }
+                offset += tamanho;
             }
             Ok(hits)
         })
@@ -669,19 +792,22 @@ impl Store {
         self.with(|c| {
             let linha = c
                 .query_row(
-                    "SELECT path, change_type, diff FROM file_changes \
-                     WHERE session_id = ?1 AND diff IS NOT NULL ORDER BY id DESC LIMIT 1",
+                    "SELECT id, path, change_type, diff FROM file_changes \
+                     WHERE session_id = ?1 AND diff IS NOT NULL AND undone = 0 \
+                     ORDER BY id DESC LIMIT 1",
                     params![session_id],
                     |r| {
                         Ok((
-                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(0)?,
                             r.get::<_, String>(1)?,
-                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
                         ))
                     },
                 )
                 .optional()?;
-            Ok(linha.map(|(path, tipo, diff)| AlteracaoRecente {
+            Ok(linha.map(|(id, path, tipo, diff)| AlteracaoRecente {
+                id,
                 path,
                 change_type: tipo,
                 diff: diff.unwrap_or_default(),
@@ -693,19 +819,32 @@ impl Store {
     pub fn alteracoes(&self, session_id: &str) -> Result<Vec<AlteracaoRecente>> {
         self.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT path, change_type, diff FROM file_changes \
-                 WHERE session_id = ?1 AND diff IS NOT NULL ORDER BY id ASC",
+                "SELECT id, path, change_type, diff FROM file_changes \
+                 WHERE session_id = ?1 AND diff IS NOT NULL AND undone = 0 ORDER BY id ASC",
             )?;
             let linhas = stmt
                 .query_map(params![session_id], |r| {
                     Ok(AlteracaoRecente {
-                        path: r.get(0)?,
-                        change_type: r.get(1)?,
-                        diff: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        id: r.get(0)?,
+                        path: r.get(1)?,
+                        change_type: r.get(2)?,
+                        diff: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(linhas)
+        })
+    }
+
+    /// Marca uma alteração como já desfeita: o `/undo` seguinte passa a
+    /// enxergar a alteração anterior, em vez de tentar reaplicar o mesmo diff.
+    pub fn marcar_alteracao_desfeita(&self, id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE file_changes SET undone = 1 WHERE id = ?1",
+                params![id],
+            )?;
+            Ok(())
         })
     }
 
@@ -878,7 +1017,7 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             let files: i64 = c.query_row(
-                "SELECT COUNT(DISTINCT path) FROM file_changes WHERE session_id = ?1",
+                "SELECT COUNT(DISTINCT path) FROM file_changes WHERE session_id = ?1 AND undone = 0",
                 params![session_id],
                 |r| r.get(0),
             )?;
@@ -906,6 +1045,7 @@ impl Store {
 /// `/undo` (desfazer) e pelo `/diff` (revisar).
 #[derive(Clone, Debug)]
 pub struct AlteracaoRecente {
+    pub id: i64,
     pub path: String,
     pub change_type: String,
     pub diff: String,
@@ -1139,6 +1279,38 @@ mod tests {
         assert_eq!(hits.len(), 1);
     }
 
+    /// A normalização dos dois lados tem de ser a mesma: `lower()` do SQLite só
+    /// minúsculas ASCII, então `AÇÃO` nunca era encontrado por `ação`.
+    #[test]
+    fn busca_ignora_maiusculas_com_acentos() {
+        let s = store();
+        s.create_session("s1", "/p", "t", "m", None, "read", None)
+            .unwrap();
+        s.append_message(
+            "s1",
+            "user",
+            "Preciso de AÇÃO no parser",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        s.append_message("s1", "user", "outro assunto", None, None, None, None)
+            .unwrap();
+        let hits = s.search_messages("ação", 10).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].content.contains("AÇÃO"));
+        // E no sentido inverso continua funcionando.
+        let hits = s.search_messages("AÇÃO", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        // ASCII comum não regrediu.
+        let hits = s.search_messages("PARSER", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let hits = s.search_messages("parser", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
     #[test]
     fn planos_tarefas_e_alteracoes() {
         let s = store();
@@ -1169,6 +1341,36 @@ mod tests {
         let stats = s.session_stats("s1").unwrap();
         assert_eq!(stats.additions, 10);
         assert_eq!(stats.files_touched, 1);
+    }
+
+    /// Desfazer uma alteração a remove da lista de pendentes: o `/undo`
+    /// seguinte precisa enxergar a anterior, não a mesma de novo.
+    #[test]
+    fn alteracao_desfeita_sai_da_ultima() {
+        let s = store();
+        s.create_session("s1", "/p", "t", "m", None, "semi", None)
+            .unwrap();
+        let a = s
+            .record_file_change("s1", "a.txt", "editar", 1, 0, Some("diff-a"))
+            .unwrap();
+        let b = s
+            .record_file_change("s1", "b.txt", "editar", 1, 0, Some("diff-b"))
+            .unwrap();
+        assert_eq!(s.ultima_alteracao("s1").unwrap().unwrap().id, b);
+        assert_eq!(s.alteracoes("s1").unwrap().len(), 2);
+
+        s.marcar_alteracao_desfeita(b).unwrap();
+        let ultima = s.ultima_alteracao("s1").unwrap().unwrap();
+        assert_eq!(ultima.id, a);
+        assert_eq!(ultima.path, "a.txt");
+        // A desfeita não aparece mais no `/diff`.
+        let restantes = s.alteracoes("s1").unwrap();
+        assert_eq!(restantes.len(), 1);
+        assert_eq!(restantes[0].id, a);
+
+        s.marcar_alteracao_desfeita(a).unwrap();
+        assert!(s.ultima_alteracao("s1").unwrap().is_none());
+        assert!(s.alteracoes("s1").unwrap().is_empty());
     }
 
     /// O uso de tokens informado pelo provedor precisa ser persistido: antes
@@ -1286,5 +1488,75 @@ mod tests {
     fn deletar_sessoes_vazias_e_nao_op() {
         let s = store();
         assert_eq!(s.delete_sessions(&[]).unwrap(), 0);
+    }
+
+    /// Excluir uma sessão-mãe também remove continuações/ramos filhas
+    /// (`parent_id`) — sem cascade ficariam órfãs apontando para uma sessão
+    /// inexistente.
+    #[test]
+    fn deletar_sessao_mae_remove_filhas() {
+        let s = store();
+        s.create_session("mae", "/p", "t1", "m", None, "semi", None)
+            .unwrap();
+        s.create_session("filha1", "/p", "t2", "m", None, "semi", Some("mae"))
+            .unwrap();
+        s.create_session("filha2", "/p", "t3", "m", None, "semi", Some("filha1"))
+            .unwrap();
+        s.create_session("independente", "/p", "t4", "m", None, "semi", None)
+            .unwrap();
+        s.append_message("filha1", "user", "msg", None, None, None, None)
+            .unwrap();
+
+        let excluidas = s.delete_sessions(&["mae".into()]).unwrap();
+        assert_eq!(excluidas, 3);
+        assert!(s.get_session("mae").unwrap().is_none());
+        assert!(s.get_session("filha1").unwrap().is_none());
+        assert!(s.get_session("filha2").unwrap().is_none());
+        assert!(s.get_session("independente").unwrap().is_some());
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'filha1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "mensagens das filhas devem sumir junto");
+    }
+
+    #[test]
+    fn ramificacao_copia_estado_e_preserva_original() {
+        let s = store();
+        s.create_session("origem", "/p", "tarefa", "m", None, "semi", None)
+            .unwrap();
+        s.append_message("origem", "user", "olá", None, None, None, None)
+            .unwrap();
+        s.append_message("origem", "assistant", "resposta", None, None, None, None)
+            .unwrap();
+        s.save_plan("origem", "objetivo", "[]").unwrap();
+        s.record_file_change("origem", "src/a.rs", "edicao", 2, 1, Some("diff"))
+            .unwrap();
+        s.record_decision("origem", "teste", "decisão", None)
+            .unwrap();
+
+        let copiadas = s.branch_session("origem", "ramo", "meu ramo").unwrap();
+        assert_eq!(copiadas, 2);
+        assert_eq!(s.recent_messages("ramo", 10).unwrap().len(), 2);
+        assert!(s.latest_plan("ramo").unwrap().is_some());
+        assert_eq!(s.file_changes("ramo").unwrap().len(), 1);
+        assert_eq!(s.decisions("ramo", 10).unwrap().len(), 1);
+        assert_eq!(
+            s.get_session("ramo").unwrap().unwrap().parent_id.as_deref(),
+            Some("origem")
+        );
+        assert_eq!(
+            s.get_session("origem").unwrap().unwrap().status,
+            "ramificada"
+        );
+        // O ramo é independente: uma mensagem nova não aparece no original.
+        s.append_message("ramo", "user", "só no ramo", None, None, None, None)
+            .unwrap();
+        assert_eq!(s.recent_messages("origem", 10).unwrap().len(), 2);
+        assert_eq!(s.recent_messages("ramo", 10).unwrap().len(), 3);
     }
 }

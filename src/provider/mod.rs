@@ -251,6 +251,23 @@ impl ProviderError {
             other => other.to_string(),
         }
     }
+
+    /// Erros em que vale a pena tentar o próximo modelo da lista de fallback.
+    /// Erros de configuração/autenticação não melhoram com outro modelo.
+    pub fn permite_fallback(&self) -> bool {
+        match self {
+            ProviderError::Cancelado | ProviderError::ChaveAusente(_) => false,
+            // Resposta inválida é problema de formato; trocar de modelo pode
+            // resolver (alguns modelos devolvem tool calls quebradas).
+            ProviderError::RespostaInvalida(_) => true,
+            ProviderError::ModeloIndisponivel(_) => true,
+            ProviderError::Rede(_) | ProviderError::Timeout(_) => true,
+            ProviderError::LimiteRequisicoes { .. } => true,
+            ProviderError::Http { status, .. } => {
+                matches!(*status, 404 | 408 | 429) || *status >= 500
+            }
+        }
+    }
 }
 
 /// Interface de provedor de modelos.

@@ -129,10 +129,24 @@ fn diff_aproximado(a: &[&str], b: &[&str]) -> Diff {
             additions,
             deletions,
         },
+        // O marcador de truncamento vem junto: sem ele, o `/undo` via zero
+        // operadores nesse texto e dizia "o arquivo mudou desde a alteração
+        // registrada" em vez de "diff grande demais para desfazer".
         text: format!(
-            "(diff textual omitido para arquivo grande: +{additions} -{deletions} linhas)"
+            "{DIFF_TRUNCADO} (diff textual omitido para arquivo grande: +{additions} -{deletions} linhas)"
         ),
     }
+}
+
+/// Frase que as versões antigas gravavam no lugar do diff de arquivo grande,
+/// sem o marcador [`DIFF_TRUNCADO`]. Continua reconhecida porque diffs antigos
+/// ainda estão no banco.
+const FRASE_DIFF_OMITIDO: &str = "(diff textual omitido";
+
+/// O texto gravado descreve a alteração completa? Diff truncado não descreve:
+/// reverter com ele escreveria um arquivo parcial.
+fn diff_truncado(texto: &str) -> bool {
+    texto.contains(DIFF_TRUNCADO) || texto.contains(FRASE_DIFF_OMITIDO)
 }
 
 /// Apenas as estatísticas (usada pelos testes de contagem).
@@ -166,7 +180,7 @@ pub const DIFF_TRUNCADO: &str =
 pub fn reverter(diff_texto: &str, atual: &str) -> Option<String> {
     // Diff truncado não descreve a alteração completa: reverter com ele
     // escreveria um arquivo parcial. Recusa explícita, nunca patch silencioso.
-    if diff_texto.contains(DIFF_TRUNCADO) {
+    if diff_truncado(diff_texto) {
         return None;
     }
     let atuais: Vec<&str> = if atual.is_empty() {
@@ -261,6 +275,28 @@ fn reverter_devolve_o_texto_anterior() {
 fn reverter_recusa_diff_truncado() {
     assert!(reverter(DIFF_TRUNCADO, "qualquer\n").is_none());
     assert!(reverter(&format!("{DIFF_TRUNCADO}\n+linha"), "x\n").is_none());
+}
+
+/// O caminho de arquivo grande (>4000 linhas) grava a frase de omissão **com**
+/// o marcador: sem ele o `/undo` via zero operadores e culpava o arquivo por
+/// ter mudado, em vez de dizer que o diff é grande demais.
+#[test]
+fn diff_de_arquivo_grande_marca_truncamento() {
+    let grande: String = (0..5000).map(|i| format!("linha {i}\n")).collect();
+    let modificado = format!("{grande}extra\n");
+    let d = diff(&grande, &modificado);
+    assert!(d.text.contains(DIFF_TRUNCADO), "{}", d.text);
+    assert!(d.text.contains("omitido"));
+    // E o reverso recusa no motivo certo.
+    assert!(reverter(&d.text, &modificado).is_none());
+    // A frase das versões antigas (sem marcador) também é recusada.
+    assert!(
+        reverter(
+            "(diff textual omitido para arquivo grande: +1 -1 linhas)",
+            "x\n"
+        )
+        .is_none()
+    );
 }
 
 /// Reverter é reversível: ida e volta dão no mesmo lugar.

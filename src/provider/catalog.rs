@@ -147,8 +147,45 @@ pub fn enrich(entry: ModelEntry) -> ModelEntry {
     entry
 }
 
-/// Descobre modelos via API e mescla com o catálogo existente, preservando
-/// entradas manuais.
+/// Preserva, em `mesclado`, os ajustes que o usuário fez em `anterior`.
+///
+/// O critério é o mesmo para entradas manuais e descobertas: um campo só é
+/// preservado quando tem valor **explícito** — `Some`, não vazio ou diferente
+/// de `desconhecido`. Campos que a descoberta/catálogo gravaria como padrão
+/// (`None`, vazios, `desconhecido`) continuam sendo preenchidos, então o
+/// catálogo interno ainda atualiza entradas antigas; o que o usuário editou à
+/// mão no `config.toml` (`context_window`, `display_name`, `notes`, capacidades,
+/// esforços) não é mais sobrescrito a cada atualização automática ou `load`.
+fn preservar_ajustes(anterior: &ModelEntry, mesclado: &mut ModelEntry) {
+    if anterior.context_window.is_some() {
+        mesclado.context_window = anterior.context_window;
+    }
+    if !anterior.reasoning_efforts.is_empty() {
+        mesclado.reasoning_efforts = anterior.reasoning_efforts.clone();
+    }
+    if anterior.supports_tools != Capability::Desconhecido {
+        mesclado.supports_tools = anterior.supports_tools;
+    }
+    if anterior.supports_reasoning != Capability::Desconhecido {
+        mesclado.supports_reasoning = anterior.supports_reasoning;
+    }
+    if anterior.supports_streaming != Capability::Desconhecido {
+        mesclado.supports_streaming = anterior.supports_streaming;
+    }
+    if anterior.supports_vision != Capability::Desconhecido {
+        mesclado.supports_vision = anterior.supports_vision;
+    }
+    mesclado.display_name = anterior.display_name.clone();
+    if anterior.notes.is_some() {
+        mesclado.notes = anterior.notes.clone();
+    }
+    if anterior.tokenizer.is_some() {
+        mesclado.tokenizer = anterior.tokenizer.clone();
+    }
+}
+
+/// Descobre modelos via API e mescla com o catálogo existente, preservando os
+/// ajustes feitos pelo usuário (manuais ou não — ver [`preservar_ajustes`]).
 pub fn merge_discovered(existente: &[ModelEntry], descobertos: Vec<ModelEntry>) -> Vec<ModelEntry> {
     let mut resultado: Vec<ModelEntry> = Vec::new();
     for mut encontrado in descobertos {
@@ -157,33 +194,7 @@ pub fn merge_discovered(existente: &[ModelEntry], descobertos: Vec<ModelEntry>) 
             let mut mesclado = encontrado.clone();
             mesclado.source = anterior.source;
             // Preserva capacidades que o usuário definiu manualmente.
-            if anterior.source == ModelSource::Manual {
-                if anterior.context_window.is_some() {
-                    mesclado.context_window = anterior.context_window;
-                }
-                if !anterior.reasoning_efforts.is_empty() {
-                    mesclado.reasoning_efforts = anterior.reasoning_efforts.clone();
-                }
-                if anterior.supports_tools != Capability::Desconhecido {
-                    mesclado.supports_tools = anterior.supports_tools;
-                }
-                if anterior.supports_reasoning != Capability::Desconhecido {
-                    mesclado.supports_reasoning = anterior.supports_reasoning;
-                }
-                // Streaming e visão também são escolhas manuais: sobrescrevê-las
-                // com o padrão da descoberta fazia a configuração do usuário
-                // desaparecer a cada atualização do catálogo.
-                if anterior.supports_streaming != Capability::Desconhecido {
-                    mesclado.supports_streaming = anterior.supports_streaming;
-                }
-                if anterior.supports_vision != Capability::Desconhecido {
-                    mesclado.supports_vision = anterior.supports_vision;
-                }
-                mesclado.display_name = anterior.display_name.clone();
-                if anterior.notes.is_some() {
-                    mesclado.notes = anterior.notes.clone();
-                }
-            }
+            preservar_ajustes(anterior, &mut mesclado);
             resultado.push(mesclado);
         } else {
             resultado.push(encontrado);
@@ -225,7 +236,11 @@ pub fn podar_e_atualizar_catalogo(entradas: &mut Vec<ModelEntry>) -> usize {
     let removidos = podar_catalogo(entradas);
     for entrada in entradas.iter_mut() {
         if entrada.source == ModelSource::Descoberto {
-            *entrada = enrich(entrada.clone());
+            let mut nova = enrich(entrada.clone());
+            // Ajustes explícitos do usuário sobrevivem ao re-enriquecimento
+            // (mesma regra da mesclagem com a descoberta).
+            preservar_ajustes(entrada, &mut nova);
+            *entrada = nova;
         }
     }
     removidos
@@ -243,10 +258,7 @@ pub async fn buscar_modelos(base_url: &str, api_key: &str) -> Result<Vec<ModelEn
     let cliente = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(20))
-        .user_agent(format!(
-            "Kestrel/{} (agente de codificação)",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(format!("Kestrel/{} (agente de codificação)", crate::VERSAO))
         .build()
         .map_err(|e| format!("cliente HTTP: {e}"))?;
     let resposta = cliente
@@ -483,6 +495,48 @@ mod tests {
         let alvo = mesclado.iter().find(|m| m.id == "x/y").unwrap();
         assert_eq!(alvo.supports_streaming, Capability::Nao);
         assert_eq!(alvo.supports_vision, Capability::Sim);
+    }
+
+    /// Entrada **descoberta** editada no `config.toml` não pode voltar ao
+    /// padrão do catálogo interno: `context_window`, `display_name` e `notes`
+    /// ajustados pelo usuário eram sobrescritos a cada atualização.
+    #[test]
+    fn mesclagem_preserva_ajustes_de_entrada_descoberta() {
+        let mut editada = ModelEntry::new("minimaxai/minimax-m3.1-flash");
+        editada.source = ModelSource::Descoberto;
+        editada.context_window = Some(200_000);
+        editada.display_name = Some("MiniMax (200k)".into());
+        editada.notes = Some("teste meu, não do catálogo".into());
+        editada.supports_reasoning = Capability::Nao;
+
+        let descoberto = vec![ModelEntry::new("minimaxai/minimax-m3.1-flash")];
+        let mesclado = merge_discovered(&[editada], descoberto);
+        let alvo = mesclado
+            .iter()
+            .find(|m| m.id == "minimaxai/minimax-m3.1-flash")
+            .unwrap();
+        assert_eq!(alvo.context_window, Some(200_000));
+        assert_eq!(alvo.display_name.as_deref(), Some("MiniMax (200k)"));
+        assert_eq!(alvo.notes.as_deref(), Some("teste meu, não do catálogo"));
+        assert_eq!(alvo.supports_reasoning, Capability::Nao);
+    }
+
+    /// O catálogo ainda atualiza o que o usuário **não** ajustou: uma entrada
+    /// descoberta antiga, gravada como `desconhecido`, ganha os esforços.
+    #[test]
+    fn mesclagem_atualiza_campos_nao_ajustados() {
+        let antiga = ModelEntry::new("minimaxai/minimax-m3.1-flash");
+        let mesclado = merge_discovered(
+            &[antiga],
+            vec![ModelEntry::new("minimaxai/minimax-m3.1-flash")],
+        );
+        let alvo = mesclado.first().unwrap();
+        assert_eq!(alvo.supports_reasoning, Capability::Sim);
+        assert_eq!(
+            alvo.reasoning_efforts,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(alvo.context_window, Some(128_000));
     }
 
     #[test]

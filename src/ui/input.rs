@@ -1,5 +1,11 @@
 //! Editor de entrada de linha de comando com histórico e cursor completo.
 
+/// Teto de caracteres do editor (e de uma única colagem). Escolhido para
+/// comportar com folga qualquer mensagem legítima sem deixar cada tecla
+/// lenta: acima disso o custo de `byte_pos` por movimento de cursor já se
+/// sente, e o que vem depois é lixo de paste acidental.
+pub const LIMITE_TEXTO: usize = 200_000;
+
 /// Editor de texto multilinha simples, com histórico de envios.
 pub struct Editor {
     texto: String,
@@ -92,13 +98,28 @@ impl Editor {
     /// A versão anterior chamava `inserir_char` por caractere: cada chamada
     /// varria o texto do início para achar o offset e realocava a String, o que
     /// é O(n²) — colar 100 mil caracteres travava a interface por ~10 s.
+    ///
+    /// A colagem também tem teto: sem limite, um bracketed paste de megabytes
+    /// entrava inteiro no editor, onde cada tecla seguinte é O(n) (o offset é
+    /// buscado do início do texto a cada movimento de cursor). O excedente é
+    /// descartado — perder o fim do paste é melhor que travar a interface.
     pub fn inserir_texto(&mut self, s: &str) {
         if s.is_empty() {
             return;
         }
+        let disponivel = LIMITE_TEXTO.saturating_sub(self.texto.chars().count());
+        if disponivel == 0 {
+            return;
+        }
+        let fim = s
+            .char_indices()
+            .nth(disponivel)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        let recorte = &s[..fim];
         let pos = self.byte_pos(self.cursor);
-        self.texto.insert_str(pos, s);
-        self.cursor += s.chars().count();
+        self.texto.insert_str(pos, recorte);
+        self.cursor += recorte.chars().count();
         self.indice_historico = None;
     }
 
@@ -128,7 +149,13 @@ impl Editor {
     }
 
     /// Posição do cursor como (linha, coluna), ambos com base zero.
+    ///
+    /// A coluna é em **células** de terminal, não em caracteres: o terminal
+    /// posiciona o cursor por célula, então um emoji ou um CJK (2 células)
+    /// deixava o cursor visual atrás do texto, e um combinante (0 células)
+    /// adiantava. Quem conta por caractere discorda do que se vê na tela.
     pub fn posicao_cursor(&self) -> (usize, usize) {
+        use unicode_width::UnicodeWidthChar;
         let mut linha = 0;
         let mut coluna = 0;
         for (i, c) in self.texto.chars().enumerate() {
@@ -139,10 +166,31 @@ impl Editor {
                 linha += 1;
                 coluna = 0;
             } else {
-                coluna += 1;
+                coluna += UnicodeWidthChar::width(c).unwrap_or(0);
             }
         }
         (linha, coluna)
+    }
+
+    /// Índice (em caracteres) em que a colona em células fecha dentro da
+    /// linha. Usado por `cima`/`baixo`, que navegam pela coluna visual.
+    fn indice_por_coluna(&self, linha: usize, coluna_celulas: usize) -> usize {
+        use unicode_width::UnicodeWidthChar;
+        let (inicio, fim) = self.limites_da_linha(linha);
+        let mut celulas = 0usize;
+        for (i, c) in self
+            .texto
+            .chars()
+            .enumerate()
+            .skip(inicio)
+            .take(fim.saturating_sub(inicio))
+        {
+            if celulas >= coluna_celulas {
+                return i;
+            }
+            celulas += UnicodeWidthChar::width(c).unwrap_or(0);
+        }
+        fim
     }
 
     pub fn total_linhas(&self) -> usize {
@@ -193,8 +241,7 @@ impl Editor {
         if linha == 0 {
             return false;
         }
-        let (inicio_anterior, fim_anterior) = self.limites_da_linha(linha - 1);
-        self.cursor = (inicio_anterior + coluna).min(fim_anterior);
+        self.cursor = self.indice_por_coluna(linha - 1, coluna);
         true
     }
 
@@ -204,8 +251,7 @@ impl Editor {
         if linha + 1 >= self.total_linhas() {
             return false;
         }
-        let (inicio_seguinte, fim_seguinte) = self.limites_da_linha(linha + 1);
-        self.cursor = (inicio_seguinte + coluna).min(fim_seguinte);
+        self.cursor = self.indice_por_coluna(linha + 1, coluna);
         true
     }
 
@@ -278,6 +324,21 @@ pub const COMANDOS_SLASH: &[ComandoSlash] = &[
         nome: "/help",
         argumentos: "",
         descricao: "mostra a ajuda completa com todos os comandos",
+    },
+    ComandoSlash {
+        nome: "/keys",
+        argumentos: "",
+        descricao: "mostra os atalhos atuais e como personalizá-los",
+    },
+    ComandoSlash {
+        nome: "/branch",
+        argumentos: "[nome]",
+        descricao: "cria um ramo/checkpoint da sessão atual com histórico e estado",
+    },
+    ComandoSlash {
+        nome: "/lang",
+        argumentos: "[pt|en]",
+        descricao: "troca o idioma da interface (pt-BR ou en-US)",
     },
     ComandoSlash {
         nome: "/model",
@@ -437,6 +498,49 @@ mod tests {
         e.inserir_texto("linha2");
         assert_eq!(e.texto(), "linha1\nlinha2");
         assert_eq!(e.total_linhas(), 2);
+    }
+
+    /// A coluna do cursor é em CÉLULAS de terminal, não em caracteres: o
+    /// terminal posiciona o cursor por célula, e um emoji/CJK (2 células)
+    /// deixava o cursor visual atrás do texto digitado.
+    #[test]
+    fn posicao_do_cursor_conta_celulas_nao_caracteres() {
+        let mut e = Editor::novo(50);
+        e.inserir_texto("Olá 🚀");
+        // 3 células de "Olá", 1 do espaço e 2 do emoji.
+        assert_eq!(e.posicao_cursor(), (0, 6));
+        let mut cjk = Editor::novo(50);
+        cjk.inserir_texto("日本");
+        assert_eq!(cjk.posicao_cursor(), (0, 4));
+    }
+
+    /// `cima`/`baixo` navegam pela coluna VISUAL: descer depois de um emoji
+    /// precisa parar na mesma coluna de células, não no mesmo índice de char.
+    #[test]
+    fn navegacao_vertical_usa_a_coluna_visual() {
+        let mut e = Editor::novo(50);
+        e.inserir_texto("🚀🚀");
+        e.nova_linha();
+        e.inserir_texto("abcdef");
+        // Cursor no fim da segunda linha: coluna 6 em células.
+        assert_eq!(e.posicao_cursor(), (1, 6));
+        assert!(e.cima());
+        // A primeira linha só tem 4 colunas de células: encosta no fim dela.
+        assert_eq!(e.posicao_cursor(), (0, 4));
+    }
+
+    /// Colar sem limite deixava o editor com megabytes de texto, onde cada
+    /// tecla seguinte é O(n): o excedente é descartado com o teto do editor.
+    #[test]
+    fn colagem_respeita_o_limite_do_editor() {
+        let mut e = Editor::novo(50);
+        e.inserir_texto("a");
+        let gigante = "b".repeat(LIMITE_TEXTO * 2);
+        e.inserir_texto(&gigante);
+        assert_eq!(e.texto().chars().count(), LIMITE_TEXTO);
+        // Com o editor cheio, nova colagem não entra.
+        e.inserir_texto("mais");
+        assert_eq!(e.texto().chars().count(), LIMITE_TEXTO);
     }
 
     #[test]

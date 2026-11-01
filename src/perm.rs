@@ -165,8 +165,25 @@ pub struct AnalysisContext {
 
 /// Diretórios de sistema cuja escrita é sempre bloqueada.
 const DIRETORIOS_SISTEMA: &[&str] = &[
-    "/etc", "/boot", "/sys", "/proc", "/dev", "/usr/bin", "/usr/lib", "/var/lib", "/bin", "/sbin",
+    "/etc", "/boot", "/sys", "/proc", "/dev", "/usr", "/lib", "/lib64", "/var/lib", "/bin", "/sbin",
 ];
+
+/// True quando o caminho (após normalização) aponta para diretório de sistema
+/// cuja escrita é sempre bloqueada.
+///
+/// A comparação é por componente de caminho (`Path::starts_with` depois de
+/// `normalize_path`), nunca por prefixo de texto: `/home/user/projeto2` não
+/// casa com `/home/user/projeto`, mas `/usr/local/bin` casa com `/usr` e
+/// `$HOME/../../etc/crontab` casa com `/etc` depois de normalizado.
+pub fn eh_caminho_de_sistema(caminho: &std::path::Path) -> bool {
+    let norm = normalize_path(caminho);
+    if norm.as_os_str().is_empty() {
+        return false;
+    }
+    DIRETORIOS_SISTEMA
+        .iter()
+        .any(|dir| norm.starts_with(std::path::Path::new(dir)))
+}
 
 /// Diretórios cuja remoção nunca é rotina. A checagem vale para o próprio
 /// diretório e para qualquer caminho dentro dele: `rm -rf /var` e
@@ -189,6 +206,30 @@ const DISPOSITIVOS_SEGUROS: &[&str] = &[
     "/dev/urandom",
 ];
 
+/// Operandos na forma `chave=valor` que realmente recebem um caminho.
+///
+/// Allowlist fechada de propósito. Aceitar qualquer chave com `-` fazia de
+/// `./configure --prefix=/usr/local`, `cmake -DCMAKE_INSTALL_PREFIX=/usr ..`,
+/// `pip install --prefix=/usr .` e `cargo build --target-dir=/usr/tmp/x` uma
+/// escrita em diretório de sistema — proibida em todos os níveis. O objetivo
+/// é barrar `dd of=/etc/passwd` e `cp --target-directory=/etc`, não travar as
+/// ferramentas de build.
+const OPERANDOS_COM_CAMINHO: &[&str] = &[
+    // `dd`: origem e destino são operandos nus.
+    "of",
+    "if",
+    // Cópia/instalação direcionada a um diretório.
+    "--target-directory",
+    "--directory",
+    "--install-dir",
+    "--destdir",
+];
+
+/// Profundidade máxima da análise recursiva (substituições `$(…)`, código
+/// inline e embrulhos). Quando ela se esgota, a classificação é restritiva:
+/// perder o conteúdo interno de vista não pode significar "permitido".
+const PROFUNDIDADE_MAXIMA: usize = 4;
+
 fn primeira_palavra(cmd: &str) -> String {
     cmd.split_whitespace()
         .next()
@@ -207,33 +248,116 @@ fn contem_algum(haystack: &str, needles: &[&str]) -> Option<String> {
         .map(|n| n.to_string())
 }
 
+/// Expande as variáveis de caminho que a análise sabe resolver: `$HOME`,
+/// `${HOME}` e `~usuario`.
+///
+/// `~` e `~/` já passavam por `util::expand_tilde`, mas `$HOME` nunca era
+/// expandido: um token como `$HOME/../../etc/passwd` não começa com `/`, `./`
+/// ou `~/` e portanto não era caminho nenhum — nem de sistema, nem fora do
+/// projeto. Copiar/redirecionar para lá passava como escrita qualquer em
+/// nível autônomo. `alvos_vitais_de_rm` já trata `$HOME` explicitamente, o que
+/// mostra a intenção de protegê-lo.
+///
+/// Só as variáveis de diretório são resolvidas: `$OUTRA` genérica continua
+/// sendo apenas uma variável, para não transformar qualquer expansão em alvo
+/// de escrita.
+fn expandir_variaveis(token: &str) -> String {
+    let home = dirs::home_dir();
+    let mut saida = token.to_string();
+    // Sem home conhecido, `/home` mantém o caminho absoluto — e os `..`
+    // continuam sendo normalizados até o destino real.
+    let base = home
+        .as_ref()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|| "/home".to_string());
+    saida = saida.replace("${HOME}", &base).replace("$HOME", &base);
+    // `~usuario`: o home de outro usuário. O próprio usuário usa o home real;
+    // os demais seguem o layout padrão do sistema.
+    if let Some(resto) = saida.strip_prefix('~')
+        && !resto.is_empty()
+        && !resto.starts_with('/')
+        && resto
+            .chars()
+            .take_while(|c| *c != '/')
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        let (usuario, caminho) = match resto.split_once('/') {
+            Some((u, c)) => (u, format!("/{c}")),
+            None => (resto, String::new()),
+        };
+        let raiz = home
+            .as_ref()
+            .filter(|h| h.file_name().and_then(|n| n.to_str()) == Some(usuario))
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(format!("/home/{usuario}")));
+        saida = raiz
+            .join(caminho.trim_start_matches('/'))
+            .to_string_lossy()
+            .to_string();
+    }
+    saida
+}
+
 /// Extrai tokens que parecem caminhos de um comando.
 ///
 /// Caminhos relativos são ancorados na primeira raiz conhecida: sem isso
 /// `cp a.txt ./b.txt` pareceria "fora do projeto" só porque `./b.txt` não
 /// começa com `/`.
 fn caminhos_no_comando(cmd: &str, raiz: Option<&PathBuf>) -> Vec<PathBuf> {
-    cmd.split_whitespace()
-        .map(|tok| {
-            tok.trim_matches(|c| {
-                c == '"' || c == '\'' || c == ';' || c == '|' || c == '(' || c == ')'
-            })
-        })
-        .filter(|tok| {
-            tok.starts_with('/')
-                || tok.starts_with("./")
-                || tok.starts_with("../")
-                || tok.starts_with("~/")
-        })
-        .map(|tok| {
+    let mut caminhos = Vec::new();
+    for bruto in cmd.split_whitespace() {
+        let token = bruto.trim_matches(|c| {
+            c == '"' || c == '\'' || c == ';' || c == '|' || c == '(' || c == ')'
+        });
+        let mut candidatos = vec![token];
+        // Operandos na forma `chave=valor` (`dd of=/etc/passwd`,
+        // `cp --target-directory=/etc`) escondiam o caminho atrás do sinal de
+        // igual. Só o valor que realmente parece caminho é considerado: um
+        // `FOO=bar` comum não vira alvo de análise.
+        if let Some((chave, valor)) = token.split_once('=') {
+            let valor = valor.trim_matches(|c| c == '"' || c == '\'');
+            // Só operandos que recebem caminho de verdade (`dd of=/etc/passwd`,
+            // `cp --target-directory=/etc`). Atribuições de ambiente como
+            // `PATH=/usr/bin` e opções de build como `--prefix=/usr/local`
+            // não são alvos de escrita: tratá-las como caminho bloquearia
+            // comandos legítimos em todos os níveis.
+            if OPERANDOS_COM_CAMINHO.contains(&chave) && parece_caminho(valor) {
+                candidatos.push(valor);
+            }
+        }
+        for tok in candidatos {
+            if !parece_caminho(tok) {
+                continue;
+            }
+            let tok = expandir_variaveis(tok);
             if (tok.starts_with("./") || tok.starts_with("../"))
                 && let Some(raiz) = raiz
             {
-                return raiz.join(tok.trim_start_matches("./"));
+                caminhos.push(raiz.join(tok.trim_start_matches("./")));
+                continue;
             }
-            crate::util::expand_tilde(tok)
-        })
-        .collect()
+            caminhos.push(crate::util::expand_tilde(&tok));
+        }
+    }
+    caminhos
+}
+
+fn parece_caminho(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+        // `$HOME`, `${HOME}` e `~usuario` viram caminho depois de expandidos.
+        // `$OUTRA` genérica continua sendo só uma variável.
+        || token == "$HOME"
+        || token == "${HOME}"
+        || token.starts_with("$HOME/")
+        || token.starts_with("${HOME}/")
+        || (token.starts_with('~')
+            && token[1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// Divide o comando em subcomandos, respeitando aspas.
@@ -329,7 +453,7 @@ fn fundir(atual: Option<Analysis>, outra: Analysis) -> Option<Analysis> {
 /// flags (`rm -rf /`, `rm -r -f /`, `rm --recursive --force /`, `rm -fr /*`).
 fn remove_raiz_do_sistema(cmd: &str) -> bool {
     for parte in subcomandos(&sem_aspas(cmd)) {
-        let (efetivo, _) = comando_efetivo(&parte);
+        let (efetivo, _, _) = comando_efetivo(&parte);
         let alvo = if efetivo.is_empty() {
             parte.as_str()
         } else {
@@ -370,10 +494,151 @@ fn find_destrutivo(cmd: &str) -> bool {
     })
 }
 
-/// Versão do comando sem aspas, para as checagens literais: `mk''fs` e
-/// `sh'''utdown` driblavam a busca por substring colocando aspas no meio.
+/// Versão do comando sem aspas e contra-barras de escape, para as checagens
+/// literais: `mk''fs` e `sh'''utdown` driblavam a busca por substring
+/// colocando aspas no meio; `r\m` e `s\hutdown` usam contra-barra de escape,
+/// que o shell resolve para `rm`/`shutdown`. Remover contra-barras só pode
+/// tornar a análise mais conservadora (nunca menos bloqueio), então é seguro
+/// aplicar em todas as barreiras.
 fn sem_aspas(cmd: &str) -> String {
-    cmd.replace(['"', '\''], "")
+    cmd.replace(['"', '\'', '\\'], "")
+}
+
+/// Remove os delimitadores de substituição/agrupamento para que as barreiras
+/// absolutas possam olhar o conteúdo de um `$(…)` aninhado como comando.
+fn sem_delimitadores(cmd: &str) -> String {
+    cmd.replace(['(', ')', '`'], " ")
+}
+
+/// Chamadas que removem arquivo ou diretório em linguagens de alto nível.
+/// `shutil.rmtree('/etc/x')` é uma remoção destrutiva, não uma função
+/// qualquer.
+const CHAMADAS_DESTRUTIVAS: &[&str] = &[
+    "rm",
+    "rmtree",
+    "rmdir",
+    "removedirs",
+    "unlink",
+    "remove",
+    "shred",
+];
+
+/// Nome final de uma chamada (`shutil.rmtree` → `rmtree`, `Path.unlink` →
+/// `unlink`).
+fn nome_da_chamada(token: &str) -> &str {
+    token
+        .rsplit(['.', '/'])
+        .next()
+        .unwrap_or(token)
+        .trim_matches(|c| c == '"' || c == '\'')
+}
+
+/// O token é um caminho absoluto (`/etc/x`, `~outro/x`, `$HOME/x`)?
+fn alvo_absoluto(token: &str) -> bool {
+    let t = token.trim_matches(|c| c == '"' || c == '\'');
+    t.starts_with('/') || t.starts_with('~') || t.starts_with("$HOME")
+}
+
+/// Remoção destrutiva escondida em código de alto nível: `python3 -c
+/// "import os; os.system('rm -rf /')"`. O código não é um comando de shell —
+/// as barreiras absolutas olham a posição de comando e nunca viam o `rm`
+/// depois de `os.system(`.
+///
+/// A verificação é por token tolerante a espaços e a separadores de código,
+/// no mesmo espírito da checagem de `:(){`. `find … -exec rm -f {} +` não
+/// casa: o operando do `rm` é `{}`, não um caminho absoluto.
+fn remocao_destrutiva_em_codigo(codigo: &str) -> Option<Analysis> {
+    let normalizado: String = sem_aspas(codigo)
+        .chars()
+        .map(|c| {
+            if matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '`' | '\n'
+            ) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let tokens: Vec<&str> = normalizado.split_whitespace().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        let nome = nome_da_chamada(token);
+        if !CHAMADAS_DESTRUTIVAS.contains(&nome) {
+            continue;
+        }
+        let mut recursivo = false;
+        let mut forcado = false;
+        let mut alvo = false;
+        for t in &tokens[i + 1..] {
+            if t.starts_with("--") {
+                if t.contains("recursive") {
+                    recursivo = true;
+                }
+                if t.contains("force") {
+                    forcado = true;
+                }
+                continue;
+            }
+            if t.len() > 1 && t.starts_with('-') && t[1..].chars().all(|c| c.is_ascii_alphabetic())
+            {
+                if t.contains('r') || t.contains('R') {
+                    recursivo = true;
+                }
+                if t.contains('f') {
+                    forcado = true;
+                }
+                continue;
+            }
+            // O primeiro operando é o alvo: só ele decide.
+            if alvo_absoluto(t) {
+                alvo = true;
+            }
+            break;
+        }
+        // `Path('/etc/x').unlink()`: o caminho vem antes da chamada.
+        let vizinho_absoluto = i
+            .checked_sub(1)
+            .and_then(|anterior| tokens.get(anterior))
+            .is_some_and(|anterior| alvo_absoluto(anterior));
+        let destrutivo = (recursivo || forcado) || nome != "rm";
+        if destrutivo && (alvo || vizinho_absoluto) {
+            return Some(Analysis::new(
+                Decision::Bloquear,
+                CommandCategory::Proibida,
+                "remoção destrutiva dentro de código inline",
+            ));
+        }
+    }
+    None
+}
+
+/// Diretório alvo de um `cd` isolado.
+///
+/// `cd` apenas navega: o argumento não é alvo de escrita (por isso
+/// `cd /usr/src/zlib-1.3 && ./configure && make` era proibido em todos os
+/// níveis), mas o diretório passa a valer para os subcomandos seguintes do
+/// mesmo comando composto — `cd /etc && tee passwd` grava em `/etc/passwd` e,
+/// sem caminho absoluto, nada mais denunciaria a escrita.
+fn alvo_de_cd(parte: &str, cwd_atual: Option<&std::path::Path>) -> Option<PathBuf> {
+    let (efetivo, _, _) = comando_efetivo(parte);
+    let alvo = if efetivo.is_empty() {
+        parte
+    } else {
+        efetivo.as_str()
+    };
+    let mut tokens = alvo.split_whitespace();
+    if tokens.next()? != "cd" {
+        return None;
+    }
+    // `cd` sem argumento vai para o home.
+    let argumento = tokens.find(|t| !t.starts_with('-'))?;
+    let destino = crate::util::expand_tilde(&expandir_variaveis(argumento));
+    let resolvido = match cwd_atual {
+        Some(base) if destino.is_relative() => base.join(&destino),
+        _ => destino,
+    };
+    Some(normalize_path(&resolvido))
 }
 
 /// Prefixos que apenas embrulham outro comando (`sudo`, `env`, `timeout`,
@@ -383,13 +648,18 @@ fn sem_aspas(cmd: &str) -> String {
 /// Devolve o comando interno e a lista de embrulhos encontrados, para que a
 /// elevação de privilégios continue exigindo confirmação mesmo quando o
 /// comando interno é inofensivo.
-fn comando_efetivo(cmd: &str) -> (String, Vec<String>) {
+fn comando_efetivo(cmd: &str) -> (String, Vec<String>, Vec<PathBuf>) {
     let tokens: Vec<String> = sem_aspas(cmd)
         .split_whitespace()
         .map(|t| t.trim_start_matches(['(', '{', '!']).to_string())
         .filter(|t| !t.is_empty())
         .collect();
     let mut wrappers = Vec::new();
+    // Diretórios de trabalho impostos por embrulhos (`env -C /etc`,
+    // `sudo --chdir=/etc`). Eles mudam o significado de caminhos relativos do
+    // comando interno: sem guardá-los, `env -C /etc tee passwd` parecia
+    // escrever em `./passwd` dentro do projeto.
+    let mut cwds: Vec<PathBuf> = Vec::new();
     let mut inicio = 0;
     while let Some(token) = tokens.get(inicio) {
         let nome = token.rsplit('/').next().unwrap_or(token).to_string();
@@ -406,7 +676,15 @@ fn comando_efetivo(cmd: &str) -> (String, Vec<String>) {
                     if !t.starts_with('-') {
                         break;
                     }
-                    j += if matches!(
+                    // Forma `--chdir=/etc`.
+                    if let Some(valor) = t
+                        .strip_prefix("--chdir=")
+                        .or_else(|| t.strip_prefix("--chroot="))
+                        && !valor.is_empty()
+                    {
+                        cwds.push(crate::util::expand_tilde(valor));
+                    }
+                    let consome_valor = matches!(
                         t.as_str(),
                         "-u" | "-g"
                             | "-p"
@@ -415,18 +693,32 @@ fn comando_efetivo(cmd: &str) -> (String, Vec<String>) {
                             | "-h"
                             | "-r"
                             | "-t"
+                            | "-D"
+                            | "-R"
+                            | "-T"
                             | "--user"
                             | "--group"
                             | "--prompt"
-                            | "--chdir"
+                            | "--other-user"
+                            | "--close-from"
                             | "--host"
                             | "--role"
                             | "--type"
-                    ) {
-                        2
+                            | "--chdir"
+                            | "--chroot"
+                            | "--command-timeout"
+                    );
+                    if consome_valor {
+                        if matches!(t.as_str(), "-D" | "-R" | "--chdir" | "--chroot")
+                            && let Some(valor) = tokens.get(j + 1)
+                            && !valor.starts_with('-')
+                        {
+                            cwds.push(crate::util::expand_tilde(valor));
+                        }
+                        j += 2;
                     } else {
-                        1
-                    };
+                        j += 1;
+                    }
                 }
                 inicio = j;
             }
@@ -468,11 +760,26 @@ fn comando_efetivo(cmd: &str) -> (String, Vec<String>) {
                         break;
                     }
                     if t.starts_with('-') {
-                        j += if matches!(t.as_str(), "-u" | "-C" | "--unset" | "--chdir") {
-                            2
+                        // Forma `--chdir=/etc` e `-C/etc`.
+                        if let Some(valor) = t.strip_prefix("--chdir=")
+                            && !valor.is_empty()
+                        {
+                            cwds.push(crate::util::expand_tilde(valor));
+                        } else if let Some(valor) = t.strip_prefix("-C")
+                            && !valor.is_empty()
+                        {
+                            cwds.push(crate::util::expand_tilde(valor));
+                        }
+                        if matches!(t.as_str(), "-u" | "-C" | "--unset" | "--chdir") {
+                            if matches!(t.as_str(), "-C" | "--chdir")
+                                && let Some(valor) = tokens.get(j + 1)
+                            {
+                                cwds.push(crate::util::expand_tilde(valor));
+                            }
+                            j += 2;
                         } else {
-                            1
-                        };
+                            j += 1;
+                        }
                     } else if t.contains('=') {
                         j += 1;
                     } else {
@@ -586,7 +893,7 @@ fn comando_efetivo(cmd: &str) -> (String, Vec<String>) {
         .get(inicio..)
         .map(|resto| resto.join(" "))
         .unwrap_or_default();
-    (efetivo, wrappers)
+    (efetivo, wrappers, cwds)
 }
 
 /// Conteúdo de substituições de comando (`$(…)`, `` `…` `` e `<(…)`), que
@@ -664,7 +971,7 @@ fn substituicoes(cmd: &str) -> Vec<String> {
 /// é desligamento. Embrulhos (`sudo`, `env`, `timeout`…) são atravessados.
 fn comando_catastrofico(cmd: &str) -> Option<(&'static str, &'static str)> {
     for parte in subcomandos(&sem_aspas(cmd)) {
-        let (efetivo, _) = comando_efetivo(&parte);
+        let (efetivo, _, _) = comando_efetivo(&parte);
         let alvo = if efetivo.is_empty() {
             parte.as_str()
         } else {
@@ -706,10 +1013,13 @@ fn comando_catastrofico(cmd: &str) -> Option<(&'static str, &'static str)> {
     None
 }
 
-/// `chmod` permissivo na raiz do sistema (`chmod -R 777 /`).
+/// Alteração de permissões/propriedade na raiz do sistema.
+///
+/// Não importa o modo: `chmod -R 000 /` derruba o sistema tanto quanto
+/// `chmod -R 777 /`. Qualquer chmod/chown/chgrp apontando para `/` é barreira.
 fn permissao_na_raiz(cmd: &str) -> bool {
     for parte in subcomandos(&sem_aspas(cmd)) {
-        let (efetivo, _) = comando_efetivo(&parte);
+        let (efetivo, _, _) = comando_efetivo(&parte);
         let alvo = if efetivo.is_empty() {
             parte.as_str()
         } else {
@@ -718,15 +1028,10 @@ fn permissao_na_raiz(cmd: &str) -> bool {
         let mut palavras = alvo.split_whitespace();
         let programa = palavras.next().unwrap_or("");
         let programa = programa.rsplit('/').next().unwrap_or(programa);
-        if programa != "chmod" {
+        if !matches!(programa, "chmod" | "chown" | "chgrp") {
             continue;
         }
-        let argumentos: Vec<&str> = palavras.collect();
-        let raiz = argumentos.iter().any(|a| matches!(*a, "/" | "/*" | "//"));
-        let permissivo = argumentos
-            .iter()
-            .any(|a| matches!(*a, "777" | "a+rwx" | "ugo+rwx" | "o+w" | "a+w"));
-        if raiz && permissivo {
+        if palavras.any(|a| matches!(a, "/" | "/*" | "//")) {
             return true;
         }
     }
@@ -753,7 +1058,7 @@ fn redireciona_para_dispositivo(cmd: &str) -> bool {
 /// `of=/dev/sda`, não `/dev/sda`, e escapava do filtro de caminhos.
 fn escrita_em_dispositivo(cmd: &str) -> bool {
     for parte in subcomandos(&sem_aspas(cmd)) {
-        let (efetivo, _) = comando_efetivo(&parte);
+        let (efetivo, _, _) = comando_efetivo(&parte);
         let alvo = if efetivo.is_empty() {
             parte.as_str()
         } else {
@@ -831,25 +1136,72 @@ fn codigo_inline_interno(cmd: &str) -> Option<String> {
     let programa = tokens.next()?;
     let nome = programa.rsplit('/').next().unwrap_or(programa);
     let restantes: Vec<&str> = tokens.collect();
-    let pos = if matches!(nome, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish") {
-        restantes.iter().position(|t| *t == "-c")?
-    } else if matches!(
-        nome,
-        "python" | "python3" | "node" | "nodejs" | "ruby" | "perl" | "php" | "lua" | "deno"
-    ) {
-        restantes
-            .iter()
-            .position(|t| matches!(*t, "-c" | "-e" | "-p" | "--eval") || t.starts_with("--eval="))?
-    } else {
-        return None;
-    };
 
-    let mut codigo = String::new();
-    if let Some(valor) = restantes[pos].strip_prefix("--eval=") {
-        codigo.push_str(valor);
-        codigo.push(' ');
+    // `eval '…'` é o próprio interpretador do shell: todo o restante é código.
+    if nome == "eval" {
+        return codigo_dos_argumentos(&restantes, 0, &[]);
     }
-    codigo.push_str(&restantes[pos + 1..].join(" "));
+
+    // `anexaveis`: flags que aceitam o código colado (`python -c'…'`). Nos
+    // shells, `-lc`/`-ec` são flags agrupadas — só `-c` pode vir colado.
+    let (pos, anexaveis): (usize, &[&str]) =
+        if matches!(nome, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish") {
+            // Flags curtas podem vir agrupadas (`bash -lc '…'`, `sh -ec '…'`).
+            // Procurar apenas o token `-c` deixava todo o código escapar da
+            // análise e o classificava como build por ser um shell.
+            let pos = restantes.iter().position(|t| {
+                *t == "-c" || (!t.starts_with("--") && t.starts_with('-') && t[1..].contains('c'))
+            })?;
+            (pos, &["-c"])
+        } else if nome == "php" {
+            // `php -r '…'` executa código sem arquivo, como `-c` nos demais.
+            let pos = restantes
+                .iter()
+                .position(|t| *t == "-r" || (t.starts_with("-r") && t.len() > 2))?;
+            (pos, &["-r"])
+        } else if nome == "deno" {
+            // `deno eval '…'` usa subcomando em vez de flag.
+            let pos = restantes.iter().position(|t| {
+                matches!(*t, "eval" | "-e" | "--eval")
+                    || t.starts_with("-e")
+                    || t.starts_with("--eval=")
+            })?;
+            (pos, &["-e"])
+        } else if matches!(
+            nome,
+            "python" | "python3" | "node" | "nodejs" | "ruby" | "perl" | "lua"
+        ) {
+            let pos = restantes.iter().position(|t| {
+                matches!(*t, "-c" | "-e" | "-p" | "--eval")
+                    || t.starts_with("-c")
+                    || t.starts_with("-e")
+                    || t.starts_with("-p")
+                    || t.starts_with("--eval=")
+            })?;
+            (pos, &["-c", "-e", "-p"])
+        } else {
+            return None;
+        };
+
+    codigo_dos_argumentos(&restantes, pos, anexaveis)
+}
+
+/// Junta o código que vem depois da flag/posição `pos`, incluindo a forma
+/// `--eval=código` e o código colado a uma das flags `anexaveis`.
+fn codigo_dos_argumentos(restantes: &[&str], pos: usize, anexaveis: &[&str]) -> Option<String> {
+    let mut codigo = String::new();
+    if let Some(token) = restantes.get(pos) {
+        let anexado = token
+            .strip_prefix("--eval=")
+            .or_else(|| anexaveis.iter().find_map(|f| token.strip_prefix(f)));
+        if let Some(valor) = anexado.filter(|v| !v.is_empty()) {
+            codigo.push_str(valor);
+            codigo.push(' ');
+        }
+    }
+    if let Some(resto) = restantes.get(pos + 1..) {
+        codigo.push_str(&resto.join(" "));
+    }
     let codigo = codigo
         .trim()
         .trim_matches(|c| c == '"' || c == '\'')
@@ -866,7 +1218,7 @@ fn dispositivo_seguro(path: &std::path::Path) -> bool {
         || path.starts_with("/dev/fd")
 }
 
-/// Alvos de redirecionamento de saída (`> f`, `2>> f`).
+/// Alvos de redirecionamento de saída (`> f`, `2>> f`, `>&f`, `>|f`).
 fn redirecionamentos(cmd: &str) -> Vec<PathBuf> {
     let chars: Vec<char> = cmd.chars().collect();
     let mut alvos = Vec::new();
@@ -874,7 +1226,16 @@ fn redirecionamentos(cmd: &str) -> Vec<PathBuf> {
     while i < chars.len() {
         if chars[i] == '>' {
             let mut j = i + 1;
-            if j < chars.len() && chars[j] == '>' {
+            if j < chars.len() && matches!(chars[j], '>' | '|') {
+                j += 1;
+            }
+            // `2>&1` duplica descritor, não abre arquivo. `>&arquivo` (sem
+            // dígito) é redirecionamento de stdout+stderr para arquivo.
+            if j < chars.len() && chars[j] == '&' {
+                if chars.get(j + 1).is_some_and(|c| c.is_ascii_digit()) {
+                    i = j + 1;
+                    continue;
+                }
                 j += 1;
             }
             while j < chars.len() && chars[j].is_whitespace() {
@@ -890,7 +1251,9 @@ fn redirecionamentos(cmd: &str) -> Vec<PathBuf> {
             if inicio < j {
                 let token: String = chars[inicio..j].iter().collect();
                 let token = token.trim_matches(|c| c == '"' || c == '\'');
-                alvos.push(crate::util::expand_tilde(token));
+                // `> $HOME/../../etc/x` precisa ser expandido como o resto:
+                // sem isso o alvo não parecia caminho e escapava da checagem.
+                alvos.push(crate::util::expand_tilde(&expandir_variaveis(token)));
             }
             i = j;
         } else {
@@ -936,6 +1299,75 @@ fn env_sem_comando(cmd: &str) -> bool {
     let mut tokens = cmd.split_whitespace();
     tokens.next();
     tokens.all(|t| t.is_empty() || t.contains('='))
+}
+
+/// `git` que descarta alterações ou reescreve histórico.
+///
+/// A detecção é estrutural (subcomando + flags), não por substring: a lista
+/// anterior deixava passar `git clean -f`, `git checkout -f`, `git restore -- .`
+/// e `git restore -W .`, que no nível Semi eram executadas sem confirmação.
+fn git_destrutivo(cmd: &str) -> bool {
+    for parte in subcomandos(&sem_aspas(cmd)) {
+        let palavras: Vec<&str> = parte.split_whitespace().collect();
+        let Some(pos) = palavras.iter().position(|p| {
+            let nome = p.rsplit('/').next().unwrap_or(p);
+            nome == "git"
+        }) else {
+            continue;
+        };
+        let args = &palavras[pos + 1..];
+        let Some(subcomando) = args.first().copied() else {
+            continue;
+        };
+        let flags: Vec<&str> = args
+            .iter()
+            .copied()
+            .filter(|a| a.starts_with('-'))
+            .collect();
+        let tem_curta = |c: char| {
+            flags
+                .iter()
+                .any(|f| !f.starts_with("--") && f.len() > 1 && f[1..].contains(c))
+        };
+        let tem_longa = |longa: &str| {
+            flags
+                .iter()
+                .any(|f| *f == longa || f.starts_with(&format!("{longa}=")))
+        };
+        match subcomando {
+            "clean" if tem_curta('f') || tem_longa("--force") => return true,
+            "checkout"
+                if tem_curta('f')
+                    || tem_longa("--force")
+                    // `git checkout .` / `git checkout -- .` descarta o
+                    // trabalho local do diretório/índice inteiro.
+                    || args.iter().any(|a| *a == "." || *a == ":/" || a.starts_with(":/")) =>
+            {
+                return true;
+            }
+            "restore" => {
+                let staged = flags.iter().any(|f| *f == "--staged" || *f == "-S");
+                let worktree = flags.iter().any(|f| *f == "--worktree" || *f == "-W");
+                let source = flags
+                    .iter()
+                    .any(|f| *f == "--source" || f.starts_with("--source="));
+                // Sem `--staged` (ou mexendo na árvore de trabalho/fonte), o
+                // comando descarta alterações locais do arquivo/intervalo.
+                if !staged || worktree || source {
+                    return true;
+                }
+            }
+            "reset" if tem_longa("--hard") => return true,
+            "stash" if matches!(args.get(1), Some(&"drop") | Some(&"clear")) => return true,
+            "push" if flags.iter().any(|f| *f == "-f" || f.starts_with("--force")) => {
+                return true;
+            }
+            "branch" if flags.contains(&"-D") => return true,
+            "filter-branch" => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Comandos de leitura reconhecidos (o mesmo conjunto do passo de leitura).
@@ -1009,9 +1441,13 @@ const LEITURA: &[&str] = &[
 ];
 
 fn combina_leitura(cmd: &str) -> bool {
-    LEITURA
-        .iter()
-        .any(|p| cmd == *p || cmd.starts_with(&format!("{p} ")))
+    LEITURA.iter().any(|p| {
+        // Alguns prefixos já terminam em espaço (`test `, `[ `); concatenar
+        // outro espaço criava `test  ` e o comando nunca era reconhecido
+        // como leitura.
+        let p = p.trim_end();
+        cmd == p || cmd.starts_with(&format!("{p} "))
+    })
 }
 
 /// Alvos de `rm` que apontam para lugares que nunca devem ser removidos:
@@ -1117,7 +1553,7 @@ fn barreiras_absolutas(cmd: &str) -> Option<Analysis> {
         return Some(Analysis::new(
             Decision::Bloquear,
             CommandCategory::Proibida,
-            "liberação de permissões na raiz do sistema",
+            "alteração de permissões/propriedade na raiz do sistema",
         ));
     }
     None
@@ -1158,26 +1594,78 @@ fn classificar_comandos(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -
     // trabalho manual que ele deveria fazer. Full permite; Semi e Write
     // confirmam; Read bloqueia — a semântica própria de "sensível".
     if pipe_para_interpretador(cmd) {
-        return Analysis::new(
+        // O pipe é sensível em si, mas o interpretador pode receber código
+        // catastrófico em linha (`… | sh -c 'rm -rf /'`). Analisa a parte do
+        // interpretador antes de devolver: a barreira absoluta vence o aviso.
+        let mut analise = Analysis::new(
             Decision::Confirmar,
             CommandCategory::Sensivel,
             "execução direta de conteúdo baixado da rede (pipe para interpretador)",
         );
+        for parte in subcomandos(cmd) {
+            let programa = primeira_palavra(&parte);
+            let programa = programa.rsplit('/').next().unwrap_or(&programa);
+            if eh_interpretador(programa) {
+                let interna = classificar_parte(&parte, ctx, profundidade, None);
+                analise = fundir(Some(analise), interna).unwrap_or_else(|| {
+                    Analysis::new(
+                        Decision::Confirmar,
+                        CommandCategory::Sensivel,
+                        "execução direta de conteúdo baixado da rede (pipe para interpretador)",
+                    )
+                });
+                break;
+            }
+        }
+        return analise;
     }
 
     // Substituições de comando executam antes do comando externo: analisá-las
     // é obrigatório para que `echo $(rm -rf ~)` não seja liberado como leitura.
     let mut resultado: Option<Analysis> = None;
-    if profundidade < 4 {
-        for interno in substituicoes(cmd) {
-            let analise = classificar_comandos(&interno, ctx, profundidade + 1);
-            resultado = fundir(resultado, analise);
+    let internos = substituicoes(cmd);
+    if !internos.is_empty() {
+        if profundidade < PROFUNDIDADE_MAXIMA {
+            for interno in internos {
+                let analise = classificar_comandos(&interno, ctx, profundidade + 1);
+                resultado = fundir(resultado, analise);
+            }
+        } else {
+            // A profundidade se esgotou: ignorar o interno deixava
+            // `echo $(echo $(… $(rm -rf /)))` classificado como leitura e
+            // liberado em todos os níveis. As barreiras absolutas ainda olham
+            // cada interno extraído, e a classificação deixa de ser permissiva.
+            for interno in &internos {
+                if let Some(proibida) = barreiras_absolutas(&sem_delimitadores(interno)) {
+                    return proibida;
+                }
+            }
+            return Analysis::new(
+                Decision::Confirmar,
+                CommandCategory::Destrutiva,
+                "aninhamento de substituições de comando além da profundidade de análise",
+            );
         }
     }
 
     // Cada subcomando é classificado sozinho; a análise mais severa vence.
+    let mut cwd: Option<PathBuf> = None;
     for parte in subcomandos(cmd) {
-        let analise = classificar_parte(&parte, ctx, profundidade);
+        // `cd` só navega: o argumento não é alvo de escrita, mas o diretório
+        // passa a valer para o que vem depois.
+        if let Some(dir) = alvo_de_cd(&parte, cwd.as_deref()) {
+            cwd = Some(dir);
+            resultado = fundir(
+                resultado,
+                Analysis::new(
+                    Decision::Permitir,
+                    CommandCategory::Leitura,
+                    "navegação de diretório",
+                ),
+            );
+            continue;
+        }
+        let analise = classificar_parte(&parte, ctx, profundidade, cwd.as_deref());
         resultado = fundir(resultado, analise);
     }
     resultado.unwrap_or_else(|| {
@@ -1190,7 +1678,15 @@ fn classificar_comandos(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -
 }
 
 /// Classifica um subcomando já isolado (sem `;`, `&&`, `||`, `|`).
-fn classificar_parte(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -> Analysis {
+///
+/// `cwd` é o diretório de trabalho imposto por um `cd` anterior no mesmo
+/// comando composto, quando houver.
+fn classificar_parte(
+    cmd: &str,
+    ctx: &AnalysisContext,
+    profundidade: usize,
+    cwd: Option<&std::path::Path>,
+) -> Analysis {
     let cmd = cmd.trim();
     if cmd.is_empty() {
         return Analysis::new(
@@ -1204,11 +1700,35 @@ fn classificar_parte(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -> A
     // `env rm -rf ~` era classificado pela palavra `env`. A análise passa a
     // enxergar o comando interno; a elevação de privilégios, quando existe,
     // continua exigindo confirmação.
-    let (efetivo, wrappers) = comando_efetivo(cmd);
+    let (efetivo, wrappers, cwds) = comando_efetivo(cmd);
+
+    // 1a. Diretório de trabalho imposto por embrulho: `env -C /etc tee passwd`
+    // grava em `/etc/passwd`. Caminhos relativos do comando efetivo resolvem
+    // contra esse diretório, então uma operação que não é de leitura nunca
+    // pode rodar a partir de um diretório de sistema. Leitura continua
+    // permitida — o nível Read já é somente leitura.
+    if !efetivo.is_empty() && !combina_leitura(&efetivo) {
+        for cwd in &cwds {
+            let norm = normalize_path(cwd);
+            if norm == std::path::Path::new("/")
+                || DIRETORIOS_SISTEMA.iter().any(|dir| norm.starts_with(dir))
+            {
+                return Analysis::new(
+                    Decision::Bloquear,
+                    CommandCategory::Proibida,
+                    format!(
+                        "operação sobre caminho de sistema a partir de {}",
+                        norm.display()
+                    ),
+                );
+            }
+        }
+    }
+
     let elevacao = wrappers
         .iter()
         .any(|w| matches!(w.as_str(), "sudo" | "doas" | "su"));
-    if elevacao && !efetivo.is_empty() && efetivo != cmd && profundidade < 4 {
+    if elevacao && !efetivo.is_empty() && efetivo != cmd && profundidade < PROFUNDIDADE_MAXIMA {
         let interno = classificar_comandos(&efetivo, ctx, profundidade + 1);
         let privilegio = Analysis::new(
             Decision::Confirmar,
@@ -1231,18 +1751,79 @@ fn classificar_parte(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -> A
     let programa = primeira_palavra(cmd);
     let leitura_cmd = combina_leitura(cmd);
 
+    // 1a-ii. O diretório de trabalho imposto por um `cd` anterior no mesmo
+    // comando composto (`cwd`). O `cd` em si é navegação, mas o que vem depois
+    // escreve lá dentro: `cd /etc && tee passwd` grava em `/etc/passwd` e, sem
+    // caminho absoluto no subcomando, nada mais denunciaria a escrita.
+    if let Some(cwd) = cwd
+        && eh_caminho_de_sistema(cwd)
+    {
+        let escreve = matches!(
+            programa.as_str(),
+            "mv" | "cp"
+                | "touch"
+                | "mkdir"
+                | "tee"
+                | "truncate"
+                | "ln"
+                | "install"
+                | "shred"
+                | "dd"
+                | "rm"
+                | "rsync"
+                | "patch"
+        ) || cmd.contains('>');
+        // Operando relativo (`tee passwd`) ou alvo de redirecionamento
+        // relativo (`cat x > passwd`). `2>&1` e os dispositivos seguros
+        // (`/dev/null`) não escrevem em lugar nenhum do sistema.
+        let alvo_relativo = cmd
+            .split_whitespace()
+            .skip(1)
+            .filter(|t| !t.starts_with('-'))
+            .any(|t| {
+                let t = t.trim_matches(|c| c == '"' || c == '\'');
+                !t.starts_with('/')
+                    && !t.starts_with('~')
+                    && !t.starts_with('$')
+                    && !t.contains('>')
+                    && !t.contains('<')
+            })
+            || redirecionamentos(cmd).iter().any(|alvo| {
+                let t = alvo.to_string_lossy();
+                !t.starts_with('&') && !alvo.is_absolute() && !dispositivo_seguro(alvo)
+            });
+        if escreve && alvo_relativo {
+            return Analysis::new(
+                Decision::Bloquear,
+                CommandCategory::Proibida,
+                format!(
+                    "escrita a partir de diretório de sistema: {}",
+                    normalize_path(cwd).display()
+                ),
+            );
+        }
+    }
+
     // 1b. Código inline em interpretador: `bash -c '…'` / `python -c '…'`
     // executam código arbitrário. O código é analisado como se fosse executado
     // direto (`bash -c 'rm -rf /'` continua proibido), com profundidade
     // limitada; os passos seguintes enxergariam as aspas, não o código.
     if let Some(codigo) = codigo_inline_interno(cmd) {
-        if profundidade < 4 {
+        // Código de alto nível não é tokenizado como comando de shell:
+        // `os.system('rm -rf /')` escapava de todas as barreiras e saía como
+        // modificação qualquer.
+        if let Some(proibida) = remocao_destrutiva_em_codigo(&codigo) {
+            return proibida;
+        }
+        if profundidade < PROFUNDIDADE_MAXIMA {
             return classificar_comandos(&codigo, ctx, profundidade + 1);
         }
+        // Aninhamento além da profundidade analisada não pode sair como
+        // sensível: no nível Full isso era liberado sem confirmação.
         return Analysis::new(
             Decision::Confirmar,
-            CommandCategory::Sensivel,
-            "execução de código inline em interpretador",
+            CommandCategory::Destrutiva,
+            "aninhamento de código inline além da profundidade de análise",
         );
     }
 
@@ -1251,25 +1832,23 @@ fn classificar_parte(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -> A
     // A checagem distingue leitura de escrita: ler qualquer caminho é o
     // contrato do nível Read ("somente leitura"), então `cat /etc/hostname`
     // não pode ser bloqueado; o que nunca passa é **escrever** em caminho de
-    // sistema. Para comandos de leitura só os alvos de redirecionamento
-    // contam; nós de dispositivo seguros (`2> /dev/null`) são ignorados.
-    if leitura_cmd {
-        for alvo in redirecionamentos(cmd) {
-            let norm = normalize_path(&alvo);
-            if !dispositivo_seguro(&norm)
-                && DIRETORIOS_SISTEMA.iter().any(|dir| norm.starts_with(dir))
-            {
-                return Analysis::new(
-                    Decision::Bloquear,
-                    CommandCategory::Proibida,
-                    format!(
-                        "redireciona escrita para caminho de sistema: {}",
-                        norm.display()
-                    ),
-                );
-            }
+    // sistema. Redirecionamentos contam para **todo** comando (inclusive
+    // `cargo test >/etc/...`), não só para os classificados como leitura.
+    for alvo in redirecionamentos(cmd) {
+        let norm = normalize_path(&alvo);
+        if !dispositivo_seguro(&norm) && DIRETORIOS_SISTEMA.iter().any(|dir| norm.starts_with(dir))
+        {
+            return Analysis::new(
+                Decision::Bloquear,
+                CommandCategory::Proibida,
+                format!(
+                    "redireciona escrita para caminho de sistema: {}",
+                    norm.display()
+                ),
+            );
         }
-    } else {
+    }
+    if !leitura_cmd {
         for caminho in caminhos_no_comando(cmd, ctx.roots.first()) {
             let norm = normalize_path(&caminho);
             if dispositivo_seguro(&norm) {
@@ -1332,19 +1911,7 @@ fn classificar_parte(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -> A
     }
 
     // 6. Git destrutivo.
-    let git_destrutivo = [
-        "git reset --hard",
-        "git clean -fd",
-        "git clean -fdx",
-        "git push --force",
-        "git push -f",
-        "git branch -D",
-        "git checkout -- .",
-        "git restore .",
-        "git stash drop",
-        "git filter-branch",
-    ];
-    if contem_algum(cmd, &git_destrutivo).is_some() {
+    if git_destrutivo(cmd) {
         return Analysis::new(
             Decision::Confirmar,
             CommandCategory::Destrutiva,
@@ -1434,6 +2001,24 @@ fn classificar_parte(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -> A
 
     // 11b. `find` com apagamento ou execução de comandos.
     if find_destrutivo(cmd) {
+        // `find` está na lista de leitura, então o passo "operação sobre
+        // caminho de sistema" nunca olhava seus alvos: `find /etc -delete`
+        // saía como destrutiva e, no nível Full, um aceite destruía o
+        // diretório. A busca que apaga a partir de um diretório de sistema é
+        // proibida, não confirmável.
+        let alvo_sistema = caminhos_no_comando(cmd, ctx.roots.first())
+            .into_iter()
+            .any(|p| {
+                let norm = normalize_path(&p);
+                !dispositivo_seguro(&norm) && eh_caminho_de_sistema(&norm)
+            });
+        if alvo_sistema {
+            return Analysis::new(
+                Decision::Bloquear,
+                CommandCategory::Proibida,
+                "busca que apaga ou executa comandos sobre caminho de sistema",
+            );
+        }
         return Analysis::new(
             Decision::Confirmar,
             CommandCategory::Destrutiva,
@@ -1566,8 +2151,9 @@ fn classificar_parte(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -> A
 
     // 14. Leitura.
     if leitura_cmd {
-        // Redirecionamentos transformam leitura em escrita.
-        if cmd.contains('>') {
+        // Redirecionamentos transformam leitura em escrita. `2>&1` não abre
+        // arquivo e não deve pedir confirmação; `> alvo` sim.
+        if !redirecionamentos(cmd).is_empty() {
             return Analysis::new(
                 Decision::Confirmar,
                 CommandCategory::Modificacao,
@@ -1579,6 +2165,22 @@ fn classificar_parte(cmd: &str, ctx: &AnalysisContext, profundidade: usize) -> A
             CommandCategory::Leitura,
             "comando de leitura",
         );
+    }
+
+    // 14b. Git de rotina: preparar e registrar mudanças é o trabalho normal
+    // do repositório. Estes subcomandos caíam no passo 15 e pediam confirmação
+    // até no nível Write. As operações destrutivas (`reset --hard`,
+    // `stash drop`, `checkout .`) já foram tratadas no passo 6, e a leitura
+    // (`git status`, `git diff`, `git branch`) no passo 14.
+    if programa == "git" && !leitura_cmd {
+        let subcomando = cmd.split_whitespace().nth(1).unwrap_or("");
+        if matches!(subcomando, "add" | "commit" | "stash") {
+            return Analysis::new(
+                Decision::Permitir,
+                CommandCategory::Modificacao,
+                "operação Git de rotina no repositório",
+            );
+        }
     }
 
     // 15. Desconhecido: exige confirmação, pois o efeito não pôde ser avaliado.
@@ -1678,6 +2280,7 @@ pub fn tool_risk(tool: &str) -> ToolRisk {
         "list_files"
         | "read_file"
         | "search_code"
+        | "search_project"
         | "inspect_file_metadata"
         | "analyze_project"
         | "list_skills"
@@ -1692,10 +2295,19 @@ pub fn tool_risk(tool: &str) -> ToolRisk {
         | "fetch_url"
         | "task_status" => ToolRisk::Leitura,
         "update_plan" => ToolRisk::Interna,
-        "write_file" | "create_file" | "edit_file" | "delete_file" | "git_stage"
-        | "create_comp" => ToolRisk::Escrita,
+        "write_file" | "create_file" | "edit_file" | "delete_file" | "apply_patch"
+        | "git_stage" | "create_comp" => ToolRisk::Escrita,
         "run_command" | "git_commit" | "git_branch" | "download_file" | "run_tests"
         | "kill_process" | "spawn_subagent" => ToolRisk::Sensivel,
+        // Meta-ferramentas de recursos/prompts de servidores MCP são leitura.
+        _ if tool.starts_with("mcp__")
+            && (tool.ends_with("__list_resources")
+                || tool.ends_with("__read_resource")
+                || tool.ends_with("__list_prompts")
+                || tool.ends_with("__get_prompt")) =>
+        {
+            ToolRisk::Leitura
+        }
         _ => ToolRisk::Sensivel,
     }
 }
@@ -1749,6 +2361,146 @@ mod tests {
     }
 
     #[test]
+    fn redirecionamentos_nao_burlam_barreira_de_sistema() {
+        for cmd in [
+            "echo x >&/etc/passwd",
+            "echo x >& /etc/passwd",
+            "echo x >|/etc/passwd",
+            "cargo test >/etc/cron.d/x",
+            "cargo build 2>/etc/arquivo",
+            "echo x >/dev/sda",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.decision, Decision::Bloquear, "{cmd}: {}", a.reason);
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}");
+        }
+        // `2>&1` duplica descritor e continua sendo leitura.
+        let a = analyze_command("ls 2>&1", &ctx(PermissionLevel::Full));
+        assert_eq!(a.decision, Decision::Permitir, "{}", a.reason);
+        // Descartar em `/dev/null` continua permitido.
+        let a = analyze_command("cargo test >/dev/null", &ctx(PermissionLevel::Full));
+        assert_ne!(a.decision, Decision::Bloquear, "{}", a.reason);
+    }
+
+    #[test]
+    fn variantes_destrutivas_de_git_exigem_confirmacao() {
+        for cmd in [
+            "git clean -f",
+            "git clean --force",
+            "git checkout -f",
+            "git checkout --force",
+            "git restore -- .",
+            "git restore -W .",
+            "git restore --source=HEAD~1 arquivo.rs",
+            "git stash clear",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(
+                a.category,
+                CommandCategory::Destrutiva,
+                "{cmd} deveria ser destrutiva: {}",
+                a.reason
+            );
+            assert_eq!(
+                apply_level(a, PermissionLevel::Full).decision,
+                Decision::Confirmar,
+                "{cmd} não pode ser automático"
+            );
+        }
+        // `--staged` só desfaz o índice, não apaga trabalho da árvore.
+        let a = analyze_command(
+            "git restore --staged arquivo.rs",
+            &ctx(PermissionLevel::Full),
+        );
+        assert_ne!(a.category, CommandCategory::Destrutiva);
+    }
+
+    /// Corpus adversarial: nenhuma variação de comando catastrófico pode sair
+    /// como "permitido", inclusive no nível Full.
+    #[test]
+    fn corpus_adversarial_nunca_e_permitido() {
+        let ataques = [
+            "rm -rf /",
+            "rm -rf / --no-preserve-root",
+            "echo x; rm -rf /",
+            "echo x && rm -rf /",
+            "echo x | sh -c 'rm -rf /'",
+            "sh -c 'rm -rf /'",
+            "bash -c \"rm -rf /\"",
+            "python3 -c 'import os; os.system(\"rm -rf /\")'",
+            "echo $(rm -rf /)",
+            "echo `rm -rf /`",
+            "echo x >/etc/passwd",
+            "echo x >&/etc/passwd",
+            "echo x >|/etc/passwd",
+            "dd if=/dev/zero of=/dev/sda",
+            "cat x > /dev/nvme0n1",
+            "git clean -f",
+            "git checkout -f",
+            "git restore -- .",
+            "git reset --hard",
+            "chmod -R 000 /",
+            "sudo rm -rf /",
+            "mkfs.ext4 /dev/sda1",
+            "echo x > /usr/local/bin/kestrel",
+            "cargo test >/etc/cron.d/x",
+            // Evasão por contra-barra de escape: o shell resolve `r\m` para
+            // `rm` e `s\hutdown` para `shutdown`; as barreiras literais não
+            // podem ser dribladas assim.
+            "r\\m -rf /",
+            "r\\m -rf / --no-preserve-root",
+            "rm -r\\f /",
+            "echo x; r\\m -rf /",
+            "sh\\utdown -h now",
+            "m\\kfs.ext4 /dev/sda1",
+            "p\\oweroff",
+        ];
+        for cmd in ataques {
+            for level in [
+                PermissionLevel::Read,
+                PermissionLevel::Write,
+                PermissionLevel::Semi,
+                PermissionLevel::Full,
+            ] {
+                let a = apply_level(analyze_command(cmd, &ctx(level)), level);
+                assert_ne!(
+                    a.decision,
+                    Decision::Permitir,
+                    "nível {level:?} liberou ataque `{cmd}` ({})",
+                    a.reason
+                );
+            }
+        }
+    }
+
+    /// Entrada aleatória não pode causar pânico no analisador.
+    #[test]
+    fn analisador_nao_entra_em_panico_com_entrada_aleatoria() {
+        const ALFABETO: &[u8] = b"abcxyz0129 /-_.'\"\\$();|&<>*?[]{}\n\t#%!@+=:,";
+        let mut estado = 0x9E37_79B9_7F4A_7C15u64;
+        let mut proximo = || {
+            estado = estado
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (estado >> 33) as usize
+        };
+        for _ in 0..1500 {
+            let tamanho = proximo() % 96;
+            let texto: String = (0..tamanho)
+                .map(|_| ALFABETO[proximo() % ALFABETO.len()] as char)
+                .collect();
+            for level in [
+                PermissionLevel::Read,
+                PermissionLevel::Write,
+                PermissionLevel::Semi,
+                PermissionLevel::Full,
+            ] {
+                let _ = analyze_command(&texto, &ctx(level));
+            }
+        }
+    }
+
+    #[test]
     fn bloqueia_padroes_catastroficos_em_qualquer_nivel() {
         for level in [
             PermissionLevel::Read,
@@ -1770,6 +2522,15 @@ mod tests {
         let a = analyze_command("cp arquivo.txt /etc/passwd", &ctx(PermissionLevel::Full));
         assert_eq!(a.decision, Decision::Bloquear);
         assert_eq!(a.category, CommandCategory::Proibida);
+        // `/usr/local/...` também é sistema: a checagem antiga só cobria
+        // `/usr/bin` e `/usr/lib`, então instalar em `/usr/local/bin` passava.
+        for cmd in [
+            "cp arquivo.txt /usr/local/bin/ferramenta",
+            "install -m 755 x /usr/local/bin/y",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+        }
     }
 
     #[test]
@@ -2289,6 +3050,407 @@ mod tests {
             PermissionLevel::Semi,
         );
         assert_eq!(b.decision, Decision::Permitir);
+    }
+
+    /// `chave=valor` escondia o caminho (`dd of=/etc/passwd`) da análise.
+    #[test]
+    fn caminho_depois_de_igual_nao_escapa_da_analise() {
+        for cmd in [
+            "dd if=/dev/zero of=/etc/passwd",
+            "cp --target-directory=/etc x",
+            "install -m 644 x --target-directory=/usr/local/bin",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+        }
+        // Variáveis comuns não viram caminho — nem quando o valor é absoluto
+        // (`PATH=/usr/bin` é atribuição de ambiente, não alvo de escrita).
+        assert!(
+            caminhos_no_comando(
+                "FOO=bar comando",
+                Some(&PathBuf::from("/home/user/projeto"))
+            )
+            .is_empty()
+        );
+        assert!(
+            caminhos_no_comando(
+                "PATH=/usr/bin:$PATH cargo build",
+                Some(&PathBuf::from("/home/user/projeto"))
+            )
+            .is_empty()
+        );
+        let a = apply_level(
+            analyze_command(
+                "PATH=/usr/bin:$PATH cargo build",
+                &ctx(PermissionLevel::Semi),
+            ),
+            PermissionLevel::Semi,
+        );
+        assert_eq!(a.decision, Decision::Permitir, "{}", a.reason);
+        assert_eq!(a.category, CommandCategory::Build);
+    }
+
+    /// `env -C /etc tee passwd` grava em `/etc/passwd`: o diretório imposto
+    /// pelo embrulho precisa participar da análise.
+    #[test]
+    fn embrulho_com_chdir_para_sistema_nao_escreve() {
+        for cmd in [
+            "env -C /etc tee passwd",
+            "env --chdir=/etc tee passwd",
+            "sudo -D /etc tee passwd",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+            assert_eq!(a.decision, Decision::Bloquear, "{cmd}");
+        }
+        // Ler a partir do diretório de sistema continua permitido.
+        let a = apply_level(
+            analyze_command("env -C /etc cat hostname", &ctx(PermissionLevel::Read)),
+            PermissionLevel::Read,
+        );
+        assert_eq!(a.decision, Decision::Permitir, "{}", a.reason);
+    }
+
+    /// Flags curtas agrupadas (`-lc`, `-ec`) escondiam o `-c` do shell.
+    #[test]
+    fn flags_agrupadas_nao_escondem_codigo_inline() {
+        for cmd in [
+            "bash -lc 'rm -rf ~'",
+            "sh -ec 'rm -rf /etc/algo'",
+            "zsh -ic 'rm -rf /usr/local'",
+            "deno eval 'rm -rf /etc/algo'",
+            // Código colado à flag (`-c'…'`) não pode virar argumento perdido.
+            "python -c'rm -rf /etc/algo'",
+            "perl -e'rm -rf /etc/algo'",
+            "php -r'rm -rf /etc/algo'",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+        }
+        assert!(codigo_inline_interno("php -r 'unlink(\"/etc/passwd\");'").is_some());
+        assert!(codigo_inline_interno("deno eval 'x'").is_some());
+        assert!(codigo_inline_interno("eval 'rm -rf ~'").is_some());
+        assert_eq!(
+            codigo_inline_interno("python -c'rm -rf /etc/algo'").as_deref(),
+            Some("rm -rf /etc/algo")
+        );
+        let a = apply_level(
+            analyze_command("bash -lc 'cargo test'", &ctx(PermissionLevel::Semi)),
+            PermissionLevel::Semi,
+        );
+        assert_eq!(a.category, CommandCategory::Build, "{}", a.reason);
+        assert_eq!(a.decision, Decision::Permitir);
+    }
+
+    /// `test`/`[` termina com espaço na lista; a concatenação de outro espaço
+    /// fazia com que nunca fossem reconhecidos como leitura.
+    #[test]
+    fn test_e_colchete_sao_leitura() {
+        for cmd in ["test -f Cargo.toml", "[ -d src ]"] {
+            let a = apply_level(
+                analyze_command(cmd, &ctx(PermissionLevel::Read)),
+                PermissionLevel::Read,
+            );
+            assert_eq!(a.decision, Decision::Permitir, "{cmd}: {}", a.reason);
+            assert_eq!(a.category, CommandCategory::Leitura, "{cmd}");
+        }
+    }
+
+    /// `$HOME`/`${HOME}` escondiam o destino: não começavam com `/`, `./` ou
+    /// `~/` e por isso não eram caminho nenhum para a análise — nem de
+    /// sistema, nem fora do projeto. Em nível autônomo o comando passava.
+    #[test]
+    fn cifrao_home_aponta_para_caminho_de_sistema() {
+        for cmd in [
+            "cp payload $HOME/../../etc/cron.d/backdoor",
+            "cp payload ${HOME}/../../etc/passwd",
+            "tee $HOME/../../etc/passwd < payload",
+            "cat payload > $HOME/../../etc/senha",
+            "dd of=$HOME/../../etc/crontab",
+            "cp x ~outro/../../etc/shadow",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+            assert_eq!(a.decision, Decision::Bloquear, "{cmd}");
+        }
+        // A expansão em si não transforma qualquer `$VAR` em caminho.
+        assert!(
+            caminhos_no_comando(
+                "echo $OUTRA_COISA $PATH",
+                Some(&PathBuf::from("/home/user/projeto"))
+            )
+            .is_empty()
+        );
+        // `$HOME` continua sendo um caminho fora do projeto (escrita exige
+        // confirmação fora do Read), não um alvo de sistema por si só.
+        let casa = dirs::home_dir().expect("ambiente de teste sem home");
+        let a = analyze_command(
+            &format!("cp x {}/notas.txt", casa.to_string_lossy()),
+            &ctx(PermissionLevel::Read),
+        );
+        assert_eq!(a.category, CommandCategory::Modificacao, "{}", a.reason);
+    }
+
+    /// Opções de build com caminho (`--prefix`, `-DCMAKE_INSTALL_PREFIX`,
+    /// `--target-dir`) não são alvos de escrita: a allowlist fechada de
+    /// operandos `chave=valor` existe para `dd of=` e `cp
+    /// --target-directory=`, não para travar `configure`/`cmake`/`cargo`.
+    #[test]
+    fn opcao_de_build_com_caminho_nao_e_alvo_de_escrita() {
+        for cmd in [
+            "./configure --prefix=/usr/local",
+            "cmake -DCMAKE_INSTALL_PREFIX=/usr ..",
+            "pip install --prefix=/usr .",
+            "cargo build --target-dir=/usr/tmp/x",
+        ] {
+            let a = apply_level(
+                analyze_command(cmd, &ctx(PermissionLevel::Full)),
+                PermissionLevel::Full,
+            );
+            assert_ne!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+            assert_ne!(a.decision, Decision::Bloquear, "{cmd}: {}", a.reason);
+        }
+    }
+
+    /// `cd` não escreve: navegar para um diretório de sistema e compilar lá é
+    /// rotina de build. O alvo destrutivo do segundo subcomando continua pego.
+    #[test]
+    fn cd_para_diretorio_de_sistema_nao_e_escrita() {
+        for cmd in [
+            "cd /usr/src/zlib-1.3 && ./configure && make",
+            "cd /etc && cat hostname",
+            "cd /usr/local && ls",
+            "cd /usr",
+        ] {
+            for level in [
+                PermissionLevel::Read,
+                PermissionLevel::Write,
+                PermissionLevel::Semi,
+                PermissionLevel::Full,
+            ] {
+                let a = apply_level(analyze_command(cmd, &ctx(level)), level);
+                assert_ne!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+                assert_ne!(
+                    a.category,
+                    CommandCategory::Destrutiva,
+                    "{cmd}: {}",
+                    a.reason
+                );
+            }
+            // De Write em diante a navegação/compilação é rotina.
+            for level in [
+                PermissionLevel::Write,
+                PermissionLevel::Semi,
+                PermissionLevel::Full,
+            ] {
+                let a = apply_level(analyze_command(cmd, &ctx(level)), level);
+                assert_ne!(
+                    a.decision,
+                    Decision::Bloquear,
+                    "{level:?}: {cmd}: {}",
+                    a.reason
+                );
+            }
+        }
+        // O segundo subcomando ainda decide: `cd /etc && rm …` é pego pelo rm.
+        let a = analyze_command("cd /etc && rm -rf /etc/algo", &ctx(PermissionLevel::Full));
+        assert_eq!(a.category, CommandCategory::Proibida, "{}", a.reason);
+    }
+
+    /// Navegar não escreve, mas o diretório passa a valer: `cd /etc && tee
+    /// passwd` grava em `/etc/passwd` mesmo sem caminho absoluto nenhum.
+    #[test]
+    fn cd_para_sistema_empresta_o_diretorio_ao_subcomando() {
+        for cmd in [
+            "cd /etc && tee passwd",
+            "cd /etc && cat x > passwd",
+            "cd /etc && rm -rf lixo",
+            "cd /etc && install -m 644 x y",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+            assert_eq!(a.decision, Decision::Bloquear, "{cmd}");
+        }
+        // Fora dos diretórios de sistema a navegação segue sendo rotina — e
+        // `2>&1`/`/dev/null` não escrevem em lugar nenhum.
+        for cmd in [
+            "cd /home/user/projeto && cargo test 2>&1",
+            "cd /tmp && cp a b",
+            "cd /home/user/projeto && cargo test > /dev/null",
+        ] {
+            let a = apply_level(
+                analyze_command(cmd, &ctx(PermissionLevel::Full)),
+                PermissionLevel::Full,
+            );
+            assert_eq!(a.decision, Decision::Permitir, "{cmd}: {}", a.reason);
+        }
+    }
+
+    /// Quando a profundidade da análise se esgota, a classificação não pode
+    /// ser permissiva: `echo $(echo $(… $(rm -rf /)))` era lido como leitura
+    /// e liberado em todos os níveis, inclusive Read.
+    #[test]
+    fn aninhamento_profundo_nao_vira_leitura() {
+        for cmd in [
+            "echo $(echo $(echo $(echo $(echo $(rm -rf /)))))",
+            "bash -c 'bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c 'rm -rf /'\\\\\\\"\\\"\"'",
+        ] {
+            let a = apply_level(
+                analyze_command(cmd, &ctx(PermissionLevel::Read)),
+                PermissionLevel::Read,
+            );
+            assert_ne!(a.decision, Decision::Permitir, "Read liberou: {cmd}");
+            let b = apply_level(
+                analyze_command(cmd, &ctx(PermissionLevel::Full)),
+                PermissionLevel::Full,
+            );
+            // Nem leitura silenciosa nem liberação autônoma: o interno não
+            // pode desaparecer da análise quando a profundidade se esgota.
+            assert!(
+                b.decision != Decision::Permitir,
+                "Full liberou: {cmd} ({})",
+                b.reason
+            );
+            assert!(
+                matches!(
+                    b.category,
+                    CommandCategory::Destrutiva | CommandCategory::Proibida
+                ),
+                "{cmd}: {}",
+                b.reason
+            );
+        }
+        // Aninhamento raso continua sendo analisado de verdade.
+        let c = analyze_command("echo $(date)", &ctx(PermissionLevel::Full));
+        assert_eq!(c.decision, Decision::Permitir, "{}", c.reason);
+    }
+
+    /// Código inline em linguagem de alto nível executava remoção destrutiva
+    /// sem ser visto: o `rm` vinha depois de `os.system(` e nenhuma barreira
+    /// olhava a posição de comando.
+    #[test]
+    fn codigo_inline_de_alto_nivel_nao_executa_remocao() {
+        for cmd in [
+            "python3 -c \"import os;os.system('rm -rf /')\"",
+            "perl -e 'system(\"rm -rf /\");'",
+            "ruby -e \"system('rm -rf /etc')\"",
+            "python3 -c \"import os;os.system('rm -f /etc/passwd')\"",
+            "python -c 'import shutil;shutil.rmtree(\"/etc/x\")'",
+            "python3 -c \"from pathlib import Path;Path('/etc/x').unlink()\"",
+        ] {
+            let a = apply_level(
+                analyze_command(cmd, &ctx(PermissionLevel::Full)),
+                PermissionLevel::Full,
+            );
+            assert_ne!(a.decision, Decision::Permitir, "Full liberou: {cmd}");
+            assert_ne!(
+                a.category,
+                CommandCategory::Modificacao,
+                "{cmd}: {}",
+                a.reason
+            );
+        }
+        // `find … -exec rm -f {} +` é uso legítimo: o operando do `rm` é `{}`.
+        let b = analyze_command(
+            "find . -name '*.tmp' -exec rm -f {} +",
+            &ctx(PermissionLevel::Full),
+        );
+        assert_eq!(b.category, CommandCategory::Destrutiva, "{}", b.reason);
+        assert!(!remocao_destrutiva_em_codigo("find / -name core -exec rm -f {} +").is_some());
+        // Código comum de build não é confundido com remoção.
+        assert!(remocao_destrutiva_em_codigo("import os\nos.rmdir('x')").is_none());
+        assert!(remocao_destrutiva_em_codigo("shutil.copy(src, dest)").is_none());
+        assert!(remocao_destrutiva_em_codigo("json.load(open('/etc/config'))").is_none());
+    }
+
+    /// `find /etc -delete` apagava um diretório de sistema com um aceite no
+    /// nível Full: a busca estava na lista de leitura, então o passo "operação
+    /// sobre caminho de sistema" nunca olhava seus alvos.
+    #[test]
+    fn find_destrutivo_em_caminho_de_sistema_e_proibido() {
+        for cmd in [
+            "find /etc -delete",
+            "find /usr -name '*.a' -exec rm -f {} +",
+            "find /etc -name hosts -delete",
+        ] {
+            let a = analyze_command(cmd, &ctx(PermissionLevel::Full));
+            assert_eq!(a.category, CommandCategory::Proibida, "{cmd}: {}", a.reason);
+            assert_eq!(a.decision, Decision::Bloquear, "{cmd}");
+        }
+        // A busca destrutiva comum continua apenas confirmável.
+        let b = analyze_command("find . -name '*.tmp' -delete", &ctx(PermissionLevel::Full));
+        assert_eq!(b.category, CommandCategory::Destrutiva);
+    }
+
+    /// `git add`/`commit`/`stash` são rotina do repositório: caíam no passo 15
+    /// e pediam confirmação até no nível Write. `git checkout .` e qualquer
+    /// `git restore` da árvore de trabalho descartam modificações locais e por
+    /// isso são destrutivos.
+    #[test]
+    fn git_de_rotina_nao_pede_confirmacao() {
+        for cmd in ["git commit -m 'corrige bug'", "git add -A", "git stash"] {
+            for level in [
+                PermissionLevel::Write,
+                PermissionLevel::Semi,
+                PermissionLevel::Full,
+            ] {
+                let a = apply_level(analyze_command(cmd, &ctx(level)), level);
+                assert_eq!(a.decision, Decision::Permitir, "{level:?} liberou: {cmd}");
+                assert_eq!(a.category, CommandCategory::Modificacao, "{cmd}");
+            }
+            let leitura = apply_level(
+                analyze_command(cmd, &ctx(PermissionLevel::Read)),
+                PermissionLevel::Read,
+            );
+            assert_eq!(leitura.decision, Decision::Bloquear, "Read liberou: {cmd}");
+        }
+        // `git checkout .` (sem o `--`) descarta o trabalho local; o mesmo
+        // vale para `restore` de um arquivo.
+        for cmd in [
+            "git checkout .",
+            "git checkout -- .",
+            "git restore .",
+            "git restore arquivo.txt",
+        ] {
+            let a = apply_level(
+                analyze_command(cmd, &ctx(PermissionLevel::Full)),
+                PermissionLevel::Full,
+            );
+            assert_eq!(a.decision, Decision::Confirmar, "Full liberou: {cmd}");
+            assert_eq!(a.category, CommandCategory::Destrutiva, "{cmd}");
+        }
+        // `git stash drop` e `git status` mantêm o comportamento anterior.
+        let b = analyze_command("git stash drop", &ctx(PermissionLevel::Full));
+        assert_eq!(b.category, CommandCategory::Destrutiva, "{}", b.reason);
+        let c = analyze_command("git status --short", &ctx(PermissionLevel::Read));
+        assert_eq!(c.category, CommandCategory::Leitura, "{}", c.reason);
+    }
+
+    /// O helper público usado pelas ferramentas compara por componente de
+    /// caminho: `/home/user/projeto2` não casa com `/home/user/projeto`.
+    #[test]
+    fn eh_caminho_de_sistema_compara_por_componente() {
+        assert!(eh_caminho_de_sistema(std::path::Path::new("/etc/passwd")));
+        assert!(eh_caminho_de_sistema(std::path::Path::new(
+            "/usr/local/bin/tool"
+        )));
+        assert!(eh_caminho_de_sistema(std::path::Path::new("/lib64/ld.so")));
+        // `..` é normalizado antes da comparação.
+        assert!(eh_caminho_de_sistema(std::path::Path::new(
+            "/home/user/../../etc/crontab"
+        )));
+        // Projeto e diretórios comuns não são sistema — mesmo com nome
+        // parecido (`projeto2` não é `projeto`).
+        assert!(!eh_caminho_de_sistema(std::path::Path::new(
+            "/home/user/projeto2/src/main.rs"
+        )));
+        assert!(!eh_caminho_de_sistema(std::path::Path::new(
+            "/home/user/projeto"
+        )));
+        assert!(!eh_caminho_de_sistema(std::path::Path::new("/tmp/build")));
+        assert!(!eh_caminho_de_sistema(std::path::Path::new("")));
+        // Caminho relativo não é caminho de sistema.
+        assert!(!eh_caminho_de_sistema(std::path::Path::new("etc/passwd")));
     }
 
     /// Código inline é analisado como o código que executa; quando não dá

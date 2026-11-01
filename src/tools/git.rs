@@ -67,6 +67,44 @@ fn validar_revisao(alvo: &str) -> Result<(), ToolError> {
 
 pub struct GitStatus;
 
+/// Estado de uma entrada do `git status --porcelain=v1`, para escolher em qual
+/// seção exibi-la. Conflito/merge nunca é "preparado".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EstadoGit {
+    Preparado,
+    Modificado,
+    NaoRastreado,
+    Conflito,
+}
+
+/// Classifica o código de dois caracteres (`XY`) do porcelain v1.
+///
+/// Antes qualquer código que não começasse com espaço caía em "preparados", o
+/// que rotulava `MM`, `UU` e `AA` como preparados — sendo que `UU`/`AA` são
+/// conflitos de merge, não mudanças preparadas.
+fn classificar_status(codigo: &str) -> EstadoGit {
+    let mut chars = codigo.chars();
+    let x = chars.next().unwrap_or(' ');
+    let y = chars.next().unwrap_or(' ');
+    if x == '?' && y == '?' {
+        return EstadoGit::NaoRastreado;
+    }
+    match (x, y) {
+        // Não mesclados / em conflito (git porcelain v1).
+        ('D', 'D')
+        | ('A', 'U')
+        | ('U', 'D')
+        | ('U', 'A')
+        | ('D', 'U')
+        | ('A', 'A')
+        | ('U', 'U') => EstadoGit::Conflito,
+        // Só mudou na árvore de trabalho (índice intacto).
+        (' ', _) => EstadoGit::Modificado,
+        // Alteração de índice (preparada), inclusive `MM`.
+        _ => EstadoGit::Preparado,
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for GitStatus {
     fn nome(&self) -> &'static str {
@@ -84,7 +122,7 @@ impl Tool for GitStatus {
     }
 
     async fn executar(&self, _args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let (ok, status) = git(ctx, &["status", "--porcelain=v1", "--branch"]).await?;
+        let (ok, status) = git(ctx, &["status", "--porcelain=v1", "-z", "--branch"]).await?;
         if !ok {
             return Err(ToolError::msg(format!(
                 "falha ao consultar o estado do Git: {status}{}",
@@ -95,25 +133,42 @@ impl Tool for GitStatus {
         let mut preparados = Vec::new();
         let mut modificados = Vec::new();
         let mut nao_rastreados = Vec::new();
-        for linha in status.lines() {
-            if let Some(resto) = linha.strip_prefix("## ") {
+        let mut conflitos = Vec::new();
+        // `-z` separa os registros por NUL e devolve os caminhos crus: um nome
+        // com newline não quebra em linhas fantasmas classificadas erradas.
+        let mut registros = status.split('\0');
+        while let Some(registro) = registros.next() {
+            if registro.is_empty() {
+                continue; // a saída termina com um NUL
+            }
+            if let Some(resto) = registro.strip_prefix("## ") {
                 branch = resto.to_string();
                 continue;
             }
-            let (codigo, arquivo) = linha.split_at(
-                linha
+            let (codigo, arquivo) = registro.split_at(
+                registro
                     .char_indices()
                     .nth(2)
                     .map(|(i, _)| i)
-                    .unwrap_or(linha.len()),
+                    .unwrap_or(registro.len()),
             );
-            let arquivo = arquivo.trim();
-            if codigo.starts_with("??") {
-                nao_rastreados.push(arquivo.to_string());
-            } else if codigo.starts_with(" ") {
-                modificados.push(format!("{codigo} {arquivo}"));
+            // `XY <caminho>`: remove só o espaço separador, preservando o nome.
+            let arquivo = arquivo.strip_prefix(' ').unwrap_or(arquivo).to_string();
+            // Renomeio/cópia (R / C): o caminho original chega num registro
+            // separado com `-z`; consumimos para não virar uma entrada fantasma.
+            let descricao = if codigo.starts_with('R') || codigo.starts_with('C') {
+                match registros.next() {
+                    Some(origem) => format!("{arquivo} (era: {origem})"),
+                    None => arquivo,
+                }
             } else {
-                preparados.push(format!("{codigo} {arquivo}"));
+                arquivo
+            };
+            match classificar_status(codigo) {
+                EstadoGit::NaoRastreado => nao_rastreados.push(descricao),
+                EstadoGit::Modificado => modificados.push(format!("{codigo} {descricao}")),
+                EstadoGit::Preparado => preparados.push(format!("{codigo} {descricao}")),
+                EstadoGit::Conflito => conflitos.push(format!("{codigo} {descricao}")),
             }
         }
         let mut texto = format!(
@@ -124,7 +179,11 @@ impl Tool for GitStatus {
                 &branch
             }
         );
-        if preparados.is_empty() && modificados.is_empty() && nao_rastreados.is_empty() {
+        if preparados.is_empty()
+            && modificados.is_empty()
+            && nao_rastreados.is_empty()
+            && conflitos.is_empty()
+        {
             texto.push_str("Árvore de trabalho limpa: nenhuma alteração pendente.");
         } else {
             if !preparados.is_empty() {
@@ -141,6 +200,13 @@ impl Tool for GitStatus {
                     modificados.join("\n  ")
                 ));
             }
+            if !conflitos.is_empty() {
+                texto.push_str(&format!(
+                    "\nEm conflito (merge) ({}):\n  {}\n",
+                    conflitos.len(),
+                    conflitos.join("\n  ")
+                ));
+            }
             if !nao_rastreados.is_empty() {
                 texto.push_str(&format!(
                     "\nNão rastreados ({}):\n  {}\n",
@@ -152,7 +218,7 @@ impl Tool for GitStatus {
         Ok(
             ToolOutput::texto(texto.trim_end().to_string()).com_resumo(format!(
                 "git status: {} alterações",
-                preparados.len() + modificados.len()
+                preparados.len() + modificados.len() + conflitos.len()
             )),
         )
     }
@@ -656,6 +722,7 @@ pub(crate) mod tests {
             store: crate::db::Store::open_in_memory().unwrap(),
             session_id: "s1".into(),
             processos: Arc::new(crate::tools::shell::ProcessManager::new()),
+            sandbox: Default::default(),
             arquivos: Arc::new(FileRegistry::new()),
             eventos: tx,
             confirmacoes: ctx_tx,
@@ -680,6 +747,73 @@ pub(crate) mod tests {
         let ctx = contexto(&dir);
         let saida = GitStatus.executar(json!({}), &ctx).await.unwrap();
         assert!(saida.conteudo.contains("novo.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Códigos de dois caracteres classificados corretamente: conflito/unmerge
+    /// (`UU`, `AA`, `AU`…) não pode cair em "preparados" como acontecia.
+    #[test]
+    fn classifica_estados_do_porcelain() {
+        assert_eq!(classificar_status("??"), EstadoGit::NaoRastreado);
+        assert_eq!(classificar_status(" M"), EstadoGit::Modificado);
+        assert_eq!(classificar_status("M "), EstadoGit::Preparado);
+        assert_eq!(classificar_status("MM"), EstadoGit::Preparado);
+        for codigo in ["UU", "AA", "AU", "UA", "DU", "UD", "DD"] {
+            assert_eq!(
+                classificar_status(codigo),
+                EstadoGit::Conflito,
+                "{codigo} deveria ser conflito"
+            );
+        }
+    }
+
+    /// Um conflito de merge aparece como "Em conflito", não como "Preparados".
+    #[tokio::test]
+    async fn status_separa_conflito_de_preparados() {
+        use crate::tools::Tool;
+        let dir = repo_temporario().await;
+        let rodar = |args: Vec<&'static str>| {
+            let dir = dir.clone();
+            async move {
+                let _ = tokio::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&dir)
+                    .output()
+                    .await
+                    .unwrap();
+            }
+        };
+        rodar(vec!["checkout", "-q", "-b", "trabalho"]).await;
+        std::fs::write(dir.join("conf.txt"), "base\n").unwrap();
+        rodar(vec!["add", "conf.txt"]).await;
+        rodar(vec!["commit", "-q", "-m", "base"]).await;
+        rodar(vec!["checkout", "-q", "-b", "lateral"]).await;
+        std::fs::write(dir.join("conf.txt"), "lado\n").unwrap();
+        rodar(vec!["add", "conf.txt"]).await;
+        rodar(vec!["commit", "-q", "-m", "lado"]).await;
+        rodar(vec!["checkout", "-q", "trabalho"]).await;
+        std::fs::write(dir.join("conf.txt"), "main\n").unwrap();
+        rodar(vec!["add", "conf.txt"]).await;
+        rodar(vec!["commit", "-q", "-m", "main"]).await;
+        rodar(vec!["merge", "lateral"]).await; // conflito de propósito
+
+        let ctx = contexto(&dir);
+        let saida = GitStatus.executar(json!({}), &ctx).await.unwrap();
+        assert!(
+            saida.conteudo.contains("conflito"),
+            "o conflito deveria estar sinalizado: {}",
+            saida.conteudo
+        );
+        assert!(
+            saida.conteudo.contains("conf.txt"),
+            "o arquivo em conflito deveria ser listado: {}",
+            saida.conteudo
+        );
+        assert!(
+            !saida.conteudo.contains("Preparados para commit"),
+            "o conflito não pode aparecer como preparado: {}",
+            saida.conteudo
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

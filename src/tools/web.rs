@@ -31,6 +31,24 @@ const LIMITE_CORPO_BUSCA: usize = 4 * 1024 * 1024;
 /// Quantos redirecionamentos seguimos manualmente antes de desistir.
 const MAX_REDIRECIONAMENTOS: usize = 8;
 
+/// Remove o arquivo parcial de um download em qualquer saída, inclusive
+/// cancelamento/timeout que descarta o future.
+struct LimparDownload(Option<PathBuf>);
+
+impl LimparDownload {
+    fn esquecer(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for LimparDownload {
+    fn drop(&mut self) {
+        if let Some(caminho) = &self.0 {
+            let _ = std::fs::remove_file(caminho);
+        }
+    }
+}
+
 /// Endereços que nunca devem ser acessados pelas ferramentas web.
 ///
 /// Link-local (`169.254.0.0/16`) inclui o serviço de metadados de nuvem
@@ -107,11 +125,53 @@ async fn validar_url_externa(url: &str) -> Result<reqwest::Url, ToolError> {
 fn cliente_web(ctx: &ToolContext) -> Result<reqwest::Client, ToolError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // Revalida cada endereço no momento da conexão. A checagem em
+        // `validar_url_externa` resolve o nome antes, mas o `reqwest` resolveria
+        // de novo no `send` — uma resposta DNS diferente podia apontar para o
+        // metadata da nuvem depois da validação (DNS rebinding).
+        .dns_resolver(std::sync::Arc::new(ResolvedorSeguro))
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(ctx.web.request_timeout_secs.max(10)))
         .user_agent(ctx.web.user_agent.clone())
         .build()
         .map_err(|e| ToolError::msg(format!("falha ao preparar o cliente HTTP: {e}")))
+}
+
+/// Resolvedor que recusa qualquer endereço interno, inclusive os obtidos numa
+/// segunda resolução feita pelo próprio cliente HTTP.
+struct ResolvedorSeguro;
+
+impl reqwest::dns::Resolve for ResolvedorSeguro {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            let enderecos = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let mut seguros = Vec::new();
+            for endereco in enderecos {
+                if ip_interno(endereco.ip()) {
+                    let erro = std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "acesso a endereço interno bloqueado: {host} → {}",
+                            endereco.ip()
+                        ),
+                    );
+                    return Err(Box::new(erro) as Box<dyn std::error::Error + Send + Sync>);
+                }
+                seguros.push(endereco);
+            }
+            if seguros.is_empty() {
+                let erro = std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("o host {host} não resolveu para nenhum endereço"),
+                );
+                return Err(Box::new(erro) as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(seguros.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// Faz um GET validando cada salto de redirecionamento.
@@ -179,6 +239,16 @@ fn regexes() -> &'static Regexes {
         .expect("regex"),
         ddg_snippet: Regex::new(r#"(?is)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#)
             .expect("regex"),
+        ddg_snippet_div: Regex::new(
+            r#"(?is)<(?:a|div|span)[^>]*class=["'][^"']*result__snippet[^"']*["'][^>]*>(.*?)</(?:a|div|span)>"#,
+        )
+        .expect("regex"),
+        a_tag: Regex::new(r#"(?is)<a([^>]*)>(.*?)</a>"#).expect("regex"),
+        href_attr: Regex::new(r#"(?is)href=["']([^"']+)["']"#).expect("regex"),
+        lite_snippet: Regex::new(
+            r#"(?is)<td[^>]*class=["'][^"']*result-snippet[^"']*["'][^>]*>(.*?)</td>"#,
+        )
+        .expect("regex"),
         tags: Regex::new(r"(?s)<[^>]+>").expect("regex"),
         bloqueio: Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>")
             .expect("regex"),
@@ -188,6 +258,10 @@ fn regexes() -> &'static Regexes {
 struct Regexes {
     ddg_resultado: Regex,
     ddg_snippet: Regex,
+    ddg_snippet_div: Regex,
+    a_tag: Regex,
+    href_attr: Regex,
+    lite_snippet: Regex,
     tags: Regex,
     bloqueio: Regex,
 }
@@ -227,8 +301,9 @@ impl Tool for WebSearch {
         ToolSpec {
             name: self.nome().into(),
             description: "Pesquisa na web e devolve título, URL e resumo dos resultados. Use \
-                depois fetch_url para ler o conteúdo relevante. O mecanismo padrão é o DuckDuckGo \
-                (sem necessidade de chave)."
+                depois fetch_url para ler o conteúdo relevante. O padrão é o DuckDuckGo; se ele \
+                falhar ou não trouxer resultados, tenta DuckDuckGo Lite, DuckDuckGo HTML e Exa \
+                (chave opcional em EXA_API_KEY)."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -248,137 +323,426 @@ impl Tool for WebSearch {
 
     async fn executar(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let consulta = arg_str(&args, "consulta")?;
-        let max = arg_u64(&args, "max_resultados").unwrap_or(8) as usize;
+        let max = (arg_u64(&args, "max_resultados").unwrap_or(8) as usize).clamp(1, 20);
         let idioma = arg_str_opt(&args, "idioma").unwrap_or_else(|| "pt-br".into());
-
-        if ctx.web.engine == "searx"
-            && let Some(base) = &ctx.web.searx_url
-        {
-            return buscar_searx(ctx, base, &consulta, max).await;
-        }
-        buscar_duckduckgo(ctx, &consulta, &idioma, max).await
+        buscar_com_fallback(ctx, &consulta, &idioma, max).await
     }
 }
 
-async fn buscar_duckduckgo(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MotorBusca {
+    Searx,
+    DuckDuckGo,
+    DuckDuckGoLite,
+    DuckDuckGoHtml,
+    Exa,
+}
+
+impl MotorBusca {
+    fn nome(self) -> &'static str {
+        match self {
+            MotorBusca::Searx => "searx",
+            MotorBusca::DuckDuckGo => "duckduckgo",
+            MotorBusca::DuckDuckGoLite => "duckduckgo lite",
+            MotorBusca::DuckDuckGoHtml => "duckduckgo html",
+            MotorBusca::Exa => "exa",
+        }
+    }
+
+    fn url_ddg(self) -> Option<&'static str> {
+        match self {
+            MotorBusca::DuckDuckGo => Some("https://duckduckgo.com/html/"),
+            MotorBusca::DuckDuckGoLite => Some("https://lite.duckduckgo.com/lite/"),
+            MotorBusca::DuckDuckGoHtml => Some("https://html.duckduckgo.com/html/"),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResultadoBusca {
+    titulo: String,
+    url: String,
+    trecho: String,
+}
+
+/// Ordem da busca: Searx (se configurado), DuckDuckGo, DuckDuckGo Lite,
+/// DuckDuckGo HTML e, por último, Exa (quando a chave está disponível).
+fn planejar_motores(web: &crate::config::WebConfig) -> Vec<MotorBusca> {
+    let mut motores = Vec::new();
+    if web.engine.trim().eq_ignore_ascii_case("searx")
+        && web
+            .searx_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty())
+    {
+        motores.push(MotorBusca::Searx);
+    }
+    motores.extend([
+        MotorBusca::DuckDuckGo,
+        MotorBusca::DuckDuckGoLite,
+        MotorBusca::DuckDuckGoHtml,
+        MotorBusca::Exa,
+    ]);
+    motores
+}
+
+async fn buscar_com_fallback(
     ctx: &ToolContext,
     consulta: &str,
     idioma: &str,
     max: usize,
 ) -> Result<ToolOutput, ToolError> {
-    let cliente = cliente_web(ctx)?;
-    let resposta = cliente
-        .post("https://html.duckduckgo.com/html/")
-        .header("Accept", "text/html")
-        .form(&[("q", consulta), ("kl", idioma)])
-        .send()
-        .await
-        .map_err(|e| {
-            ToolError::msg(format!(
-                "falha na pesquisa (rede): {e}. Verifique sua conexão ou use fetch_url diretamente."
-            ))
-        })?;
-    if !resposta.status().is_success() {
-        return Err(ToolError::msg(format!(
-            "o mecanismo de pesquisa respondeu HTTP {}",
-            resposta.status()
-        )));
+    let motores = planejar_motores(&ctx.web);
+    // Cada mecanismo tem um teto curto: um provedor pendurado não pode somar
+    // minutos de espera aos demais fallbacks.
+    let limite = std::time::Duration::from_secs(ctx.web.request_timeout_secs.clamp(5, 30));
+    let mut obtidos = Vec::with_capacity(motores.len());
+    for motor in motores {
+        let resultado =
+            match tokio::time::timeout(limite, executar_motor(ctx, motor, consulta, idioma, max))
+                .await
+            {
+                Ok(resultado) => resultado,
+                Err(_) => Err(format!("tempo limite de {}s", limite.as_secs())),
+            };
+        obtidos.push((motor, resultado));
     }
-    let corpo = ler_corpo_limitado(resposta, LIMITE_CORPO_BUSCA)
-        .await
-        .map_err(|e| ToolError::msg(format!("falha ao ler a resposta da pesquisa: {e}")))?;
-    let r = regexes();
-    let titulos: Vec<(String, String)> = r
-        .ddg_resultado
-        .captures_iter(&corpo)
-        .map(|c| {
-            (
-                limpar(c.get(2).map(|m| m.as_str()).unwrap_or_default()),
-                url_real(c.get(1).map(|m| m.as_str()).unwrap_or_default()),
-            )
-        })
-        .filter(|(t, _)| !t.is_empty())
-        .collect();
-    let snippets: Vec<String> = r
-        .ddg_snippet
-        .captures_iter(&corpo)
-        .map(|c| limpar(c.get(1).map(|m| m.as_str()).unwrap_or_default()))
-        .collect();
-
-    if titulos.is_empty() {
-        return Ok(ToolOutput::texto(format!(
-            "Nenhum resultado encontrado para `{consulta}`. \
-             O mecanismo pode ter solicitado captcha; tente reformular a consulta ou use fetch_url em uma URL conhecida."
-        )));
-    }
-    let mut linhas = Vec::new();
-    for (i, (titulo, url)) in titulos.iter().take(max).enumerate() {
-        linhas.push(format!(
-            "{}. {}\n   {}\n   {}",
-            i + 1,
-            titulo,
-            url,
-            snippets.get(i).cloned().unwrap_or_default()
-        ));
-    }
-    Ok(ToolOutput::texto(format!(
-        "Resultados para `{consulta}` ({}):\n\n{}",
-        ctx.web.engine,
-        linhas.join("\n")
-    ))
-    .com_resumo(format!(
-        "{} resultados para \"{}\"",
-        linhas.len(),
-        crate::util::truncate(consulta, 40)
-    )))
+    consolidar(consulta, obtidos)
 }
 
-async fn buscar_searx(
+/// Aplica a ordem de fallback sobre os resultados já coletados.
+fn consolidar(
+    consulta: &str,
+    obtidos: Vec<(MotorBusca, Result<Vec<ResultadoBusca>, String>)>,
+) -> Result<ToolOutput, ToolError> {
+    let mut falhas: Vec<String> = Vec::new();
+    let mut respondeu_vazio = false;
+    for (motor, resultado) in obtidos {
+        match resultado {
+            Ok(resultados) if !resultados.is_empty() => {
+                return Ok(formatar_resultados(consulta, motor, &resultados, &falhas));
+            }
+            Ok(_) => {
+                respondeu_vazio = true;
+                falhas.push(format!("{}: sem resultados", motor.nome()));
+            }
+            Err(e) => falhas.push(format!("{}: {e}", motor.nome())),
+        }
+    }
+    let detalhe = falhas.join("; ");
+    if respondeu_vazio {
+        Ok(ToolOutput::texto(format!(
+            "Nenhum resultado para `{consulta}` em nenhum mecanismo. Tentativas: {detalhe}. \
+             Reformule a consulta ou use fetch_url em uma URL conhecida."
+        )))
+    } else {
+        Err(ToolError::msg(format!(
+            "pesquisa web falhou em todos os mecanismos. Tentativas: {detalhe}. \
+             Verifique a conexão ou configure a chave do Exa."
+        )))
+    }
+}
+
+async fn executar_motor(
+    ctx: &ToolContext,
+    motor: MotorBusca,
+    consulta: &str,
+    idioma: &str,
+    max: usize,
+) -> Result<Vec<ResultadoBusca>, String> {
+    match motor {
+        MotorBusca::Searx => {
+            let base = ctx
+                .web
+                .searx_url
+                .as_deref()
+                .ok_or_else(|| "web.searx_url não definido".to_string())?;
+            buscar_searx_resultados(ctx, base, consulta, max).await
+        }
+        MotorBusca::DuckDuckGo | MotorBusca::DuckDuckGoLite | MotorBusca::DuckDuckGoHtml => {
+            let base = motor
+                .url_ddg()
+                .ok_or_else(|| "URL do DuckDuckGo ausente".to_string())?;
+            buscar_ddg(
+                ctx,
+                base,
+                consulta,
+                idioma,
+                max,
+                motor == MotorBusca::DuckDuckGoLite,
+            )
+            .await
+        }
+        MotorBusca::Exa => buscar_exa(ctx, consulta, max).await,
+    }
+}
+
+async fn buscar_ddg(
+    ctx: &ToolContext,
+    base: &str,
+    consulta: &str,
+    idioma: &str,
+    max: usize,
+    lite: bool,
+) -> Result<Vec<ResultadoBusca>, String> {
+    let cliente = cliente_web(ctx).map_err(|e| e.to_string())?;
+    let mut url = reqwest::Url::parse(base).map_err(|e| format!("URL do DDG inválida: {e}"))?;
+    url.query_pairs_mut()
+        .append_pair("q", consulta)
+        .append_pair("kl", idioma);
+    let (_final, resposta) = get_com_redirecionamentos(&cliente, url.as_str(), Some("text/html"))
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resposta.status().is_success() {
+        return Err(format!("HTTP {}", resposta.status()));
+    }
+    let corpo = ler_corpo_limitado(resposta, LIMITE_CORPO_BUSCA).await?;
+    Ok(if lite {
+        parse_lite(&corpo, max)
+    } else {
+        parse_ddg(&corpo, max)
+    })
+}
+
+fn parse_ddg(html: &str, limite: usize) -> Vec<ResultadoBusca> {
+    let r = regexes();
+    let mut resultados: Vec<ResultadoBusca> = r
+        .ddg_resultado
+        .captures_iter(html)
+        .filter_map(|c| {
+            let titulo = limpar(c.get(2).map(|m| m.as_str()).unwrap_or_default());
+            let url = url_real(c.get(1).map(|m| m.as_str()).unwrap_or_default());
+            (!titulo.is_empty() && !url.is_empty()).then_some(ResultadoBusca {
+                titulo,
+                url,
+                trecho: String::new(),
+            })
+        })
+        .collect();
+    if resultados.is_empty() {
+        resultados = extrair_links(html, "result__a", limite)
+            .into_iter()
+            .map(|(url, titulo)| ResultadoBusca {
+                titulo,
+                url,
+                trecho: String::new(),
+            })
+            .collect();
+    }
+    let mut trechos: Vec<String> = r
+        .ddg_snippet
+        .captures_iter(html)
+        .map(|c| limpar(c.get(1).map(|m| m.as_str()).unwrap_or_default()))
+        .collect();
+    if trechos.is_empty() {
+        trechos = r
+            .ddg_snippet_div
+            .captures_iter(html)
+            .map(|c| limpar(c.get(1).map(|m| m.as_str()).unwrap_or_default()))
+            .collect();
+    }
+    for (i, resultado) in resultados.iter_mut().enumerate() {
+        resultado.trecho = trechos.get(i).cloned().unwrap_or_default();
+    }
+    resultados.truncate(limite);
+    resultados
+}
+
+fn parse_lite(html: &str, limite: usize) -> Vec<ResultadoBusca> {
+    let r = regexes();
+    let trechos: Vec<String> = r
+        .lite_snippet
+        .captures_iter(html)
+        .map(|c| limpar(c.get(1).map(|m| m.as_str()).unwrap_or_default()))
+        .collect();
+    extrair_links(html, "result-link", limite)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (url, titulo))| ResultadoBusca {
+            titulo,
+            url,
+            trecho: trechos.get(i).cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Extrai links `<a>` cujo atributo de classe contém `classe`, sem depender da
+/// ordem dos atributos (`href` antes ou depois de `class`).
+fn extrair_links(html: &str, classe: &str, limite: usize) -> Vec<(String, String)> {
+    let r = regexes();
+    r.a_tag
+        .captures_iter(html)
+        .filter_map(|c| {
+            let attrs = c.get(1)?.as_str().to_lowercase();
+            if !attrs.contains(classe) {
+                return None;
+            }
+            let href = r.href_attr.captures(c.get(1)?.as_str())?.get(1)?.as_str();
+            if href.starts_with("javascript:") || href.starts_with('#') {
+                return None;
+            }
+            let titulo = limpar(c.get(2)?.as_str());
+            (!titulo.is_empty()).then_some((url_real(href), titulo))
+        })
+        .take(limite)
+        .collect()
+}
+
+async fn buscar_searx_resultados(
     ctx: &ToolContext,
     base: &str,
     consulta: &str,
     max: usize,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<Vec<ResultadoBusca>, String> {
     let url = format!("{}/search", base.trim_end_matches('/'));
-    let cliente = cliente_web(ctx)?;
+    let cliente = cliente_web(ctx).map_err(|e| e.to_string())?;
     let resposta = cliente
         .get(&url)
         .query(&[("q", consulta), ("format", "json")])
         .send()
         .await
-        .map_err(|e| ToolError::msg(format!("falha ao consultar o SearxNG: {e}")))?;
+        .map_err(|e| format!("falha ao consultar o SearxNG: {e}"))?;
     if !resposta.status().is_success() {
-        return Err(ToolError::msg(format!(
-            "o SearxNG respondeu HTTP {}",
-            resposta.status()
-        )));
+        return Err(format!("HTTP {}", resposta.status()));
     }
-    let corpo = ler_corpo_limitado(resposta, LIMITE_CORPO_BUSCA)
+    let corpo = ler_corpo_limitado(resposta, LIMITE_CORPO_BUSCA).await?;
+    let valor: Value =
+        serde_json::from_str(&corpo).map_err(|e| format!("resposta inválida do SearxNG: {e}"))?;
+    Ok(valor
+        .get("results")
+        .and_then(|r| r.as_array())
+        .map(|resultados| {
+            resultados
+                .iter()
+                .take(max)
+                .filter_map(|item| {
+                    let url = item.get("url").and_then(|u| u.as_str())?;
+                    Some(ResultadoBusca {
+                        titulo: limpar(item.get("title").and_then(|t| t.as_str()).unwrap_or(url)),
+                        url: url.to_string(),
+                        trecho: limpar(item.get("content").and_then(|c| c.as_str()).unwrap_or("")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+async fn buscar_exa(
+    ctx: &ToolContext,
+    consulta: &str,
+    max: usize,
+) -> Result<Vec<ResultadoBusca>, String> {
+    let env = ctx.web.exa_api_key_env.trim();
+    if env.is_empty() {
+        return Err("web.exa_api_key_env vazio".into());
+    }
+    let chave = std::env::var(env)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| format!("{env} não definida"))?;
+    let endpoint = ctx
+        .web
+        .exa_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or("https://api.exa.ai/search");
+    let cliente = cliente_web(ctx).map_err(|e| e.to_string())?;
+    let resposta = cliente
+        .post(endpoint)
+        .header("x-api-key", chave)
+        .header("Accept", "application/json")
+        .json(&json!({
+            "query": consulta,
+            "numResults": max,
+            "type": "auto",
+            "contents": {"text": {"maxCharacters": 1200}}
+        }))
+        .send()
         .await
-        .map_err(|e| ToolError::msg(format!("falha ao ler a resposta do SearxNG: {e}")))?;
-    let valor: Value = serde_json::from_str(&corpo)
-        .map_err(|e| ToolError::msg(format!("resposta inválida do SearxNG: {e}")))?;
+        .map_err(|e| format!("falha ao consultar o Exa: {e}"))?;
+    let status = resposta.status();
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {status}{}",
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                " (verifique a chave do Exa)"
+            } else {
+                ""
+            }
+        ));
+    }
+    let corpo = ler_corpo_limitado(resposta, LIMITE_CORPO_BUSCA).await?;
+    let valor: Value =
+        serde_json::from_str(&corpo).map_err(|e| format!("resposta inválida do Exa: {e}"))?;
+    if let Some(erro) = valor.get("error") {
+        return Err(format!(
+            "Exa: {}",
+            crate::util::truncate(&erro.to_string(), 300)
+        ));
+    }
+    let resultados = parse_exa(&valor, max)?;
+    Ok(resultados)
+}
+
+fn parse_exa(valor: &Value, max: usize) -> Result<Vec<ResultadoBusca>, String> {
+    let resultados = valor
+        .get("results")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| "resposta do Exa sem `results`".to_string())?;
+    Ok(resultados
+        .iter()
+        .take(max)
+        .filter_map(|item| {
+            let url = item.get("url").and_then(|u| u.as_str())?;
+            let titulo = item.get("title").and_then(|t| t.as_str()).unwrap_or(url);
+            let trecho = item
+                .get("text")
+                .or_else(|| item.get("summary"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            Some(ResultadoBusca {
+                titulo: limpar(titulo),
+                url: url.to_string(),
+                trecho: crate::util::truncate(&limpar(trecho), 500),
+            })
+        })
+        .collect())
+}
+
+fn formatar_resultados(
+    consulta: &str,
+    motor: MotorBusca,
+    resultados: &[ResultadoBusca],
+    tentativas: &[String],
+) -> ToolOutput {
     let mut linhas = Vec::new();
-    if let Some(resultados) = valor.get("results").and_then(|r| r.as_array()) {
-        for (i, item) in resultados.iter().take(max).enumerate() {
-            linhas.push(format!(
-                "{}. {}\n   {}\n   {}",
-                i + 1,
-                item.get("title").and_then(|t| t.as_str()).unwrap_or(""),
-                item.get("url").and_then(|u| u.as_str()).unwrap_or(""),
-                item.get("content").and_then(|c| c.as_str()).unwrap_or("")
-            ));
-        }
+    for (i, resultado) in resultados.iter().enumerate() {
+        linhas.push(format!(
+            "{}. {}\n   {}\n   {}",
+            i + 1,
+            resultado.titulo,
+            resultado.url,
+            resultado.trecho
+        ));
     }
-    if linhas.is_empty() {
-        return Ok(ToolOutput::texto(format!(
-            "Nenhum resultado no SearxNG para `{consulta}`."
-        )));
-    }
-    Ok(ToolOutput::texto(format!(
-        "Resultados para `{consulta}` (searx):\n\n{}",
+    let fallback = if tentativas.is_empty() {
+        String::new()
+    } else {
+        format!("\nFallback: {}.", tentativas.join("; "))
+    };
+    ToolOutput::texto(format!(
+        "Resultados para `{consulta}` ({}):{fallback}\n\n{}",
+        motor.nome(),
         linhas.join("\n")
-    )))
+    ))
+    .com_resumo(format!(
+        "{} resultados ({})",
+        resultados.len(),
+        motor.nome()
+    ))
 }
 
 pub struct FetchUrl;
@@ -510,17 +874,29 @@ async fn ler_corpo_limitado(resposta: reqwest::Response, limite: usize) -> Resul
         ));
     }
     let mut bytes: Vec<u8> = Vec::new();
+    let mut truncado = false;
     let mut stream = resposta.bytes_stream();
     while let Some(pedaco) = stream.next().await {
         let pedaco = pedaco.map_err(|e| e.to_string())?;
         let restante = limite.saturating_sub(bytes.len());
-        if pedaco.len() >= restante {
+        if pedaco.len() > restante {
             bytes.extend_from_slice(&pedaco[..restante]);
+            truncado = true;
             break;
         }
         bytes.extend_from_slice(&pedaco);
     }
-    Ok(String::from_utf8_lossy(&bytes).to_string())
+    let mut texto = String::from_utf8_lossy(&bytes).to_string();
+    if truncado {
+        // Sem este aviso o modelo recebia HTML cortado no meio (efeito comum
+        // em resposta chunked, sem Content-Length) sem saber que faltava corpo.
+        texto.push_str(&format!(
+            "\n\n[conteúdo truncado: o corpo excedeu o limite de {} bytes e foi entregue parcialmente; \
+             apenas o início foi lido]",
+            crate::util::human_bytes(limite as u64)
+        ));
+    }
+    Ok(texto)
 }
 
 pub struct DownloadFile;
@@ -599,14 +975,38 @@ impl Tool for DownloadFile {
                 .map_err(|e| ToolError::msg(format!("falha ao criar {}: {e}", pai.display())))?;
         }
         use tokio::io::AsyncWriteExt;
-        let temporario = destino.with_extension("kestrel-download");
-        let mut arquivo = tokio::fs::File::create(&temporario)
+        // Nome único e criado com `create_new`: dois downloads de arquivos com
+        // a mesma extensão não podem compartilhar o temporário, e um symlink
+        // plantado no destino não deve ser seguido.
+        let nome = destino
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "download".into());
+        let temporario = destino.with_file_name(format!(
+            ".{nome}.{}.kestrel-download",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut arquivo = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporario)
             .await
             .map_err(|e| ToolError::msg(format!("falha ao criar {}: {e}", temporario.display())))?;
+        // Mesmo que a chamada seja cancelada ou o future seja descartado no
+        // meio, o arquivo parcial não fica no projeto.
+        let mut limpeza = LimparDownload(Some(temporario.clone()));
 
         let mut total: u64 = 0;
         let mut stream = resposta.bytes_stream();
-        while let Some(pedaco) = stream.next().await {
+        loop {
+            let pedaco = tokio::select! {
+                _ = ctx.cancel.cancelled() => {
+                    drop(arquivo);
+                    return Err(ToolError::Cancelado);
+                }
+                pedaco = stream.next() => pedaco,
+            };
+            let Some(pedaco) = pedaco else { break };
             let bytes = match pedaco {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -643,6 +1043,7 @@ impl Tool for DownloadFile {
                 destino.display()
             )));
         }
+        limpeza.esquecer();
 
         // Identificação básica do conteúdo (sem executar nada).
         let amostra = std::fs::read(&destino)
@@ -791,16 +1192,30 @@ impl Tool for BrowserRender {
             .map_err(|e| ToolError::msg(format!("falha ao ler a saída do navegador: {e}")))?;
         leitura_erro
             .map_err(|e| ToolError::msg(format!("falha ao ler os erros do navegador: {e}")))?;
-        let status = filho
-            .wait()
-            .await
-            .map_err(|e| ToolError::msg(format!("falha ao aguardar o navegador: {e}")))?;
-        if dom_bytes.len() > LIMITE_DOM {
+        // O `Take` no stdout para de drenar ao atingir LIMITE_DOM+1: se o DOM
+        // for maior, o chromium fica bloqueado escrevendo no pipe e um `wait()`
+        // sem tempo limite nunca completaria (deadlock). Detectamos o estouro,
+        // matamos o filho e sempre emolduramos o `wait()` num tempo limite.
+        let estourou_dom = dom_bytes.len() > LIMITE_DOM;
+        if estourou_dom {
+            let _ = filho.start_kill();
+        }
+        let status = match tokio::time::timeout(Duration::from_secs(10), filho.wait()).await {
+            Ok(Ok(s)) => Some(s),
+            // Estouro do tempo limite ou falha ao aguardar: ambos ficam sem
+            // status; o caminho de estouro do DOM já trata o caso principal.
+            Ok(Err(_)) => None,
+            Err(_) => None,
+        };
+        if estourou_dom {
             return Err(ToolError::msg(format!(
                 "o navegador produziu um DOM maior que o limite de {}",
                 crate::util::human_bytes(LIMITE_DOM as u64)
             )));
         }
+        let status = status.ok_or_else(|| {
+            ToolError::msg("o navegador não pôde ser aguardado (travado ou encerrado a tempo)")
+        })?;
         if !status.success() {
             return Err(ToolError::msg(format!(
                 "o navegador terminou com código {:?}: {}",
@@ -921,5 +1336,156 @@ mod tests {
                 "erro inesperado: {erro}"
             ),
         }
+    }
+
+    #[test]
+    fn cadeia_de_busca_usa_ddg_e_fallbacks_na_ordem() {
+        let web = crate::config::WebConfig::default();
+        assert_eq!(
+            planejar_motores(&web),
+            vec![
+                MotorBusca::DuckDuckGo,
+                MotorBusca::DuckDuckGoLite,
+                MotorBusca::DuckDuckGoHtml,
+                MotorBusca::Exa,
+            ]
+        );
+        let mut web = web;
+        web.engine = "searx".into();
+        web.searx_url = Some("http://localhost:8888".into());
+        let motores = planejar_motores(&web);
+        assert_eq!(motores[0], MotorBusca::Searx);
+        assert_eq!(motores.len(), 5);
+    }
+
+    #[test]
+    fn parser_do_ddg_html_extrai_titulo_url_e_trecho() {
+        let html = r#"
+            <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpagina&rut=1">Título <b>um</b></a>
+            <a class="result__snippet" href="https://example.com/pagina">Resumo <b>importante</b></a>
+            <a rel="nofollow" class="result__a" href="https://example.org/dois">Segundo</a>
+        "#;
+        let resultados = parse_ddg(html, 10);
+        assert_eq!(resultados.len(), 2);
+        assert_eq!(resultados[0].titulo, "Título um");
+        assert_eq!(resultados[0].url, "https://example.com/pagina");
+        assert_eq!(resultados[0].trecho, "Resumo importante");
+        assert_eq!(resultados[1].url, "https://example.org/dois");
+    }
+
+    #[test]
+    fn parser_do_ddg_lite_aceita_href_antes_da_classe() {
+        let html = r#"
+            <a rel="nofollow" href="https://lite.example/1" class='result-link'>Lite 1</a>
+            <td class='result-snippet'>Resumo lite</td>
+            <a class='result-link' rel="nofollow" href="//lite.example/2">Lite 2</a>
+        "#;
+        let resultados = parse_lite(html, 10);
+        assert_eq!(resultados.len(), 2);
+        assert_eq!(resultados[0].url, "https://lite.example/1");
+        assert_eq!(resultados[0].trecho, "Resumo lite");
+        assert_eq!(resultados[1].url, "https://lite.example/2");
+    }
+
+    #[test]
+    fn parser_do_exa_limpa_html_e_respeita_limite() {
+        let valor = json!({
+            "results": [
+                {"title": "Exa <b>Title</b>", "url": "https://exa.example/1", "text": "Texto <i>limpo</i>"},
+                {"title": "Segundo", "url": "https://exa.example/2", "summary": "resumo"}
+            ]
+        });
+        let resultados = parse_exa(&valor, 1).unwrap();
+        assert_eq!(resultados.len(), 1);
+        assert_eq!(resultados[0].titulo, "Exa Title");
+        assert_eq!(resultados[0].trecho, "Texto limpo");
+    }
+
+    #[test]
+    fn fallback_continua_apos_vazio_ou_erro() {
+        let resultado = consolidar(
+            "consulta",
+            vec![
+                (MotorBusca::DuckDuckGo, Ok(Vec::new())),
+                (MotorBusca::DuckDuckGoLite, Err("HTTP 202".into())),
+                (
+                    MotorBusca::DuckDuckGoHtml,
+                    Ok(vec![ResultadoBusca {
+                        titulo: "Achado".into(),
+                        url: "https://exemplo/achado".into(),
+                        trecho: "trecho".into(),
+                    }]),
+                ),
+            ],
+        )
+        .unwrap();
+        assert!(resultado.conteudo.contains("duckduckgo html"));
+        assert!(resultado.conteudo.contains("Achado"));
+        assert!(resultado.conteudo.contains("Fallback"));
+        assert!(resultado.conteudo.contains("duckduckgo: sem resultados"));
+
+        let vazio = consolidar("consulta", vec![(MotorBusca::DuckDuckGo, Ok(Vec::new()))]).unwrap();
+        assert!(vazio.conteudo.contains("Nenhum resultado"));
+
+        let erro = consolidar(
+            "consulta",
+            vec![(MotorBusca::DuckDuckGo, Err("rede caiu".into()))],
+        )
+        .expect_err("todos os mecanismos falharam");
+        assert!(erro.to_string().contains("todos os mecanismos"));
+    }
+
+    /// Corpo truncado ao atingir o limite precisa de um marcador visível: sem
+    /// ele o modelo recebia HTML cortado no meio (resposta chunked, sem
+    /// Content-Length) sem saber que faltava conteúdo.
+    #[tokio::test]
+    async fn corpo_truncado_ganha_marcador_e_corpo_pequeno_nao() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn servir_e_ler(corpo: &'static str, limite: usize) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endereco = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buffer = [0u8; 2048];
+                    let _ = socket.read(&mut buffer).await;
+                    // Resposta chunked, sem Content-Length: é o caso em que o
+                    // reqwest entrega o corpo via `bytes_stream`, exatamente onde
+                    // o corte precisava ser sinalizado.
+                    let resposta = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{corpo}\r\n0\r\n\r\n",
+                        corpo.len()
+                    );
+                    let _ = socket.write_all(resposta.as_bytes()).await;
+                }
+            });
+            let cliente = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let resposta = cliente
+                .get(format!("http://{endereco}/"))
+                .send()
+                .await
+                .unwrap();
+            ler_corpo_limitado(resposta, limite).await.unwrap()
+        }
+
+        // Corpo pequeno, dentro do limite: nada é truncado.
+        let completo = servir_e_ler("abc", 100).await;
+        assert_eq!(completo, "abc");
+        assert!(!completo.contains("truncad"));
+
+        // Corpo maior que o limite: aparece o marcador de truncamento.
+        let corpo = "0123456789ABCDEFGHIJ"; // 20 bytes
+        let cortado = servir_e_ler(corpo, 5).await;
+        assert!(
+            cortado.starts_with("01234"),
+            "início preservado: {cortado:?}"
+        );
+        assert!(
+            cortado.contains("truncad"),
+            "deve avisar do corte: {cortado:?}"
+        );
     }
 }

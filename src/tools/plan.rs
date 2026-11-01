@@ -97,6 +97,45 @@ fn tarefas_de(valor: &Value) -> Vec<TaskRow> {
         .unwrap_or_default()
 }
 
+/// Encontra um ciclo de dependências no grafo (ids → dependências).
+fn encontrar_ciclo(grafo: &std::collections::HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    fn visitar(
+        no: &str,
+        grafo: &std::collections::HashMap<String, Vec<String>>,
+        estados: &mut std::collections::HashMap<String, u8>,
+        pilha: &mut Vec<String>,
+    ) -> bool {
+        match estados.get(no).copied().unwrap_or(0) {
+            1 => {
+                pilha.push(no.to_string());
+                return true;
+            }
+            2 => return false,
+            _ => {}
+        }
+        estados.insert(no.to_string(), 1);
+        pilha.push(no.to_string());
+        if let Some(deps) = grafo.get(no) {
+            for dep in deps {
+                if visitar(dep, grafo, estados, pilha) {
+                    return true;
+                }
+            }
+        }
+        pilha.pop();
+        estados.insert(no.to_string(), 2);
+        false
+    }
+    let mut estados = std::collections::HashMap::new();
+    let mut pilha = Vec::new();
+    for no in grafo.keys() {
+        if visitar(no, grafo, &mut estados, &mut pilha) {
+            return Some(pilha);
+        }
+    }
+    None
+}
+
 pub struct UpdatePlan;
 
 #[async_trait::async_trait]
@@ -187,12 +226,8 @@ impl Tool for UpdatePlan {
 
         // Valida dependências: todas devem existir entre as subtarefas informadas
         // ou já existir no banco.
-        let existentes: Vec<String> = ctx
-            .store
-            .tasks(&ctx.session_id)?
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
+        let existentes_tarefas = ctx.store.tasks(&ctx.session_id)?;
+        let existentes: Vec<String> = existentes_tarefas.iter().map(|t| t.id.clone()).collect();
         let ids_atuais: Vec<String> = tarefas.iter().map(|t| t.id.clone()).collect();
         for t in &tarefas {
             for dep in &t.depends_on {
@@ -210,6 +245,23 @@ impl Tool for UpdatePlan {
                     )));
                 }
             }
+        }
+
+        // Dependências circulares deixariam as tarefas do ciclo bloqueadas
+        // para sempre (nenhuma pode começar antes da outra).
+        let mut grafo: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for t in existentes_tarefas {
+            grafo.insert(t.id, t.depends_on);
+        }
+        for t in &tarefas {
+            grafo.insert(t.id.clone(), t.depends_on.clone());
+        }
+        if let Some(ciclo) = encontrar_ciclo(&grafo) {
+            return Err(ToolError::Argumentos(format!(
+                "as dependências formam um ciclo: {}. Remova uma das ligações para que as tarefas possam ser executadas.",
+                ciclo.join(" → ")
+            )));
         }
 
         let passos_json = serde_json::to_string(
@@ -471,5 +523,52 @@ mod tests {
             .expect_err("autodependência deveria falhar");
         assert!(erro.to_string().contains("si mesma"), "{erro}");
         assert!(ctx.store.latest_plan(&ctx.session_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn plano_rejeita_dependencias_circulares() {
+        let ctx = contexto();
+        let erro = UpdatePlan
+            .executar(
+                json!({
+                    "objetivo": "x",
+                    "subtarefas": [
+                        {"id": "a", "titulo": "a", "depende_de": ["b"]},
+                        {"id": "b", "titulo": "b", "depende_de": ["a"]}
+                    ]
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("ciclo deveria falhar");
+        assert!(erro.to_string().contains("ciclo"), "{erro}");
+        assert!(ctx.store.latest_plan(&ctx.session_id).unwrap().is_none());
+        assert!(ctx.store.tasks(&ctx.session_id).unwrap().is_empty());
+
+        // Um ciclo pode se formar também contra tarefas já gravadas.
+        UpdatePlan
+            .executar(
+                json!({
+                    "objetivo": "ok",
+                    "subtarefas": [{"id": "a", "titulo": "a"}]
+                }),
+                &ctx,
+            )
+            .await
+            .expect("plano sem ciclo");
+        let erro = UpdatePlan
+            .executar(
+                json!({
+                    "objetivo": "ok",
+                    "subtarefas": [
+                        {"id": "a", "titulo": "a", "depende_de": ["b"]},
+                        {"id": "b", "titulo": "b", "depende_de": ["a"]}
+                    ]
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("ciclo contra tarefa existente deveria falhar");
+        assert!(erro.to_string().contains("ciclo"), "{erro}");
     }
 }

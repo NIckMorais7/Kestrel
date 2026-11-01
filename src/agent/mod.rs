@@ -12,7 +12,7 @@ use crate::events::{AgentEvent, ConfirmRequest, PlanoPasso, StatusPasso, TarefaV
 use crate::perm::{PermissionLevel, ToolRisk};
 use crate::project::{self, ProjectInfo};
 use crate::provider::{
-    ChatMessage, ChatRequest, Provider, ProviderError, StreamEvent, ToolCall, ToolSpec,
+    ChatMessage, ChatRequest, Completion, Provider, ProviderError, StreamEvent, ToolCall, ToolSpec,
 };
 use crate::skills::SkillRegistry;
 use crate::tools::shell::ProcessManager;
@@ -21,6 +21,7 @@ use crate::util::Paths;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -57,6 +58,10 @@ pub struct Compartilhado {
     pub eventos: mpsc::UnboundedSender<AgentEvent>,
     pub confirmacoes: mpsc::UnboundedSender<ConfirmRequest>,
     pub permitidos: Arc<Mutex<HashSet<String>>>,
+    /// Indica que o aplicativo está sendo encerrado (`/quit`): o turno em
+    /// andamento não deve sobrescrever o status `pausada` gravado pelo
+    /// encerramento (`ativa`/`interrompida`).
+    pub encerrando: AtomicBool,
     estado: RwLock<EstadoAgente>,
 }
 
@@ -140,6 +145,30 @@ impl Compartilhado {
 
     pub fn definir_sessao(&self, sessao: EstadoSessao) {
         self.estado.write().expect("estado").sessao = sessao;
+    }
+
+    /// Cria um ramo (checkpoint) da sessão atual: histórico, plano, tarefas,
+    /// decisões e alterações de arquivo são copiados para uma sessão nova,
+    /// que passa a ser a ativa. A original é preservada.
+    pub fn ramificar(&self, titulo: Option<String>) -> anyhow::Result<()> {
+        let sessao = self.sessao();
+        let id = uuid::Uuid::new_v4().to_string();
+        let titulo = titulo
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| format!("ramo de {}", crate::util::truncate(&sessao.titulo, 50)));
+        let mensagens = self.store.branch_session(&sessao.id, &id, &titulo)?;
+        self.definir_sessao(EstadoSessao {
+            id: id.clone(),
+            titulo: titulo.clone(),
+            objetivo: sessao.objetivo.clone(),
+        });
+        self.evento(AgentEvent::Ramificada {
+            id,
+            titulo,
+            mensagens,
+        });
+        Ok(())
     }
 
     /// Atualiza o modelo e o esforço, recriando o provedor e persistindo.
@@ -253,7 +282,7 @@ impl Compartilhado {
     pub fn definir_permissao(&self, nivel: PermissionLevel) -> anyhow::Result<()> {
         {
             let mut estado = self.estado.write().expect("estado");
-            estado.config.agent.permission = nivel;
+            estado.config.definir_permissao(nivel);
             estado
                 .config
                 .save(&self.paths)
@@ -404,6 +433,11 @@ impl Compartilhado {
             store: self.store.clone(),
             session_id: self.sessao().id,
             processos: self.processos.clone(),
+            sandbox: crate::sandbox::SandboxSettings::novo(
+                config.agent.sandbox,
+                config.agent.sandbox_allow_network,
+                config.agent.sandbox_extra_writable.clone(),
+            ),
             arquivos: self.arquivos.clone(),
             eventos: self.eventos.clone(),
             confirmacoes: self.confirmacoes.clone(),
@@ -478,6 +512,7 @@ pub fn iniciar(config: Config, paths: Paths, store: Store) -> anyhow::Result<Age
         eventos: eventos_tx,
         confirmacoes: confirm_tx,
         permitidos: Arc::new(Mutex::new(HashSet::new())),
+        encerrando: AtomicBool::new(false),
         estado: RwLock::new(EstadoAgente {
             config,
             provider,
@@ -496,9 +531,17 @@ pub fn iniciar(config: Config, paths: Paths, store: Store) -> anyhow::Result<Age
     // os outros nem a abertura do Kestrel.
     if !comp.config().mcp.is_empty() {
         let comp_mcp = comp.clone();
-        let servidores = comp.config().mcp.clone();
+        let cfg_mcp = comp.config();
+        let servidores = cfg_mcp.mcp.clone();
+        let confiaveis = cfg_mcp.mcp_trusted_keys.clone();
+        let sandbox = crate::sandbox::SandboxSettings::novo(
+            cfg_mcp.agent.sandbox,
+            cfg_mcp.agent.sandbox_allow_network,
+            cfg_mcp.agent.sandbox_extra_writable.clone(),
+        );
         tokio::spawn(async move {
-            let (descobertas, avisos) = crate::tools::mcp::conectar_todos(&servidores).await;
+            let (descobertas, avisos) =
+                crate::tools::mcp::conectar_todos(&servidores, &confiaveis, &sandbox).await;
             for aviso in avisos {
                 comp_mcp.evento(AgentEvent::Aviso { mensagem: aviso });
             }
@@ -507,7 +550,7 @@ pub fn iniciar(config: Config, paths: Paths, store: Store) -> anyhow::Result<Age
                 comp_mcp.registro.write().await.registrar_mcp(descobertas);
                 comp_mcp.evento(AgentEvent::Aviso {
                     mensagem: format!(
-                        "MCP: {total} ferramentas de servidores locais disponíveis                          (nomes com prefixo `mcp__`)."
+                        "MCP: {total} ferramentas de servidores remotos/locais disponíveis                          (nomes com prefixo `mcp__`)."
                     ),
                 });
             }
@@ -720,6 +763,32 @@ impl Agente {
                                 self.retomar_sessao(&id, &mut turno_ativo, &mut cancel_atual, &fim_tx);
                             }
                         }
+                        UiCommand::Ramificar { titulo } => {
+                            if turno_ativo {
+                                self.comp.evento(AgentEvent::Aviso {
+                                    mensagem: "Há um turno em andamento. Interrompa-o (Esc) antes de criar um ramo.".into(),
+                                });
+                            } else if let Err(e) = self.comp.ramificar(titulo) {
+                                self.comp.evento(AgentEvent::Aviso {
+                                    mensagem: format!("não foi possível criar o ramo: {e}"),
+                                });
+                            }
+                        }
+                        UiCommand::RecarregarSkills => {
+                            let workdir = self.comp.config().workdir();
+                            let skills = Arc::new(SkillRegistry::discover(
+                                &self.comp.paths,
+                                &workdir,
+                            ));
+                            let total = skills.all().len();
+                            self.comp.estado.write().expect("estado").skills = skills;
+                            self.comp.evento(AgentEvent::Aviso {
+                                mensagem: format!(
+                                    "skills recarregadas: {total} disponível(is) em {}",
+                                    self.comp.paths.skills_dir().display()
+                                ),
+                            });
+                        }
                         UiCommand::AnalisarProjeto => {
                             let info = self.comp.reanalisar_projeto();
                             self.comp.evento(AgentEvent::Aviso {
@@ -745,6 +814,9 @@ impl Agente {
                             });
                         }
                         UiCommand::Encerrar => {
+                            // Marca o encerramento ANTES de cancelar: o turno
+                            // destacado não pode sobrescrever `pausada`.
+                            self.comp.encerrando.store(true, Ordering::SeqCst);
                             if let Some(c) = &cancel_atual { c.cancel(); }
                             self.comp.processos.encerrar_todos();
                             self.comp
@@ -967,10 +1039,12 @@ fn spawn_turno(
                 ),
                 recuperavel: true,
             });
-            comp_erro
-                .store
-                .update_session_status(&comp_erro.sessao().id, "interrompida")
-                .ok();
+            if !comp_erro.encerrando.load(Ordering::SeqCst) {
+                comp_erro
+                    .store
+                    .update_session_status(&comp_erro.sessao().id, "interrompida")
+                    .ok();
+            }
             comp_erro.evento(AgentEvent::TurnoConcluido {
                 resumo: format!("Turno encerrado por falha interna: {e}"),
             });
@@ -1037,6 +1111,19 @@ async fn executar_turno(
     // limite de iterações: o agente segue até terminar ou ser interrompido.
     let mut iteracoes = 0u32;
     let mut malformadas_seguidas = 0u32;
+    // Quantas chamadas da resposta atual eram malformadas (a lista é movida
+    // para o histórico antes da execução das válidas).
+    let mut malformadas_contagem: usize;
+    // Respostas interrompidas por `finish_reason: "length"`: tenta continuar
+    // algumas vezes antes de encerrar o turno como incompleto.
+    let mut continuacoes_truncadas = 0u32;
+    // Uma compactação que não reduza o contexto abaixo do orçamento não pode
+    // recomeçar o laço indefinidamente (criando sessões de continuação vazias).
+    let mut compactou_sem_chamada = false;
+    // Resumo de encerramento quando o orçamento de recuperação estoura no
+    // caminho misto (chamadas válidas + malformadas na mesma resposta): o
+    // turno só termina depois de todos os resultados irem para o histórico.
+    let mut encerrar_malformada: Option<String> = None;
 
     let resultado = 'turno: loop {
         if cancel.is_cancelled() {
@@ -1059,7 +1146,8 @@ async fn executar_turno(
         // Orçamento de contexto.
         let sistema = montar_prompt(&comp, &cfg, dossie_ativo.as_deref());
         let ferramentas = comp.registro.read().await.specs_do_modo(cfg.agent.modo);
-        let usados = context::estimar_prompt(&sistema, &historico, &ferramentas);
+        let usados =
+            context::estimar_prompt(&cfg.provider.model, &sistema, &historico, &ferramentas);
         let orcamento = context::OrcamentoContexto::novo(
             cfg.context_window(),
             cfg.agent.reserve_response_tokens,
@@ -1071,6 +1159,21 @@ async fn executar_turno(
             capacidade: cfg.context_window(),
         });
         if orcamento.precisa_compactar(usados, cfg.agent.context_compact_threshold) {
+            if compactou_sem_chamada {
+                comp.evento(AgentEvent::Erro {
+                    mensagem: "a compactação de contexto não conseguiu reduzir o histórico abaixo do orçamento (prompt de sistema, ferramentas e dossiê podem ser grandes demais).".into(),
+                    dica: Some(
+                        "reduza o número de ferramentas MCP, o tamanho do projeto ou reinicie com /nova"
+                            .into(),
+                    ),
+                    recuperavel: true,
+                });
+                break ResultadoTurno {
+                    resumo: "Turno interrompido: o contexto não cabe na janela do modelo mesmo após a compactação.".into(),
+                    concluido: false,
+                };
+            }
+            compactou_sem_chamada = true;
             comp.estado_ui("compactando contexto (dossiê de continuidade)");
             match compactar_contexto(&comp, &cfg, &historico, &cancel) {
                 Ok((dossie, novos)) => {
@@ -1106,6 +1209,7 @@ async fn executar_turno(
                 }
             }
         }
+        compactou_sem_chamada = false;
 
         comp.estado_ui("consultando o modelo");
         let mut req = ChatRequest::new(
@@ -1119,8 +1223,7 @@ async fn executar_turno(
         req.reasoning_effort = cfg.provider.reasoning_effort.clone();
 
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<StreamEvent>();
-        let provider = comp.provider();
-        let chamada = provider.chat(req, cancel.clone(), Some(delta_tx));
+        let chamada = chamar_com_fallback(&comp, &req, &cfg, &cancel, Some(delta_tx));
         tokio::pin!(chamada);
 
         let completion = loop {
@@ -1159,9 +1262,12 @@ async fn executar_turno(
         };
 
         let completion = match resultado {
-            Ok(c) => {
+            Ok((c, modelo_usado)) => {
                 // Contabilidade real: o usage vem do provedor e era descartado.
                 if let Some(uso) = c.usage {
+                    if modelo_usado == cfg.provider.model {
+                        crate::tokenizer::calibrar(&modelo_usado, uso.prompt_tokens, usados);
+                    }
                     comp.store
                         .record_usage(
                             &sessao.id,
@@ -1170,8 +1276,7 @@ async fn executar_turno(
                             uso.reasoning_tokens,
                         )
                         .ok();
-                    tokens_gerados_turno +=
-                        u64::from(uso.completion_tokens) + u64::from(uso.reasoning_tokens);
+                    tokens_gerados_turno += tokens_gerados(&uso);
                     comp.evento(AgentEvent::Tokens {
                         prompt: uso.prompt_tokens,
                         completion: uso.completion_tokens,
@@ -1250,6 +1355,57 @@ async fn executar_turno(
         ));
 
         if tool_calls.is_empty() {
+            // `length` significa que o modelo foi cortado pelo limite de
+            // tokens: tratar como resposta concluída entregava um texto pela
+            // metade como sucesso.
+            match completion.finish_reason.as_str() {
+                "length" if continuacoes_truncadas < 2 => {
+                    continuacoes_truncadas += 1;
+                    let aviso = "[sistema] A resposta anterior foi truncada pelo limite de tokens. \
+                                 Continue exatamente de onde parou, sem repetir o que já foi escrito.";
+                    comp.evento(AgentEvent::Erro {
+                        mensagem:
+                            "a resposta foi truncada pelo limite de tokens; pedindo continuação"
+                                .into(),
+                        dica: Some(
+                            "aumente `max_tokens` na configuração se isso se repetir".into(),
+                        ),
+                        recuperavel: true,
+                    });
+                    comp.store
+                        .append_message(&sessao.id, "user", aviso, None, None, None, None)?;
+                    historico.push(ChatMessage::user(aviso));
+                    continue;
+                }
+                "length" => {
+                    comp.evento(AgentEvent::Erro {
+                        mensagem: "a resposta continuou sendo truncada pelo limite de tokens"
+                            .into(),
+                        dica: Some(
+                            "aumente `max_tokens` na configuração ou peça uma resposta menor"
+                                .into(),
+                        ),
+                        recuperavel: true,
+                    });
+                    break ResultadoTurno {
+                        resumo: "Turno encerrado: resposta truncada pelo limite de tokens.".into(),
+                        concluido: false,
+                    };
+                }
+                "content_filter" => {
+                    comp.evento(AgentEvent::Erro {
+                        mensagem: "o provedor interrompeu a resposta por filtro de conteúdo".into(),
+                        dica: Some("reformule a instrução".into()),
+                        recuperavel: true,
+                    });
+                    break ResultadoTurno {
+                        resumo: "Turno encerrado: resposta bloqueada pelo filtro de conteúdo do provedor."
+                            .into(),
+                        concluido: false,
+                    };
+                }
+                _ => {}
+            }
             recuperacao.limpar();
             break ResultadoTurno {
                 resumo: resumo_turno(&comp, &sessao.id),
@@ -1258,32 +1414,76 @@ async fn executar_turno(
         }
 
         // Valida os argumentos de todas as chamadas antes de executar qualquer uma.
+        if completion.finish_reason != "length" {
+            continuacoes_truncadas = 0;
+        }
         let (validas, malformadas) = separar_chamadas(tool_calls);
-        if validas.is_empty() && !malformadas.is_empty() {
+        // Chamadas malformadas gastam o orçamento de recuperação em QUALQUER
+        // caminho — inclusive quando a mesma resposta também traz chamadas
+        // válidas. Antes só o ramo "todas malformadas" registrava tentativa: no
+        // ramo misto `malformadas_seguidas` era zerada e nada era contabilizado,
+        // então um modelo que estoura `max_tokens` no meio dos argumentos
+        // repetia a mesma resposta para sempre (a chamada válida executava, o
+        // erro de JSON voltava no histórico e o ciclo recomeçava) — sem
+        // `AgentEvent::Erro`, gastando tokens até o usuário apertar Esc.
+        if !malformadas.is_empty() {
             malformadas_seguidas += 1;
+            malformadas_contagem = malformadas.len();
             let classe = recovery::Classificacao::RespostaMalformada;
-            let diag = recuperacao.diagnosticar(classe);
-            // Primeiro os `tool` results, depois o pedido de nova resposta: a
-            // API exige um resultado para cada `tool_call` já gravado.
+            // Primeiro os `tool` results das chamadas malformadas: a API exige
+            // um resultado para cada `tool_call` já gravado.
             registrar_malformadas(&comp, &sessao, &mut historico, malformadas)?;
-            comp.store.append_message(
-                &sessao.id,
-                "user",
-                "[sistema] A resposta anterior continha chamadas de ferramenta malformadas. Responda novamente com JSON válido.",
-                None,
-                None,
-                None,
-                None,
-            )?;
-            historico.push(ChatMessage::user(
-                "[sistema] As chamadas de ferramenta anteriores estavam malformadas (JSON inválido). \
-                 Rejeite-as e produza novas chamadas com argumentos JSON válidos.",
-            ));
-            if let Err(limite) = recuperacao.registrar_tentativa(classe, "nova resposta solicitada")
+            if validas.is_empty() {
+                let diag = recuperacao.diagnosticar(classe);
+                comp.store.append_message(
+                    &sessao.id,
+                    "user",
+                    "[sistema] A resposta anterior continha chamadas de ferramenta malformadas. Responda novamente com JSON válido.",
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+                historico.push(ChatMessage::user(
+                    "[sistema] As chamadas de ferramenta anteriores estavam malformadas (JSON inválido). \
+                     Rejeite-as e produza novas chamadas com argumentos JSON válidos.",
+                ));
+                if let Err(limite) =
+                    recuperacao.registrar_tentativa(classe, "nova resposta solicitada")
+                {
+                    comp.evento(AgentEvent::Erro {
+                        mensagem: format!(
+                            "O modelo enviou {} respostas malformadas seguidas ({}). Recuperação automática encerrada.\n\
+                             Tentativas: {} em {:.1}s.\nEstratégias tentadas: {}.\n\
+                             Próxima ação recomendada: verifique se o modelo selecionado \
+                             realmente suporta chamadas de ferramentas (veja /model) ou escolha outro modelo.",
+                            malformadas_seguidas,
+                            limite.classificacao.label(),
+                            limite.tentativas,
+                            limite.tempo_gasto.as_secs_f64(),
+                            if limite.estrategias.is_empty() { "(nenhuma)".to_string() } else { limite.estrategias.join("; ") }
+                        ),
+                        dica: Some("use /model para ver as capacidades conhecidas de cada modelo".into()),
+                        recuperavel: false,
+                    });
+                    break ResultadoTurno {
+                        resumo: "Encerrado por respostas malformadas do modelo.".into(),
+                        concluido: false,
+                    };
+                }
+                let _ = diag;
+                continue;
+            }
+            // Ramo misto: as chamadas válidas rodam normalmente e o erro das
+            // malformadas já está no histórico; a tentativa é contabilizada e,
+            // ao estourar o orçamento, o turno acaba (depois de persistir os
+            // resultados das chamadas válidas).
+            if let Err(limite) = recuperacao
+                .registrar_tentativa(classe, "chamada malformada junto de chamada válida")
             {
                 comp.evento(AgentEvent::Erro {
                     mensagem: format!(
-                        "O modelo enviou {} respostas malformadas seguidas ({}). Recuperação automática encerrada.\n\
+                        "O modelo enviou {} respostas com chamadas malformadas ({}). Recuperação automática encerrada.\n\
                          Tentativas: {} em {:.1}s.\nEstratégias tentadas: {}.\n\
                          Próxima ação recomendada: verifique se o modelo selecionado \
                          realmente suporta chamadas de ferramentas (veja /model) ou escolha outro modelo.",
@@ -1296,25 +1496,25 @@ async fn executar_turno(
                     dica: Some("use /model para ver as capacidades conhecidas de cada modelo".into()),
                     recuperavel: false,
                 });
-                break ResultadoTurno {
-                    resumo: "Encerrado por respostas malformadas do modelo.".into(),
-                    concluido: false,
-                };
+                encerrar_malformada = Some(format!(
+                    "Recuperação automática encerrada para {} ({} tentativas em {:.1}s).",
+                    limite.classificacao.label(),
+                    limite.tentativas,
+                    limite.tempo_gasto.as_secs_f64()
+                ));
             }
-            let _ = diag;
-            continue;
+        } else {
+            malformadas_seguidas = 0;
+            malformadas_contagem = 0;
         }
-        malformadas_seguidas = 0;
 
         // Executa as chamadas. O contexto é recriado aqui (e não no início do
         // turno) para refletir sessão ativa, nível, modo e raízes atuais —
         // inclusive depois de uma compactação ou de /permission no meio do turno.
+        let total_chamadas = validas.len() + malformadas_contagem;
         let mut ctx_ferramentas = comp.contexto_ferramentas(cancel.clone());
         ctx_ferramentas.subagente = Some(Compartilhado::novo_subagente(&comp));
-        comp.estado_ui(format!(
-            "executando {} ferramenta(s)",
-            validas.len() + malformadas.len()
-        ));
+        comp.estado_ui(format!("executando {total_chamadas} ferramenta(s)"));
         let resultados =
             executar_chamadas(&comp, &ctx_ferramentas, &validas, &mut recuperacao).await;
 
@@ -1388,15 +1588,22 @@ async fn executar_turno(
                 resumo: crate::util::redact_secrets(&resumo),
                 adicoes,
                 remocoes,
-                diff: crate::util::redact_secrets(&conteudo),
+                diff: diff_para_interface(&conteudo, adicoes, remocoes),
             });
         }
 
-        // Chamadas malformadas viram resultados de erro para o modelo corrigir.
-        registrar_malformadas(&comp, &sessao, &mut historico, malformadas)?;
+        // As chamadas malformadas desta resposta já foram registradas antes da
+        // execução (a API exige um resultado para cada `tool_call`).
 
         // Só depois de persistir e devolver todos os resultados é que o turno
         // termina — nunca no meio do laço.
+        if let Some(resumo) = encerrar_malformada {
+            break 'turno ResultadoTurno {
+                resumo,
+                concluido: false,
+            };
+        }
+
         if let Some(resumo) = encerrar {
             break 'turno ResultadoTurno {
                 resumo,
@@ -1418,7 +1625,11 @@ async fn executar_turno(
     comp.store.touch_session(&sessao.id).ok();
     let duracao = inicio.elapsed();
     if resultado.concluido {
-        comp.store.update_session_status(&sessao.id, "ativa").ok();
+        // Se o aplicativo foi encerrado (/quit), o status `pausada` gravado
+        // pelo encerramento não pode ser sobrescrito pelo turno.
+        if !comp.encerrando.load(Ordering::SeqCst) {
+            comp.store.update_session_status(&sessao.id, "ativa").ok();
+        }
         let segundos = duracao.as_secs_f64().max(0.001);
         let velocidade = tokens_gerados_turno as f64 / segundos;
         comp.evento(AgentEvent::TurnoConcluido {
@@ -1431,9 +1642,11 @@ async fn executar_turno(
             ),
         });
     } else if cancel.is_cancelled() {
-        comp.store
-            .update_session_status(&sessao.id, "interrompida")
-            .ok();
+        if !comp.encerrando.load(Ordering::SeqCst) {
+            comp.store
+                .update_session_status(&sessao.id, "interrompida")
+                .ok();
+        }
         comp.evento(AgentEvent::Interrompido {
             resumo: resultado.resumo,
         });
@@ -1598,6 +1811,72 @@ fn carregar_historico(comp: &Compartilhado, sessao: &str, limite: usize) -> Vec<
 }
 
 /// Compacta o contexto: gera o dossiê e cria uma nova sessão de continuação.
+/// Modelos a tentar numa chamada, na ordem: o principal e depois os fallbacks
+/// configurados, sem repetições nem entradas vazias.
+fn modelos_de_chamada(cfg: &Config) -> Vec<String> {
+    let mut modelos = Vec::new();
+    if !cfg.provider.model.trim().is_empty() {
+        modelos.push(cfg.provider.model.trim().to_string());
+    }
+    for modelo in &cfg.provider.fallback_models {
+        let modelo = modelo.trim();
+        if !modelo.is_empty() && !modelos.iter().any(|m| m == modelo) {
+            modelos.push(modelo.to_string());
+        }
+    }
+    modelos
+}
+
+/// Chama o provedor com fallback entre modelos.
+///
+/// O primeiro modelo mantém o streaming ao vivo. Se ele falhar de um jeito que
+/// outro modelo pode resolver (indisponível, limite, rede, 5xx), as tentativas
+/// seguintes rodam sem `sink`: o texto parcial não se mistura e a resposta
+/// final substitui o bloco por inteiro. O modelo escolhido no disco não muda.
+async fn chamar_com_fallback(
+    comp: &Arc<Compartilhado>,
+    req: &ChatRequest,
+    cfg: &Config,
+    cancel: &CancellationToken,
+    sink: Option<mpsc::UnboundedSender<StreamEvent>>,
+) -> Result<(Completion, String), ProviderError> {
+    let modelos = modelos_de_chamada(cfg);
+    let provider = comp.provider();
+    let mut ultimo: Option<ProviderError> = None;
+    for (indice, modelo) in modelos.iter().enumerate() {
+        if indice > 0 {
+            let anterior = &modelos[indice - 1];
+            comp.evento(AgentEvent::Aviso {
+                mensagem: format!(
+                    "modelo `{anterior}` falhou; tentando fallback `{modelo}` para este turno"
+                ),
+            });
+            comp.store
+                .record_decision(
+                    &comp.sessao().id,
+                    "fallback/modelo",
+                    &format!("{anterior} → {modelo}"),
+                    None,
+                )
+                .ok();
+        }
+        let mut tentativa = req.clone();
+        tentativa.model = modelo.clone();
+        let sink_tentativa = if indice == 0 { sink.clone() } else { None };
+        match provider
+            .chat(tentativa, cancel.clone(), sink_tentativa)
+            .await
+        {
+            Ok(completion) => return Ok((completion, modelo.clone())),
+            Err(erro) if erro.permite_fallback() && indice + 1 < modelos.len() => {
+                ultimo = Some(erro);
+            }
+            Err(erro) => return Err(erro),
+        }
+    }
+    Err(ultimo.unwrap_or_else(|| ProviderError::ModeloIndisponivel(cfg.provider.model.clone())))
+}
+
 fn compactar_contexto(
     comp: &Compartilhado,
     cfg: &Config,
@@ -1637,7 +1916,7 @@ fn compactar_contexto(
         .ok();
     comp.store.set_context_state(
         &sessao.id,
-        context::estimar_prompt("", historico, &[]),
+        context::estimar_prompt(&cfg.provider.model, "", historico, &[]),
         cfg.context_window(),
         Some(&texto_dossie),
     )?;
@@ -1669,12 +1948,31 @@ fn compactar_contexto(
     if cancel.is_cancelled() {
         anyhow::bail!("cancelado durante a compactação");
     }
-    Ok((
-        texto_dossie.clone(),
-        vec![ChatMessage::user(format!(
-            "Continue o trabalho a partir do dossiê a seguir. Confirme o estado real do projeto antes de agir.\n\n{texto_dossie}"
-        ))],
-    ))
+    // Mantém as últimas mensagens de conversa (sem tool calls) junto do
+    // dossiê: o resumo determinístico preserva o estado do projeto, mas perde
+    // o fio imediato do diálogo. Quatro mensagens curtas dão continuidade sem
+    // devolver o contexto que acabou de ser compactado.
+    let recentes: Vec<ChatMessage> = historico
+        .iter()
+        .rev()
+        .filter(|m| {
+            matches!(
+                m.role,
+                crate::provider::Role::User | crate::provider::Role::Assistant
+            ) && m.tool_calls.is_empty()
+                && !m.content.trim().is_empty()
+        })
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let mut novos = vec![ChatMessage::user(format!(
+        "Continue o trabalho a partir do dossiê a seguir. Confirme o estado real do projeto antes de agir.\n\n{texto_dossie}"
+    ))];
+    novos.extend(recentes);
+    Ok((texto_dossie.clone(), novos))
 }
 
 /// Separa chamadas válidas das malformadas.
@@ -1715,10 +2013,26 @@ fn separar_chamadas(chamadas: Vec<ToolCall>) -> (Vec<ToolCall>, Vec<(ToolCall, S
 /// Só paraleliza operações de leitura, ou escritas em caminhos distintos;
 /// duas chamadas que tocam o mesmo caminho (ou ferramentas sensíveis) são
 /// executadas em sequência, na ordem pedida pelo modelo.
-fn pode_paralelizar(chamadas: &[ToolCall]) -> bool {
+fn pode_paralelizar(chamadas: &[ToolCall], workdir: &std::path::Path) -> bool {
     if chamadas.len() < 2 {
         return false;
     }
+    // Comparar caminhos crus deixava `a.rs` e `./a.rs` (ou o caminho absoluto)
+    // passarem como alvos distintos e rodarem juntos.
+    let normalizar = |caminho: &str| {
+        let caminho = std::path::Path::new(caminho);
+        let absoluto = if caminho.is_absolute() {
+            caminho.to_path_buf()
+        } else {
+            workdir.join(caminho)
+        };
+        crate::util::normalize_path(&absoluto)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let tem_escrita = chamadas
+        .iter()
+        .any(|c| crate::perm::tool_risk(&c.name) == ToolRisk::Escrita);
     let mut caminhos = HashSet::new();
     for chamada in chamadas {
         let risco = crate::perm::tool_risk(&chamada.name);
@@ -1727,13 +2041,15 @@ fn pode_paralelizar(chamadas: &[ToolCall]) -> bool {
         }
         match caminho_da_chamada(chamada) {
             Some(caminho) => {
-                if !caminhos.insert(caminho) {
+                if !caminhos.insert(normalizar(&caminho)) {
                     return false;
                 }
             }
             None => {
-                // Sem caminho explícito, só leituras são seguras em paralelo.
-                if risco == ToolRisk::Escrita {
+                // Sem caminho explícito, só leituras são seguras em paralelo —
+                // e nunca junto de uma escrita, porque ferramentas como
+                // `git_diff` observam o repositório inteiro.
+                if risco == ToolRisk::Escrita || (tem_escrita && risco == ToolRisk::Leitura) {
                     return false;
                 }
             }
@@ -1770,7 +2086,7 @@ async fn executar_chamadas(
         });
     }
 
-    let paralelo = pode_paralelizar(chamadas);
+    let paralelo = pode_paralelizar(chamadas, &ctx.workdir);
     let mut resultados: Vec<(ToolCall, ResultadoFerramenta)> = Vec::new();
 
     if paralelo {
@@ -1830,12 +2146,16 @@ async fn executar_chamadas(
                     maximo,
                 });
             }
-        } else if recuperacao.estrategia_repetida(
-            recovery::classificar(Some(&chamada.name), "", false),
-            &format!("{} {}", chamada.name, detalhe_chamada(chamada)),
-        ) {
-            // Estratégia que já havia falhado agora funcionou: resolve o incidente.
-            recuperacao.resolver(recovery::classificar(Some(&chamada.name), "", false));
+        } else {
+            // A mesma chamada que já tinha falhado agora deu certo: o incidente
+            // é resolvido pela ESTRATÉGIA, não pela classe. A classe da falha
+            // depende da mensagem ("error[E0308]" → `Compilacao`) e uma chamada
+            // bem-sucedida não tem mensagem: classificar de novo com "" caía em
+            // `ExecucaoFerramenta` e o incidente real sobrevivia — depois de
+            // várias falhas corrigidas uma a uma, o turno morria com "Limite de
+            // recuperação automática atingido".
+            let estrategia = format!("{} {}", chamada.name, detalhe_chamada(chamada));
+            recuperacao.resolver_por_estrategia(&estrategia);
         }
     }
 
@@ -1888,6 +2208,39 @@ fn detalhe_chamada(chamada: &ToolCall) -> String {
         .unwrap_or_else(|| chamada.name.clone())
 }
 
+/// Tokens contados como geração do turno — a base da taxa de tok/s do rodapé.
+///
+/// Só `completion_tokens`: `reasoning_tokens` é o detalhe de raciocínio já
+/// contido dentro dele (o `SessionStats::total_tokens` também soma apenas
+/// prompt + completion). Somar os dois inflava a taxa exibida — 75% a mais
+/// num modelo que raciocina bastante.
+fn tokens_gerados(uso: &crate::provider::Usage) -> u64 {
+    u64::from(uso.completion_tokens)
+}
+
+/// Conteúdo que a interface pode pintar como diff.
+///
+/// A interface classifica linha a linha o que chega em `FerramentaConcluida`
+/// (`diff`): `+` vira adição, `-` vira remoção. Enviar a saída bruta de
+/// qualquer ferramenta fazia `run_command "cargo test"` (com `---- stdout
+/// ----`, `failures:` e listas `-`) e `read_file` de YAML aparecerem como
+/// remoções e adições de arquivo. Só entra aqui o que é diff de verdade:
+/// - a ferramenta declarou linhas alteradas (`com_diff`: escrita/edição/remoção);
+/// - ou a saída já é um diff unificado (`git_diff`), que não declara contagem.
+fn diff_para_interface(conteudo: &str, adicoes: usize, remocoes: usize) -> String {
+    if adicoes > 0 || remocoes > 0 || parece_diff_unificado(conteudo) {
+        return crate::util::redact_secrets(conteudo);
+    }
+    String::new()
+}
+
+/// A saída tem a forma de um diff unificado (`diff --git`/bloco `@@`).
+fn parece_diff_unificado(conteudo: &str) -> bool {
+    conteudo
+        .lines()
+        .any(|l| l.starts_with("diff --git") || l.starts_with("@@"))
+}
+
 /// Resumo exibido no bloco `◇` ao fim do turno.
 ///
 /// Ele **não** repete a resposta do agente: o texto completo já está no bloco
@@ -1919,7 +2272,21 @@ impl SubagentRunner for ExecutorSubagente {
         cancel: CancellationToken,
         eventos: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<String, String> {
-        executar_subagente_interno(self.comp.clone(), tarefa, contexto, cancel, eventos).await
+        let resultado = executar_subagente_interno(
+            self.comp.clone(),
+            tarefa,
+            contexto,
+            cancel,
+            eventos.clone(),
+        )
+        .await;
+        // Um único evento de conclusão, com o resultado real: antes ele era
+        // emitido dentro do laço a cada rodada de ferramentas, fechando o grupo
+        // como sucesso mesmo quando o subagente ainda trabalhava (ou falhava).
+        let _ = eventos.send(AgentEvent::SubagenteConcluido {
+            sucesso: resultado.is_ok(),
+        });
+        resultado
     }
 }
 
@@ -1962,6 +2329,24 @@ fn registrar_malformadas(
         });
     }
     Ok(())
+}
+
+/// Anuncia na interface uma chamada do subagente — uma vez por chamada.
+///
+/// O `id` é o da chamada do modelo: com ele a conclusão casa o bloco certo
+/// mesmo com duas ferramentas de mesmo nome na mesma rodada.
+fn anunciar_chamada_subagente(
+    eventos: &mpsc::UnboundedSender<AgentEvent>,
+    rotulo: &str,
+    tarefa: &str,
+    chamada: &ToolCall,
+) {
+    let _ = eventos.send(AgentEvent::FerramentaIniciada {
+        id: Some(chamada.id.clone()),
+        nome: format!("subagente:{}", chamada.name),
+        detalhe: tarefa.to_string(),
+        subagente: Some(rotulo.to_string()),
+    });
 }
 
 /// Ferramentas disponíveis para subagentes (sem planejamento nem recursão).
@@ -2023,6 +2408,7 @@ async fn executar_subagente_interno(
         tarefa: tarefa.to_string(),
     });
 
+    let mut esgotou_rodadas = true;
     for _ in 0..12 {
         if cancel.is_cancelled() {
             return Err("subagente cancelado".into());
@@ -2045,14 +2431,12 @@ async fn executar_subagente_interno(
                 _ = cancel.cancelled() => return Err("subagente cancelado".into()),
                 resultado = &mut chamada => break resultado,
                 Some(evento) = delta_rx.recv() => {
-                    if let StreamEvent::ToolCall { name: Some(nome), .. } = evento {
-                        let _ = eventos.send(AgentEvent::FerramentaIniciada {
-                            id: None,
-                            nome: format!("subagente:{nome}"),
-                            detalhe: tarefa.to_string(),
-                            subagente: Some(rotulo.clone()),
-                        });
-                    }
+                    // Deltas parciais não anunciam bloco: os provedores
+                    // repetem `function.name` em cada fragmento e a UI
+                    // empilhava vários blocos "em execução" eternos. O anúncio
+                    // (com o id da chamada) sai uma vez, na execução —
+                    // exatamente como no caminho do agente principal.
+                    let _ = evento;
                 }
             }
         };
@@ -2066,17 +2450,21 @@ async fn executar_subagente_interno(
             chamadas_para_historico(&completion.tool_calls),
         ));
         if validas.is_empty() && malformadas.is_empty() {
+            esgotou_rodadas = false;
             break;
         }
-        let _ = eventos.send(AgentEvent::SubagenteConcluido { sucesso: true });
+        // Um bloco por chamada, anunciado uma única vez e com o id da chamada
+        // (o caminho do agente principal faz o mesmo em `executar_chamadas`):
+        // antes o anúncio saía a cada delta parcial do stream e a conclusão
+        // chegava uma vez com `id: None`, sobrando blocos "em execução" eternos.
+        for chamada in malformadas.iter().map(|(c, _)| c).chain(&validas) {
+            anunciar_chamada_subagente(&eventos, &rotulo, tarefa, chamada);
+        }
         // Chamadas malformadas também precisam de um `tool` result: sem ele o
         // histórico fica inválido para a próxima requisição.
         for (chamada, erro) in malformadas {
-            // A interface recebeu `FerramentaIniciada` para esta chamada ao
-            // acompanhar o stream; sem a conclusão correspondente o bloco
-            // ficaria girando para sempre.
             let _ = eventos.send(AgentEvent::FerramentaConcluida {
-                id: None,
+                id: Some(chamada.id.clone()),
                 nome: format!("subagente:{}", chamada.name),
                 sucesso: false,
                 resumo: format!("argumentos inválidos: {}", crate::util::truncate(&erro, 80)),
@@ -2097,7 +2485,7 @@ async fn executar_subagente_interno(
             // spawn_subagent).
             if !FERRAMENTAS_SUBAGENTE.contains(&chamada.name.as_str()) {
                 let _ = eventos.send(AgentEvent::FerramentaConcluida {
-                    id: None,
+                    id: Some(chamada.id.clone()),
                     nome: format!("subagente:{}", chamada.name),
                     sucesso: false,
                     resumo: "ferramenta indisponível para subagentes".into(),
@@ -2148,13 +2536,15 @@ async fn executar_subagente_interno(
                 ),
             };
             let _ = eventos.send(AgentEvent::FerramentaConcluida {
-                id: None,
+                id: Some(chamada.id.clone()),
                 nome: format!("subagente:{}", chamada.name),
                 sucesso,
                 resumo: crate::util::redact_secrets(&resumo),
                 adicoes,
                 remocoes,
-                diff: String::new(),
+                // A saída da ferramenta não é diff: o conteúdo bruto pintado
+                // como diff mostraria listas `-` da saída como remoções.
+                diff: diff_para_interface(&texto, adicoes, remocoes),
             });
             // Segredos não podem voltar ao modelo nem ao relatório.
             let texto = crate::util::redact_secrets(&texto);
@@ -2164,6 +2554,11 @@ async fn executar_subagente_interno(
                 texto,
             ));
         }
+    }
+    if esgotou_rodadas {
+        // Retornar o último texto como relatório de sucesso escondia que o
+        // subagente parou no meio de uma sequência de ferramentas.
+        return Err("o subagente atingiu o limite de 12 rodadas sem concluir a tarefa".into());
     }
     if relatorio.trim().is_empty() {
         Err("o subagente terminou sem produzir relatório".into())
@@ -2365,6 +2760,8 @@ mod tests {
     fn ambiente_de_teste(store: Store, ajuste: impl FnOnce(&mut Config)) -> Ambiente {
         let mut cfg = Config::default();
         cfg.provider.model = "modelo/teste".into();
+        // Testes não devem depender de Landlock do kernel hospedeiro.
+        cfg.agent.sandbox = crate::config::SandboxMode::Off;
         ajuste(&mut cfg);
         let (eventos_tx, eventos) = mpsc::unbounded_channel();
         let (confirmacoes_tx, confirmacoes) = mpsc::unbounded_channel();
@@ -2377,6 +2774,7 @@ mod tests {
             eventos: eventos_tx,
             confirmacoes: confirmacoes_tx,
             permitidos: Arc::new(Mutex::new(HashSet::new())),
+            encerrando: AtomicBool::new(false),
             estado: RwLock::new(EstadoAgente {
                 provider: Arc::new(ProvedorFalso),
                 projeto: Arc::new(ProjectInfo::default()),
@@ -2519,10 +2917,19 @@ mod tests {
                 .expect("roteiro")
                 .pop_front()
                 .expect("o provedor roteirizado não tem mais respostas");
-            if let Some(sink) = sink
-                && !resposta.text.is_empty()
-            {
-                let _ = sink.send(StreamEvent::Texto(resposta.text.clone()));
+            if let Some(sink) = sink {
+                if !resposta.text.is_empty() {
+                    let _ = sink.send(StreamEvent::Texto(resposta.text.clone()));
+                }
+                // provedores reais repetem `function.name` a cada fragmento da
+                // chamada: dois deltas para a mesma chamada, de propósito.
+                for chamada in &resposta.tool_calls {
+                    for _ in 0..2 {
+                        let _ = sink.send(StreamEvent::ToolCall {
+                            name: Some(chamada.name.clone()),
+                        });
+                    }
+                }
             }
             Ok(resposta)
         }
@@ -2551,36 +2958,90 @@ mod tests {
         }
     }
 
+    /// `reasoning_tokens` é detalhe dentro de `completion_tokens`: somá-los
+    /// inflava a taxa de tok/s do rodapé do turno.
+    #[test]
+    fn taxa_de_tokens_conta_so_a_geracao() {
+        let uso = crate::provider::Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 40,
+            reasoning_tokens: 70,
+        };
+        assert_eq!(tokens_gerados(&uso), 40);
+        assert_eq!(
+            tokens_gerados(&crate::provider::Usage::default()),
+            0,
+            "resposta sem usage não deveria inventar tokens"
+        );
+    }
+
+    #[test]
+    fn modelos_de_chamada_incluem_fallbacks_sem_duplicar() {
+        let mut cfg = Config::default();
+        cfg.provider.model = "principal".into();
+        cfg.provider.fallback_models = vec![
+            " reserva ".into(),
+            "principal".into(),
+            "".into(),
+            "outra".into(),
+        ];
+        assert_eq!(
+            modelos_de_chamada(&cfg),
+            vec!["principal", "reserva", "outra"]
+        );
+        cfg.provider.model.clear();
+        // "principal" continua na lista porque foi declarado como fallback;
+        // só o modelo ativo vazio não entra.
+        assert_eq!(
+            modelos_de_chamada(&cfg),
+            vec!["reserva", "principal", "outra"]
+        );
+    }
+
     #[test]
     fn paralelismo_respeita_risco_e_arquivos() {
+        let raiz = std::path::Path::new("/projeto");
         let leitura = |id: &str, path: &str| ToolCall {
             id: id.into(),
             name: "read_file".into(),
             arguments: json!({"path": path}).to_string(),
         };
-        assert!(pode_paralelizar(&[
-            leitura("1", "a.rs"),
-            leitura("2", "b.rs")
-        ]));
-        assert!(!pode_paralelizar(&[
-            leitura("1", "a.rs"),
-            leitura("2", "a.rs")
-        ]));
+        assert!(pode_paralelizar(
+            &[leitura("1", "a.rs"), leitura("2", "b.rs")],
+            raiz
+        ));
+        assert!(!pode_paralelizar(
+            &[leitura("1", "a.rs"), leitura("2", "a.rs")],
+            raiz
+        ));
+        assert!(!pode_paralelizar(
+            &[leitura("1", "a.rs"), leitura("2", "./a.rs")],
+            raiz
+        ));
         let mut escrita = leitura("3", "b.rs");
         escrita.name = "write_file".into();
-        assert!(pode_paralelizar(&[leitura("1", "a.rs"), escrita.clone()]));
+        assert!(pode_paralelizar(
+            &[leitura("1", "a.rs"), escrita.clone()],
+            raiz
+        ));
         let mut escrita_mesmo_caminho = leitura("4", "a.rs");
         escrita_mesmo_caminho.name = "edit_file".into();
-        assert!(!pode_paralelizar(&[
-            leitura("1", "a.rs"),
-            escrita_mesmo_caminho
-        ]));
+        assert!(!pode_paralelizar(
+            &[leitura("1", "a.rs"), escrita_mesmo_caminho],
+            raiz
+        ));
         let comando = ToolCall {
             id: "5".into(),
             name: "run_command".into(),
             arguments: json!({"comando": "ls"}).to_string(),
         };
-        assert!(!pode_paralelizar(&[leitura("1", "a.rs"), comando]));
+        assert!(!pode_paralelizar(&[leitura("1", "a.rs"), comando], raiz));
+        let git_diff = ToolCall {
+            id: "6".into(),
+            name: "git_diff".into(),
+            arguments: json!({}).to_string(),
+        };
+        assert!(!pode_paralelizar(&[escrita.clone(), git_diff], raiz));
     }
 
     #[test]
@@ -2675,6 +3136,153 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Os provedores repetem `function.name` a cada delta parcial do stream.
+    /// O subagente anunciava um bloco por delta e a conclusão chegava uma vez
+    /// com `id: None`: sobravam blocos "em execução" eternos na conversa.
+    #[tokio::test]
+    async fn subagente_anuncia_cada_chamada_uma_unica_vez() {
+        let dir = dir_de_teste("subagente-anuncio");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_session(
+                "s",
+                &dir.display().to_string(),
+                "t",
+                "modelo/teste",
+                None,
+                "full",
+                None,
+            )
+            .unwrap();
+        let ambiente = ambiente_de_teste(store, |cfg| {
+            cfg.agent.workdir = Some(dir.clone());
+            cfg.agent.pin_workdir = true;
+            cfg.agent.permission = PermissionLevel::Full;
+        });
+        usar_roteiro(
+            &ambiente,
+            vec![
+                chamada("c1", "list_files", json!({"path": "."})),
+                resposta("relatório do subagente"),
+            ],
+        );
+        let (eventos_tx, mut eventos) = mpsc::unbounded_channel();
+        executar_subagente_interno(
+            ambiente.comp.clone(),
+            "listar arquivos",
+            "",
+            CancellationToken::new(),
+            eventos_tx,
+        )
+        .await
+        .unwrap();
+
+        let mut iniciadas = 0;
+        let mut concluidas = 0;
+        while let Ok(evento) = eventos.try_recv() {
+            match evento {
+                AgentEvent::FerramentaIniciada { nome, id, .. }
+                    if nome == "subagente:list_files" =>
+                {
+                    assert!(
+                        id.is_some(),
+                        "o anúncio precisa do id da chamada para casar com a conclusão"
+                    );
+                    iniciadas += 1;
+                }
+                AgentEvent::FerramentaConcluida { nome, .. } if nome == "subagente:list_files" => {
+                    concluidas += 1;
+                }
+                _ => {}
+            }
+        }
+        // Um anúncio e uma conclusão, mesmo com dois deltas de stream.
+        assert_eq!(iniciadas, 1, "a chamada foi anunciada mais de uma vez");
+        assert_eq!(concluidas, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A classe da falha depende da mensagem (`error[E0308]` → compilação) e o
+    /// sucesso não tem mensagem: resolver o incidente pela classe do sucesso
+    /// deixava o incidente real aberto, e o turno morria por "Limite de
+    /// recuperação automática atingido" com falhas já corrigidas.
+    #[tokio::test]
+    async fn falha_corrigida_restaura_o_orcamento_de_recuperacao() {
+        let dir = dir_de_teste("orcamento-recuperacao");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_session(
+                "s",
+                &dir.display().to_string(),
+                "t",
+                "modelo/teste",
+                None,
+                "full",
+                None,
+            )
+            .unwrap();
+        let mut ambiente = ambiente_de_teste(store, |cfg| {
+            cfg.agent.workdir = Some(dir.clone());
+            cfg.agent.pin_workdir = true;
+            cfg.agent.permission = PermissionLevel::Full;
+            // Orçamento curto de propósito: duas tentativas por incidente.
+            cfg.agent.recovery_max_attempts = 2;
+            cfg.agent.recovery_timeout_secs = 600;
+        });
+        // Falha na primeira chamada, passa na segunda (mesma estratégia) e
+        // volta a falhar na terceira — que só é permitida porque o incidente
+        // foi resolvido no acerto.
+        let comando = "n=$(cat contador 2>/dev/null || echo 0); n=$((n+1)); echo $n > contador; \
+                       if [ $n -eq 2 ]; then echo compilou; else echo \"error[E0308]: falha $n\"; exit 1; fi";
+        usar_roteiro(
+            &ambiente,
+            vec![
+                chamada("c1", "run_command", json!({"comando": comando})),
+                chamada("c2", "run_command", json!({"comando": comando})),
+                chamada("c3", "run_command", json!({"comando": comando})),
+                resposta("compilou e segui"),
+            ],
+        );
+
+        executar_turno(
+            ambiente.comp.clone(),
+            "compile o projeto".into(),
+            false,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let eventos = drenar_eventos(&mut ambiente);
+        // Nenhuma das falhas deveria encerrar o turno por limite de recuperação.
+        for evento in &eventos {
+            if let AgentEvent::Erro { mensagem, .. } = evento {
+                assert!(
+                    !mensagem.contains("Limite de recuperação"),
+                    "o turno morreu por limite de recuperação: {mensagem}"
+                );
+            }
+        }
+        assert!(
+            eventos
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnoConcluido { .. })),
+            "o turno deveria ter sido concluído"
+        );
+        // As três execuções aconteceram (o orçamento foi restaurado no acerto).
+        let ferramentas = ambiente
+            .comp
+            .store
+            .recent_messages("s", 100)
+            .unwrap()
+            .iter()
+            .filter(|m| m.role == "tool" && m.tool_name.as_deref() == Some("run_command"))
+            .count();
+        assert_eq!(ferramentas, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ------------------------------------------------- testes de ponta a ponta
 
     #[tokio::test]
@@ -2733,6 +3341,95 @@ mod tests {
         assert!(mensagens[2].content.contains("conteudo-de-teste"));
         assert!(mensagens[3].content.contains("conteudo-de-teste"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fallback_troca_de_modelo_sem_mudar_o_principal() {
+        let dir = dir_de_teste("fallback");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_session(
+                "s",
+                &dir.display().to_string(),
+                "t",
+                "principal",
+                None,
+                "semi",
+                None,
+            )
+            .unwrap();
+        let mut ambiente = ambiente_de_teste(store, |cfg| {
+            cfg.agent.workdir = Some(dir.clone());
+            cfg.agent.pin_workdir = true;
+            cfg.provider.model = "principal".into();
+            cfg.provider.fallback_models = vec!["reserva".into()];
+        });
+        let vistos = Arc::new(Mutex::new(Vec::new()));
+        ambiente.comp.estado.write().expect("estado").provider = Arc::new(ProvedorFallback {
+            vistos: vistos.clone(),
+        });
+
+        executar_turno(
+            ambiente.comp.clone(),
+            "responda".into(),
+            false,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(vistos.lock().unwrap().as_slice(), ["principal", "reserva"]);
+        let eventos = drenar_eventos(&mut ambiente);
+        assert!(eventos.iter().any(|e| matches!(
+            e,
+            AgentEvent::Aviso { mensagem } if mensagem.contains("fallback")
+        )));
+        assert!(
+            eventos
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnoConcluido { .. }))
+        );
+        assert_eq!(ambiente.comp.config().provider.model, "principal");
+        let mensagens = ambiente.comp.store.recent_messages("s", 10).unwrap();
+        assert!(
+            mensagens
+                .last()
+                .is_some_and(|m| m.content.contains("ok do reserva"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct ProvedorFallback {
+        vistos: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ProvedorFallback {
+        async fn chat(
+            &self,
+            req: ChatRequest,
+            _cancel: CancellationToken,
+            _sink: Option<mpsc::UnboundedSender<StreamEvent>>,
+        ) -> Result<crate::provider::Completion, ProviderError> {
+            self.vistos.lock().unwrap().push(req.model.clone());
+            if req.model == "principal" {
+                return Err(ProviderError::ModeloIndisponivel(
+                    "principal fora do ar".into(),
+                ));
+            }
+            Ok(crate::provider::Completion {
+                text: "ok do reserva".into(),
+                usage: Some(crate::provider::Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 3,
+                    reasoning_tokens: 0,
+                }),
+                ..Default::default()
+            })
+        }
+        async fn list_models(&self) -> Result<Vec<crate::config::ModelEntry>, ProviderError> {
+            Ok(vec![])
+        }
     }
 
     #[tokio::test]
@@ -2993,12 +3690,15 @@ mod tests {
 
         assert!(dossie.contains("# Dossiê de continuidade"));
         assert!(dossie.contains("implemente a feature"));
-        assert_eq!(novos.len(), 1);
+        // Dossiê + as duas mensagens recentes (continuidade imediata).
+        assert_eq!(novos.len(), 3);
         assert!(
             novos[0]
                 .content
                 .contains("Continue o trabalho a partir do dossiê")
         );
+        assert!(novos[1].content.contains("implemente a feature"));
+        assert!(novos[2].content.contains("vou começar lendo"));
 
         // A sessão antiga ficou marcada e guardou o dossiê.
         let antiga = ambiente.comp.store.get_session("s").unwrap().unwrap();

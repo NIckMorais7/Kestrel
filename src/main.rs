@@ -13,11 +13,15 @@ mod db;
 mod diff;
 mod events;
 mod html;
+mod i18n;
+mod index;
 mod migrar;
 mod perm;
 mod project;
 mod provider;
+mod sandbox;
 mod skills;
+mod tokenizer;
 mod tools;
 mod ui;
 mod util;
@@ -34,11 +38,17 @@ use crossterm::event::{
 use ratatui_image::picker::Picker;
 use std::path::PathBuf;
 
+/// Versão exibida na interface e em `--version`.
+///
+/// O Cargo exige semver de três componentes, então o pacote continua em
+/// `0.9.5`; o hotfix é identificado como `0.9.5.5`.
+pub const VERSAO: &str = "0.9.7";
+
 /// Kestrel — agente autônomo de codificação para o terminal.
 #[derive(Parser, Debug)]
 #[command(
     name = "kestrel",
-    version,
+    version = VERSAO,
     about = "Agente autônomo de codificação para o terminal",
     long_about = "O Kestrel analisa o projeto, planeja, executa comandos reais, edita arquivos \
                   e valida o resultado com testes — tudo no seu terminal, com permissões \
@@ -80,15 +90,30 @@ fn main() -> anyhow::Result<()> {
     if let Some(aviso) = &aviso_config {
         eprintln!("kestrel: aviso: {aviso}");
     }
+    crate::tokenizer::registrar_modelos(&config.provider.models);
+    if config.agent.sandbox == crate::config::SandboxMode::Require && !crate::sandbox::disponivel()
+    {
+        anyhow::bail!(
+            "sandbox exigido em agent.sandbox, mas este kernel não oferece Landlock; \
+             use `sandbox = \"auto\"` ou \"off\""
+        );
+    }
 
-    if let Some(valor) = &cli.permissao {
+    // O nível pedido na linha de comando vale só para esta execução. Ele é
+    // guardado à parte porque `Config::save` (bloco do `--model` e o assistente
+    // de configuração) persistiria o override no config.toml do usuário para
+    // sempre: `kestrel -p full -m x` não pode marcar `permission = "full"`
+    // em todas as sessões seguintes.
+    let permissao_sessao = if let Some(valor) = &cli.permissao {
         let nivel = PermissionLevel::parse(valor).ok_or_else(|| {
             anyhow::anyhow!(
                 "nível de permissão inválido: `{valor}` (use read, write, semi ou full)"
             )
         })?;
-        config.agent.permission = nivel;
-    }
+        Some(nivel)
+    } else {
+        None
+    };
 
     if let Some(dir) = &cli.workdir {
         let dir = crate::util::expand_tilde(&dir.to_string_lossy());
@@ -157,27 +182,48 @@ fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        let icone = ui::icone::IconeKestrel::novo(&picker).ok();
         // A interface trata rolagem do mouse e colagem de texto (bracketed paste).
         let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
-        let resultado = executar(
+        // O guard restaura também num panic: o hook do ratatui devolve o modo
+        // bruto e a tela alternativa, mas não desliga mouse/paste. Sem isso, um
+        // panic deixava o terminal do usuário colando e reportando mouse.
+        let _restaurar = RestaurarTerminal;
+        executar(
             &mut terminal,
             config,
             &paths,
             store,
-            cli.setup,
+            SessaoAtual {
+                forcar_setup: cli.setup,
+                permissao: permissao_sessao,
+            },
             pip_grafico,
-            icone,
         )
-        .await;
+        .await
+    })
+}
+
+/// Restaura os modos de entrada do terminal no fim da execução — inclusive
+/// durante o desenrolar de um panic.
+struct RestaurarTerminal;
+
+impl Drop for RestaurarTerminal {
+    fn drop(&mut self) {
         let _ = crossterm::execute!(
             std::io::stdout(),
             DisableBracketedPaste,
             DisableMouseCapture
         );
         ratatui::restore();
-        resultado
-    })
+    }
+}
+
+/// Ajustes que valem só para esta execução — nada aqui é persistido.
+struct SessaoAtual {
+    /// Força o assistente de configuração (`--setup`).
+    forcar_setup: bool,
+    /// Nível pedido em `-p/--permissions`.
+    permissao: Option<PermissionLevel>,
 }
 
 /// Executa o assistente (quando necessário) e a interface principal,
@@ -187,11 +233,10 @@ async fn executar(
     config: Config,
     paths: &Paths,
     store: Store,
-    forcar_setup: bool,
+    sessao: SessaoAtual,
     pip_grafico: Option<PipGrafico>,
-    icone: Option<ui::icone::IconeKestrel>,
 ) -> anyhow::Result<()> {
-    let config = if !config.setup_complete || forcar_setup {
+    let mut config = if !config.setup_complete || sessao.forcar_setup {
         // O mascote não aparece no assistente: ele é elemento de nova sessão.
         let pronto = ui::setup::executar(terminal, config, None).await?;
         pronto.save(paths)?;
@@ -199,5 +244,10 @@ async fn executar(
     } else {
         config
     };
-    app::executar(terminal, config, paths.clone(), store, pip_grafico, icone).await
+    // O override de sessão entra aqui, depois de tudo que persiste a
+    // configuração: ele não pode sobreviver a esta execução.
+    if let Some(nivel) = sessao.permissao {
+        config.aplicar_permissao_sessao(nivel);
+    }
+    app::executar(terminal, config, paths.clone(), store, pip_grafico).await
 }

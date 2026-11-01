@@ -80,10 +80,7 @@ impl OpenAiCompatProvider {
             // `read_timeout` mede a pausa entre leituras, que é o que importa.
             .read_timeout(Duration::from_secs(timeout_secs.max(10)))
             .connect_timeout(Duration::from_secs(20))
-            .user_agent(format!(
-                "Kestrel/{} (agente de codificação)",
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(format!("Kestrel/{} (agente de codificação)", crate::VERSAO))
             .build()?;
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -149,25 +146,23 @@ impl OpenAiCompatProvider {
     }
 
     /// Executa a requisição com novas tentativas para falhas transitórias.
+    ///
+    /// `construir` monta a requisição concreta (POST de chat, GET de modelos),
+    /// então a política de novas tentativas é a mesma para os dois caminhos.
     async fn enviar_com_retentativas(
         &self,
-        body: &Value,
+        caminho: &str,
         cancel: &CancellationToken,
+        construir: impl Fn(&reqwest::Client, &str, &str) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, ProviderError> {
         let chave = self.chave()?;
-        let url = self.endpoint("chat/completions");
+        let url = self.endpoint(caminho);
         let mut tentativa = 0u32;
         loop {
             if cancel.is_cancelled() {
                 return Err(ProviderError::Cancelado);
             }
-            let envio = self
-                .client
-                .post(&url)
-                .bearer_auth(chave)
-                .header("Accept", "text/event-stream")
-                .json(body)
-                .send();
+            let envio = construir(&self.client, &url, chave).send();
 
             let resultado = tokio::select! {
                 _ = cancel.cancelled() => return Err(ProviderError::Cancelado),
@@ -183,9 +178,10 @@ impl OpenAiCompatProvider {
                         .get("retry-after")
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u64>().ok());
-                    let texto = texto_com_limite(resp, LIMITE_CORPO_RESPOSTA)
-                        .await
-                        .unwrap_or_default();
+                    let texto = tokio::select! {
+                        _ = cancel.cancelled() => return Err(ProviderError::Cancelado),
+                        r = texto_com_limite(resp, LIMITE_CORPO_RESPOSTA) => r.unwrap_or_default(),
+                    };
                     let erro = classificar_status(status.as_u16(), &texto, retry_after);
                     if erro.transitorio() && tentativa < self.max_retries {
                         tentativa += 1;
@@ -221,7 +217,15 @@ impl OpenAiCompatProvider {
     ) -> Result<Completion, ProviderError> {
         let mut body = self.corpo(req);
         body["stream"] = json!(false);
-        let resp = self.enviar_com_retentativas(&body, cancel).await?;
+        let resp = self
+            .enviar_com_retentativas("chat/completions", cancel, |cliente, url, chave| {
+                cliente
+                    .post(url)
+                    .bearer_auth(chave)
+                    .header("Accept", "text/event-stream")
+                    .json(&body)
+            })
+            .await?;
         let texto = tokio::select! {
             _ = cancel.cancelled() => return Err(ProviderError::Cancelado),
             r = texto_com_limite(resp, LIMITE_CORPO_RESPOSTA) => r?,
@@ -284,7 +288,15 @@ impl OpenAiCompatProvider {
         // OpenAI). Sem ele, provedores compatíveis não informam tokens e
         // `/cost`/estatísticas ficam zerados.
         body["stream_options"] = json!({"include_usage": true});
-        let resp = self.enviar_com_retentativas(&body, cancel).await?;
+        let resp = self
+            .enviar_com_retentativas("chat/completions", cancel, |cliente, url, chave| {
+                cliente
+                    .post(url)
+                    .bearer_auth(chave)
+                    .header("Accept", "text/event-stream")
+                    .json(&body)
+            })
+            .await?;
         let mut stream = resp.bytes_stream();
         // Bytes, não `String`: um caractere UTF-8 multibyte pode ser dividido
         // entre dois chunks da rede. Converter cada chunk isoladamente com
@@ -295,6 +307,7 @@ impl OpenAiCompatProvider {
             ..Default::default()
         };
         let mut viu_done = false;
+        let mut ultimo_indice = 0usize;
         let mut parciais: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
 
         'leitura: loop {
@@ -302,9 +315,21 @@ impl OpenAiCompatProvider {
                 _ = cancel.cancelled() => return Err(ProviderError::Cancelado),
                 c = stream.next() => c,
             };
-            let Some(chunk) = chunk else { break };
-            let bytes = chunk.map_err(|e| ProviderError::Rede(e.to_string()))?;
-            buffer.extend_from_slice(&bytes);
+            let fim = match chunk {
+                None => true,
+                Some(Ok(bytes)) => {
+                    buffer.extend_from_slice(&bytes);
+                    false
+                }
+                Some(Err(e)) => return Err(ProviderError::Rede(e.to_string())),
+            };
+            // Um provedor pode fechar a conexão logo após o último evento sem
+            // quebrar linha. Sem este flush, a última linha (inclusive um
+            // `finish_reason`) era descartada e a resposta completa virava
+            // "truncada".
+            if fim && !buffer.is_empty() {
+                buffer.push(b'\n');
+            }
 
             while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
                 // A linha inteira já chegou: a conversão respeita caracteres
@@ -335,7 +360,13 @@ impl OpenAiCompatProvider {
                     )));
                 }
                 if let Some(uso) = parse_usage(valor.get("usage")) {
-                    completion.usage = Some(uso);
+                    // Provedores podem fatiar o uso: mescla em vez de
+                    // substituir para um chunk posterior com zeros não apagar
+                    // o consumo já informado.
+                    let atual = completion.usage.get_or_insert_with(Default::default);
+                    atual.prompt_tokens = atual.prompt_tokens.max(uso.prompt_tokens);
+                    atual.completion_tokens = atual.completion_tokens.max(uso.completion_tokens);
+                    atual.reasoning_tokens = atual.reasoning_tokens.max(uso.reasoning_tokens);
                 }
                 let Some(escolha) = valor.get("choices").and_then(|c| c.get(0)) else {
                     continue;
@@ -368,13 +399,35 @@ impl OpenAiCompatProvider {
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
                     for c in calls {
-                        let index = c.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                        let id_fatia = c.get("id").and_then(|i| i.as_str());
+                        let nome_fatia = c
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str());
+                        // Um fragmento sem `index` pode ser continuação da
+                        // chamada atual ou o início de outra (alguns
+                        // compatíveis omitem o campo). Um `id` ou `nome`
+                        // diferente do slot atual indica chamada nova; assumir
+                        // sempre 0 concatenava chamadas distintas.
+                        let index = match c.get("index").and_then(|i| i.as_u64()) {
+                            Some(i) => i as usize,
+                            None => {
+                                let atual = parciais.get(ultimo_indice);
+                                let novo = atual.is_some_and(|atual| {
+                                    id_fatia.is_some_and(|id| !atual.0.is_empty() && atual.0 != id)
+                                        || nome_fatia.is_some_and(|nome| {
+                                            !atual.1.is_empty() && atual.1 != nome
+                                        })
+                                });
+                                if novo { parciais.len() } else { ultimo_indice }
+                            }
+                        };
                         // Um `index` absurdo (resposta malformada ou hostil) não
                         // pode virar alocação sem limite.
-                        if index >= MAX_CHAMADAS_PARCIALS as u64 {
+                        if index >= MAX_CHAMADAS_PARCIALS {
                             continue;
                         }
-                        let index = index as usize;
+                        ultimo_indice = index;
                         while parciais.len() <= index {
                             parciais.push((String::new(), String::new(), String::new()));
                         }
@@ -423,6 +476,9 @@ impl OpenAiCompatProvider {
                         }
                     }
                 }
+            }
+            if fim {
+                break;
             }
             if buffer.len() > MAX_LINHA_SSE {
                 return Err(ProviderError::RespostaInvalida(format!(
@@ -610,7 +666,10 @@ fn extrair_mensagem(corpo: &str) -> String {
 }
 
 fn backoff(tentativa: u32) -> Duration {
-    Duration::from_millis(800 * 2u64.pow(tentativa.saturating_sub(1)).min(8))
+    // O expoente precisa ser limitado **antes** de `2u64.pow`: uma sequência
+    // longa de tentativas (tentativa >= 65) estourava o `u64` e derrubava o
+    // processo em debug. `2^3` é o teto real de 8× a espera base.
+    Duration::from_millis(800 * 2u64.pow(tentativa.saturating_sub(1).min(3)))
 }
 
 async fn tracing_sleep(d: Duration, cancel: &CancellationToken) -> Result<(), ProviderError> {
@@ -648,31 +707,18 @@ impl Provider for OpenAiCompatProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelEntry>, ProviderError> {
-        let chave = self.chave()?;
-        let url = self.endpoint("models");
+        let cancel = CancellationToken::new();
+        // Mesmo teto de bytes e mesmas novas tentativas do chat: `resp.json()`
+        // lia o corpo inteiro sem limite — um `base_url` mal configurado
+        // apontando para outro serviço devolvia gigabytes (a interface travava)
+        // — e uma falha transitória derrubava a listagem sem repetir.
         let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(chave)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout(self.timeout.as_secs())
-                } else {
-                    ProviderError::Rede(e.to_string())
-                }
-            })?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let corpo = texto_com_limite(resp, LIMITE_CORPO_RESPOSTA)
-                .await
-                .unwrap_or_default();
-            return Err(classificar_status(status, &corpo, None));
-        }
-        let valor: Value = resp
-            .json()
-            .await
+            .enviar_com_retentativas("models", &cancel, |cliente, url, chave| {
+                cliente.get(url).bearer_auth(chave)
+            })
+            .await?;
+        let texto = texto_com_limite(resp, LIMITE_CORPO_RESPOSTA).await?;
+        let valor: Value = serde_json::from_str(&texto)
             .map_err(|e| ProviderError::RespostaInvalida(e.to_string()))?;
         let mut modelos = Vec::new();
         if let Some(lista) = valor.get("data").and_then(|d| d.as_array()) {
@@ -1232,6 +1278,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ultima_linha_sem_quebra_e_processada() {
+        // A conexão pode fechar sem `\n` depois do último evento; antes a
+        // linha era descartada e uma resposta completa virava "truncada".
+        let corpo =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}";
+        let (base, _reqs) = servir_sse(corpo.to_string(), 64, 0).await;
+        let p = cliente(&base);
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect("linha final sem quebra deveria ser lida");
+        assert_eq!(saida.text, "ok");
+        assert_eq!(saida.finish_reason, "stop");
+    }
+
+    #[tokio::test]
+    async fn tool_call_sem_index_nao_mescla_com_a_anterior() {
+        // Alguns compatíveis omitem `index` em deltas posteriores; assumir 0
+        // concatenava chamadas distintas no mesmo slot.
+        let corpo = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"c2\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base, _reqs) = servir_sse(corpo.to_string(), 64, 0).await;
+        let p = cliente(&base);
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("faça")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect("stream deveria funcionar");
+        assert_eq!(saida.tool_calls.len(), 2);
+        assert_eq!(saida.tool_calls[0].name, "read_file");
+        assert_eq!(saida.tool_calls[1].name, "write_file");
+    }
+
+    #[tokio::test]
+    async fn usage_fatiado_e_mesclado() {
+        let corpo = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0}}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base, _reqs) = servir_sse(corpo.to_string(), 64, 0).await;
+        let p = cliente(&base);
+        let saida = p
+            .chat(
+                ChatRequest::new("modelo/teste", vec![ChatMessage::user("oi")]),
+                CancellationToken::new(),
+                Some(pia().0),
+            )
+            .await
+            .expect("stream deveria funcionar");
+        let uso = saida.usage.expect("usage deveria existir");
+        assert_eq!(uso.prompt_tokens, 10);
+        assert_eq!(uso.completion_tokens, 5);
+    }
+
+    #[tokio::test]
     async fn nome_de_tool_repetido_nao_duplica() {
         // Alguns provedores repetem o nome em cada delta; concatenar produzia
         // `read_fileread_file`.
@@ -1255,6 +1367,88 @@ mod tests {
         assert_eq!(saida.finish_reason, "tool_calls");
     }
 
+    /// Servidor minúsculo que responde `corpo` com `status`, devolvendo 500 nas
+    /// primeiras `falhar_antes` requisições. Usado por `list_models`.
+    async fn servir_resposta(status: &'static str, corpo: String, falhar_antes: usize) -> String {
+        let ouvinte = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("porta efemera");
+        let endereco = ouvinte.local_addr().unwrap();
+        let vistas = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let contador = vistas.clone();
+        tokio::spawn(async move {
+            while let Ok((mut soquete, _)) = ouvinte.accept().await {
+                let corpo = corpo.clone();
+                let contador = contador.clone();
+                tokio::spawn(async move {
+                    let mut lido = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !lido.windows(4).any(|j| j == b"\r\n\r\n") {
+                        match soquete.read(&mut buf).await {
+                            Ok(0) => return,
+                            Ok(n) => lido.extend_from_slice(&buf[..n]),
+                            Err(_) => return,
+                        }
+                    }
+                    let vistas = contador.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (linha_status, conteudo) = if vistas < falhar_antes {
+                        (
+                            "HTTP/1.1 500 Internal Server Error",
+                            r#"{"error":{"message":"falhou agora, volta já"}}"#.to_string(),
+                        )
+                    } else {
+                        (status, corpo)
+                    };
+                    let _ = soquete
+                        .write_all(
+                            format!(
+                                "{linha_status}\r\ncontent-type: application/json\r\n\
+                                 content-length: {}\r\n\r\n{conteudo}",
+                                conteudo.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let _ = soquete.flush().await;
+                });
+            }
+        });
+        format!("http://{endereco}/v1")
+    }
+
+    #[tokio::test]
+    async fn list_models_le_o_json_da_listagem() {
+        let base = servir_resposta(
+            "HTTP/1.1 200 OK",
+            r#"{"object":"list","data":[
+                {"id":"org/bbb","owned_by":"org"},
+                {"id":"org/aaa","owned_by":"org"}
+            ]}"#
+            .to_string(),
+            0,
+        )
+        .await;
+        let p = cliente(&base);
+        let modelos = p.list_models().await.expect("listagem deveria funcionar");
+        assert_eq!(modelos.len(), 2);
+        // Ordenada por id.
+        assert_eq!(modelos[0].id, "org/aaa");
+        assert_eq!(modelos[1].owned_by.as_deref(), Some("org"));
+    }
+
+    /// Falha transitória (500) não derruba mais a listagem: a requisição é
+    /// repetida, como no caminho do chat.
+    #[tokio::test]
+    async fn list_models_repete_falha_transitoria() {
+        let base = servir_resposta("HTTP/1.1 200 OK", r#"{"data":[]}"#.to_string(), 1).await;
+        let p = cliente(&base); // `max_retries = 1`
+        let modelos = p
+            .list_models()
+            .await
+            .expect("deveria repetir a falha transitória");
+        assert!(modelos.is_empty());
+    }
+
     #[test]
     fn retry_after_gigante_e_limitado() {
         // Um servidor pode pedir horas de espera; o teto evita dormir para
@@ -1264,6 +1458,15 @@ mod tests {
             espera_retry_after(86_400),
             Duration::from_secs(RETRY_AFTER_MAX_SECS)
         );
+    }
+
+    #[test]
+    fn backoff_nao_estoura_em_tentativas_altas() {
+        assert_eq!(backoff(1), Duration::from_millis(800));
+        assert_eq!(backoff(2), Duration::from_millis(1600));
+        assert_eq!(backoff(4), Duration::from_millis(6400));
+        // Antes, `2u64.pow(64)` estourava antes do `.min(8)`.
+        assert_eq!(backoff(u32::MAX), Duration::from_millis(6400));
     }
 
     #[test]

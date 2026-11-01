@@ -39,13 +39,18 @@ impl OrcamentoContexto {
 }
 
 /// Estima o total de tokens do prompt enviado ao modelo.
-pub fn estimar_prompt(sistema: &str, mensagens: &[ChatMessage], ferramentas: &[ToolSpec]) -> u32 {
-    let mut total = crate::util::estimate_tokens(sistema);
+pub fn estimar_prompt(
+    modelo: &str,
+    sistema: &str,
+    mensagens: &[ChatMessage],
+    ferramentas: &[ToolSpec],
+) -> u32 {
+    let mut total = crate::tokenizer::contar(modelo, sistema);
     for m in mensagens {
-        total += crate::util::estimate_tokens(&m.content);
+        total += crate::tokenizer::contar(modelo, &m.content);
         for tc in &m.tool_calls {
-            total += crate::util::estimate_tokens(&tc.name)
-                + crate::util::estimate_tokens(&tc.arguments)
+            total += crate::tokenizer::contar(modelo, &tc.name)
+                + crate::tokenizer::contar(modelo, &tc.arguments)
                 + 8;
         }
         if m.tool_call_id.is_some() {
@@ -53,9 +58,9 @@ pub fn estimar_prompt(sistema: &str, mensagens: &[ChatMessage], ferramentas: &[T
         }
     }
     for f in ferramentas {
-        total += crate::util::estimate_tokens(&f.name)
-            + crate::util::estimate_tokens(&f.description)
-            + crate::util::estimate_tokens(&f.parameters.to_string())
+        total += crate::tokenizer::contar(modelo, &f.name)
+            + crate::tokenizer::contar(modelo, &f.description)
+            + crate::tokenizer::contar(modelo, &f.parameters.to_string())
             + 8;
     }
     total
@@ -214,8 +219,12 @@ pub fn construir_dossie(
             }
         }
     }
-    d.comandos.truncate(20);
-    d.testes.truncate(20);
+    // O dossiê precisa do que está em andamento: `recent_messages` devolve a
+    // conversa em ordem cronológica, então o excedente é descartado do INÍCIO
+    // (os mais antigos). Um `truncate` manteria os primeiros N e a compactação
+    // jogaria fora justamente os comandos e erros recentes.
+    manter_os_ultimos(&mut d.comandos, 20);
+    manter_os_ultimos(&mut d.testes, 20);
 
     // Erros: mensagens de ferramenta que indicam falha.
     for m in &recentes {
@@ -229,9 +238,8 @@ pub fn construir_dossie(
             d.erros.push(crate::util::truncate(m.content.trim(), 200));
         }
     }
-    d.erros.truncate(10);
-
-    d.instrucoes.truncate(10);
+    manter_os_ultimos(&mut d.erros, 10);
+    manter_os_ultimos(&mut d.instrucoes, 10);
     if !projeto_summary.is_empty() {
         d.decisoes.push(format!(
             "Contexto do projeto: {}",
@@ -239,6 +247,18 @@ pub fn construir_dossie(
         ));
     }
     Ok(d)
+}
+
+/// Mantém apenas os últimos `maximo` itens, descartando o excedente do início.
+///
+/// `truncate` mantém os primeiros N; como as listas do dossiê são montadas em
+/// ordem cronológica, isso guardaria as instruções e os erros do COMEÇO da
+/// conversa em vez do que está em andamento.
+fn manter_os_ultimos(itens: &mut Vec<String>, maximo: usize) {
+    if itens.len() > maximo {
+        let excesso = itens.len() - maximo;
+        itens.drain(..excesso);
+    }
 }
 
 #[cfg(test)]
@@ -269,8 +289,8 @@ mod tests {
             ChatMessage::user("mensagem curta"),
             ChatMessage::assistant("resposta"),
         ];
-        let a = estimar_prompt(sistema, &uma, &[]);
-        let b = estimar_prompt(sistema, &muitas, &[]);
+        let a = estimar_prompt("modelo/teste", sistema, &uma, &[]);
+        let b = estimar_prompt("modelo/teste", sistema, &muitas, &[]);
         assert!(b > a);
     }
 
@@ -373,5 +393,107 @@ mod tests {
             "deveria manter a alteração mais recente: {:?}",
             d.arquivos
         );
+    }
+
+    /// Depois de compactar, o agente continua a partir do que estava em
+    /// andamento: as listas do dossiê mantêm os itens MAIS RECENTES. O
+    /// `truncate` anterior preservava os primeiros N — as instruções e os
+    /// erros do início da conversa.
+    #[test]
+    fn dossie_mantem_as_instrucoes_e_erros_mais_recentes() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_session("s1", "/p", "tarefa longa", "m", None, "semi", None)
+            .unwrap();
+        // Instruções, comandos e testes numerados: cada lista tem o próprio
+        // teto (10 instruções, 20 comandos, 20 testes, 10 erros).
+        for i in 0..25 {
+            store
+                .append_message(
+                    "s1",
+                    "user",
+                    &format!("instrução {i:02} do usuário"),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            store
+                .append_message(
+                    "s1",
+                    "tool",
+                    &format!("Comando: cargo check {i:02}\nsaida {i:02}"),
+                    None,
+                    Some(&format!("c{i:02}")),
+                    Some("run_command"),
+                    None,
+                )
+                .unwrap();
+            store
+                .append_message(
+                    "s1",
+                    "tool",
+                    &format!("test result: FAILED (falha numerada {i:02})\nerror[E0308]"),
+                    None,
+                    Some(&format!("e{i:02}")),
+                    Some("run_tests"),
+                    None,
+                )
+                .unwrap();
+        }
+        let d = construir_dossie(&store, "s1", "", "", "").unwrap();
+        assert_eq!(d.instrucoes.len(), 10, "{:?}", d.instrucoes);
+        assert!(
+            d.instrucoes.iter().any(|i| i.contains("instrução 24")),
+            "a instrução mais recente deveria sobreviver: {:?}",
+            d.instrucoes
+        );
+        assert!(
+            !d.instrucoes.iter().any(|i| i.contains("instrução 14")),
+            "instruções antigas deveriam ter sido descartadas: {:?}",
+            d.instrucoes
+        );
+        assert_eq!(d.comandos.len(), 20, "{:?}", d.comandos);
+        assert!(
+            d.comandos.iter().any(|c| c.contains("cargo check 24")),
+            "o comando mais recente deveria sobreviver: {:?}",
+            d.comandos
+        );
+        assert!(
+            !d.comandos.iter().any(|c| c.contains("cargo check 03")),
+            "comandos antigos deveriam ter sido descartados: {:?}",
+            d.comandos
+        );
+        assert_eq!(d.testes.len(), 20, "{:?}", d.testes);
+        assert!(
+            d.testes.iter().any(|t| t.contains("numerada 24")),
+            "o teste mais recente deveria sobreviver: {:?}",
+            d.testes
+        );
+        assert_eq!(d.erros.len(), 10, "{:?}", d.erros);
+        assert!(
+            d.erros.iter().any(|e| e.contains("numerada 24")),
+            "o erro mais recente deveria sobreviver: {:?}",
+            d.erros
+        );
+        assert!(
+            !d.erros.iter().any(|e| e.contains("numerada 14")),
+            "erros antigos deveriam ter sido descartados: {:?}",
+            d.erros
+        );
+        let texto = d.para_texto();
+        assert!(texto.contains("cargo check 24"));
+        assert!(!texto.contains("cargo check 03\n"), "{texto}");
+        assert!(texto.contains("falha numerada 24"));
+    }
+
+    #[test]
+    fn manter_os_ultimos_descarta_do_inicio() {
+        let mut itens: Vec<String> = (0..5).map(|i| i.to_string()).collect();
+        manter_os_ultimos(&mut itens, 3);
+        assert_eq!(itens, vec!["2", "3", "4"]);
+        manter_os_ultimos(&mut itens, 10);
+        assert_eq!(itens, vec!["2", "3", "4"], "não deveria mexer na lista");
     }
 }

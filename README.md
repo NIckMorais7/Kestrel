@@ -230,14 +230,23 @@ continua geométrica: a massa branca do gato com a tinta (contorno e olhos)
 vazada; os buracos dos olhos são pintados com a cor de fundo da aplicação, então
 não ficam brancos em terminal claro.
 
-O ciclo tem 128 tiques e é determinístico: repouso respirando (e piscando),
-caminhada leve para a esquerda e volta, caminhada leve para a direita e volta,
-repouso de novo. Desde a v0.9.4 os deslocamentos são senoidais — o movimento
-acelera no meio e desacelera nas pontas, sem saltos de posição — e a passada
-da caminhada é suave, então o Pip não “treme” nem parece travado. Na v0.9.5
-a **piscada** passou a fechar o olho com a cor do pelo amostrada da própria
-imagem (antes usava branco puro fixo, que aparecia como um “olho branco”
-estranho quando o pelo é sombreado).
+O ciclo tem 96 quadros a ~40 ms (~3,8 s) e é determinístico: repouso
+respirando (e piscando), passeio leve para a esquerda, pausa, passeio para a
+direita e repouso de novo. Cada quadro move no máximo **1 pixel**, então o
+deslocamento é contínuo. A moldura é **composta sobre a cor de fundo do tema**
+(alfa pré-multiplicado), sem pixels transparentes sobrando — transparência na
+moldura virava um bloco branco em alguns protocolos gráficos. Trocar de skin
+recodifica os quadros para que a moldura acompanhe a nova cor.
+
+Na v0.9.6 a animação foi reconstruída: quadros a 40 ms, passos de 1 pixel,
+piscada só em repouso e animação restrita à recepção (numa conversa longa o Pip
+não é desenhado e não força redesenhos). A piscada fecha o olho com uma
+pálpebra escura (tinta amostrada do contorno) — preencher com o pelo deixava
+um bloco branco no rosto branco. A área do Pip recebe o fundo do tema antes do
+protocolo gráfico, eliminando a faixa clara que o `clear_area` do Sixel podia
+deixar. A rolagem também ganhou cadência de 60 fps enquanto o alvo está em
+movimento e os giros da roda acumulam no alvo, sem “travar” em posições
+intermediárias.
 
 A partir da v0.5.0, o Pip **não fica mais no rodapé** nem no assistente. Ele
 aparece somente na **recepção de nova sessão**, no chat, junto de instruções
@@ -259,12 +268,10 @@ Limitações documentadas:
 
 ## Ícone do Kestrel
 
-O cabeçalho usa o novo ícone oficial (`assets/white_icon_kestrel.png` em fundo
-escuro e `assets/icon_kestrel.png` em fundo claro). A escolha é automática:
-fundo claro usa o ícone preto; fundo escuro usa o ícone branco. Trocar de skin
-troca o ícone junto.
-
-Nas respostas do agente não aparece mais a forma geométrica antes de `Kestrel`.
+A partir da v0.9.6 o cabeçalho **não exibe mais o ícone** no canto superior
+esquerdo: ele começa direto em `Kestrel v0.9.6`. Os arquivos de imagem
+continuam no repositório como material de marca, mas não são carregados nem
+codificados na inicialização.
 
 ## Contexto no rodapé
 
@@ -276,9 +283,10 @@ contexto 390.000/1.000.000 (39%)
 ```
 
 O rodapé e o cabeçalho são **discretos**: estado e contexto em texto apagado,
-indicador de atividade fixo (`·`), processos ativos só como `⚙ N`, modelo e
-Comp no cabeçalho sem destaque. Tokens acumulados continuam disponíveis em
-`/cost`.
+indicador de atividade em um único círculo (discreto quando ocioso, branco ao
+concluir e piscando devagar durante o trabalho), processos ativos só como
+`⚙ N`, modelo e Comp no cabeçalho sem destaque. Tokens acumulados continuam
+disponíveis em `/cost`.
 
 ## Raciocínio do modelo (`/thinking`)
 
@@ -301,6 +309,10 @@ voltar ao estado mais recente:
 - ou clique no atalho `↓ voltar para o último`, que aparece no canto direito do
   rodapé enquanto você estiver fora do fim.
 
+A rolagem é animada a 60 fps enquanto há alvo pendente; cada giro da roda ou
+PageUp/PageDown soma ao **alvo** (não à posição já animada), então gestos
+rápidos não se perdem.
+
 ## Diretório inicial
 
 O Kestrel começa **no diretório de onde foi chamado**. Fixar um projeto
@@ -308,7 +320,7 @@ O Kestrel começa **no diretório de onde foi chamado**. Fixar um projeto
 abrir sempre nesse diretório — para voltar ao comportamento "onde estou",
 desligue a fixação em `/config` ou apague os dois campos do `config.toml`.
 
-## MCP (servidores locais)
+## MCP (servidores locais e remotos)
 
 O Kestrel sobe servidores MCP declarados em `~/.config/kestrel/config.toml` e
 expõe as ferramentas deles ao modelo, com o prefixo `mcp__<servidor>__<nome>`:
@@ -320,19 +332,135 @@ comando = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
 
 [[mcp]]
-nome = "arquivos"
-comando = "uvx"
-args = ["mcp-server-filesystem", "/caminho/permitido"]
-cwd = "/home/user"
+nome = "remoto"
+transporte = "http"                 # "stdio" (padrão) ou "http"
+url = "https://mcp.exemplo/mcp"
+headers = { "X-Ambiente" = "dev" }
+token_env = "MCP_TOKEN"             # bearer token por variável de ambiente
+# OAuth2 client-credentials (sem segredo no TOML):
+# [mcp.oauth]
+# token_url = "https://auth.exemplo/token"
+# client_id = "kestrel"
+# client_secret_env = "MCP_CLIENT_SECRET"
+# scopes = ["mcp.read", "mcp.write"]
 ```
 
-- **Só stdio.** O servidor é um processo filho que morre com o Kestrel: não
-  existe URL, porta nem superfície de rede nova.
+- **stdio e HTTP/SSE**: o transporte HTTP aceita JSON ou `text/event-stream`,
+  preserva `Mcp-Session-Id`, faz OAuth client-credentials e respeita timeout.
+- **Recursos e prompts**: quando o servidor anuncia as capacidades, o modelo
+  recebe também `list_resources`, `read_resource`, `list_prompts` e
+  `get_prompt`. Notificações do servidor (inclusive `list_changed`) são lidas.
+- **Assinatura**: dá para exigir integridade do plugin. `mcp_trusted_keys`
+  mapeia id → chave pública Ed25519 (hex); o manifesto assinado inclui nome,
+  transporte, comando/URL, args, env, headers, cwd e o SHA-256 do executável
+  (stdio). Configure `assinatura`, `chave_id` e, se quiser fixar o binário,
+  `sha256` no servidor:
+
+  ```toml
+  [mcp_trusted_keys]
+  "equipe" = "hex-da-chave-publica-ed25519"
+
+  [[mcp]]
+  nome = "plugin"
+  comando = "/opt/plugin/mcp"
+  assinatura = "hex-da-assinatura"
+  chave_id = "equipe"
+  sha256 = "hex-do-digest"
+  ```
 - **Mesmas regras.** Ferramentas MCP passam pela verificação de permissão, pelo
   escopo de caminhos e pela auditoria, como qualquer ferramenta nativa.
-- **Sem travar.** Um servidor que falha (comando inexistente, aperto de mão
-  estourado) não impede os outros nem a abertura do Kestrel: o aviso aparece na
-  conversa e o resto continua funcionando.
+- **Sem travar.** Um servidor que falha não impede os outros nem a abertura do
+  Kestrel: o aviso aparece na conversa e o resto continua funcionando.
+
+## Busca web e fallback (0.9.7)
+
+`web_search` usa o **DuckDuckGo** por padrão. Se o mecanismo falhar (rede, HTTP
+ou captcha) **ou não devolver nenhum resultado**, o Kestrel tenta, na ordem:
+
+1. DuckDuckGo (`duckduckgo.com/html`, seguindo redirecionamento)
+2. DuckDuckGo Lite (`lite.duckduckgo.com/lite`)
+3. DuckDuckGo HTML (`html.duckduckgo.com/html`)
+4. **Exa** (`https://api.exa.ai/search`), quando a chave está disponível
+
+O resultado informa qual mecanismo respondeu e quais falharam/voltaram vazios.
+Se todos falharem, o erro lista as tentativas; se algum respondeu sem
+resultados, o modelo recebe essa informação para reformular a consulta.
+
+```toml
+[web]
+engine = "duckduckgo"          # ou "searx" (SearxNG primeiro, DDG como fallback)
+# exa_api_key_env = "EXA_API_KEY"
+# exa_url = "https://api.exa.ai/search"
+```
+
+A chave do Exa é lida **apenas** da variável de ambiente (padrão
+`EXA_API_KEY`) e nunca é gravada no TOML.
+
+## Tokens, fallback e contexto (0.9.6)
+
+- **Tokenizer real**: modelos com codificação conhecida usam `tiktoken`
+  (`o200k_base`, `cl100k_base`, `p50k_base`, `r50k_base`), declarada em
+  `provider.models[].tokenizer` ou reconhecida pelo id. O `usage` real do
+  provedor calibra a estimativa por modelo; modelos sem tokenizer caem na
+  estimativa por caracteres.
+- **Fallback entre modelos**:
+
+  ```toml
+  [provider]
+  fallback_models = ["nvidia/nemotron-3-super-120b-a12b", "meta/muse-glimmer-30b"]
+  ```
+
+  Se o modelo principal falhar por indisponibilidade, limite, rede ou 5xx, o
+  próximo é tentado para aquele turno (o modelo padrão em disco não muda).
+- **`search_project`**: retrieval BM25 local, respeitando `.gitignore`, que
+  ranqueia arquivos e devolve trechos com números de linha.
+- **`apply_patch`**: patch nativo com validação de contexto (`*** Begin Patch`
+  ou diff unificado); se um hunk não bate, nada é escrito. `/branch` (ou
+  `/checkpoint`) cria um ramo da sessão com histórico, plano, tarefas, decisões
+  e alterações de arquivo.
+
+## Sandbox de execução
+
+Processos filhos podem ser confinados com **Landlock**:
+
+```toml
+[agent]
+sandbox = "auto"            # auto | off | require
+sandbox_allow_network = true
+sandbox_extra_writable = ["/caminho/extra"]
+```
+
+- Leitura do sistema continua liberada (compiladores e bibliotecas).
+- Escrita permitida apenas no projeto, `external_dirs`, `/tmp`, caches usuais
+  (`~/.cache`, `~/.cargo`, `~/.npm`) e caminhos extras.
+- `sandbox_allow_network = false` nega TCP no domínio Landlock.
+- `require` falha ao iniciar se o kernel não oferecer Landlock; `auto` avisa e
+  segue sem confinamento.
+
+## Atalhos, busca, cópia e idioma (0.9.6)
+
+- `Ctrl+F` busca na conversa; `Enter`/`↓` vão à próxima ocorrência e `↑` à
+  anterior.
+- `Ctrl+Y` copia a última resposta via OSC 52.
+- `F1` ajuda, `F2` raciocínio, `Shift+Tab` permissões, `PageUp/PageDown` rolam.
+- Tudo isso é personalizável:
+
+  ```toml
+  [ui]
+  reduced_motion = false
+  language = "pt-BR"        # ou "en-US"
+  [ui.keybindings]
+  buscar = "ctrl+g"
+  copiar = "ctrl+y"
+  ```
+
+  Ações: `buscar`, `copiar`, `ajuda`, `raciocinio`, `permissoes`,
+  `rolar_cima`, `rolar_baixo`, `interromper`. `/keys` mostra os atalhos atuais;
+  `/lang en` e `/lang pt` trocam o idioma.
+- A conversa é **virtualizada**: só as linhas visíveis são renderizadas, com
+  cache de alturas por largura/versão.
+- `/skills reload` relê os diretórios de skills sem reiniciar.
+
 
 ## Conversa
 

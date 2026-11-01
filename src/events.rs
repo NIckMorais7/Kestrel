@@ -244,6 +244,13 @@ pub enum AgentEvent {
         /// projeto precisa trocar o diretório de trabalho junto.
         workdir: String,
     },
+    /// A sessão atual virou um ramo novo; a interface continua na mesma
+    /// conversa, apenas muda o id ativo.
+    Ramificada {
+        id: String,
+        titulo: String,
+        mensagens: usize,
+    },
     ModeloAtual {
         modelo: String,
         esforco: Option<String>,
@@ -281,6 +288,12 @@ pub enum UiCommand {
     DefinirComp(Option<String>),
     NovaSessao,
     RetomarSessao(String),
+    /// Cria um ramo/checkpoint da sessão atual (cópia do histórico e estado).
+    Ramificar {
+        titulo: Option<String>,
+    },
+    /// Relê os diretórios de skills (instalação sem reiniciar).
+    RecarregarSkills,
     /// Troca o diretório de trabalho, reanalisa o projeto e abre nova sessão.
     TrocarProjeto(String),
     AnalisarProjeto,

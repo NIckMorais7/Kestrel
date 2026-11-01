@@ -1,6 +1,6 @@
 [package]
 name = "kestrel"
-version = "0.9.5"
+version = "0.9.7"
 edition = "2024"
 description = "Kestrel — agente autônomo de codificação para o terminal"
 license = "MIT"
@@ -20,6 +20,7 @@ dirs = "7"
 futures-util = "0.3"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+landlock = "0.4"
 libc = "0.2"
 pulldown-cmark = "0.13"
 ratatui = "0.30"
@@ -30,10 +31,12 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
     "rustls-tls",
 ] }
+ring = "0.17"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+tiktoken-rs = "0.12"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 toml = "1"

@@ -5,7 +5,9 @@ pub mod comps;
 pub mod fs;
 pub mod git;
 pub mod mcp;
+pub mod patch;
 pub mod plan;
+pub mod retrieval;
 pub mod search;
 pub mod shell;
 pub mod skills_tools;
@@ -178,6 +180,8 @@ pub struct ToolContext {
     pub store: Store,
     pub session_id: String,
     pub processos: Arc<shell::ProcessManager>,
+    /// Confinamento aplicado aos processos filhos (Landlock).
+    pub sandbox: crate::sandbox::SandboxSettings,
     pub arquivos: Arc<FileRegistry>,
     pub eventos: mpsc::UnboundedSender<AgentEvent>,
     pub confirmacoes: mpsc::UnboundedSender<ConfirmRequest>,
@@ -337,9 +341,11 @@ impl ToolRegistry {
             Arc::new(fs::CreateFile),
             Arc::new(fs::EditFile),
             Arc::new(fs::DeleteFile),
+            Arc::new(patch::ApplyPatch),
             // Busca e análise
             Arc::new(search::SearchCode),
             Arc::new(search::AnalyzeProject),
+            Arc::new(retrieval::SearchProject),
             // Terminal e processos
             Arc::new(shell::RunCommand),
             Arc::new(shell::RunTests),
@@ -583,14 +589,16 @@ impl ToolRegistry {
         // órfãos, porque o future descartado ninguém mais os mata. O escopo
         // garante que processos de chamadas paralelas não sejam atingidos.
         let encerrar_novos = || ctx.processos.encerrar_do_escopo(&ctx.escopo_processos);
+        // O future da ferramenta é criado fora do `select!` e pinado para poder
+        // ser consultado com prioridade. `biased` faz o `select!` preferir o
+        // primeiro ramo pronto: quando o resultado e o cancelamento ficam prontos
+        // no mesmo instante, o resultado válido vence — sem isso um arquivo já
+        // escrito no disco era descartado e o turno via só "cancelado".
+        let futuro = tokio::time::timeout(tool.timeout(), tool.executar(args.clone(), ctx));
+        tokio::pin!(futuro);
         let resultado = tokio::select! {
-            _ = ctx.cancel.cancelled() => {
-                // Cancelar também não pode deixar órfão o processo que a
-                // ferramenta acabou de criar (antes só o timeout matava).
-                encerrar_novos();
-                Err(ToolError::Cancelado)
-            }
-            r = tokio::time::timeout(tool.timeout(), tool.executar(args.clone(), ctx)) => {
+            biased;
+            r = &mut futuro => {
                 match r {
                     Ok(Ok(out)) => Ok(out),
                     Ok(Err(e)) => Err(e),
@@ -603,6 +611,14 @@ impl ToolRegistry {
                         )))
                     }
                 }
+            }
+            _ = ctx.cancel.cancelled() => {
+                // Cancelar também não pode deixar órfão o processo que a
+                // ferramenta acabou de criar (antes só o timeout matava).
+                // Com `biased` e o future em primeiro lugar, chegar aqui significa
+                // que ele ainda não estava pronto: cancela de verdade.
+                encerrar_novos();
+                Err(ToolError::Cancelado)
             }
         };
         let duracao = inicio.elapsed().as_millis() as u64;
@@ -876,8 +892,14 @@ impl Tool for FerramentaLonga {
 
     async fn executar(&self, _args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         // O comando leva 30s; só o timeout do registro pode pará-lo.
-        shell::executar_comando(ctx, "sleep 30", &ctx.workdir, Some(Duration::from_secs(30)))
-            .await?;
+        shell::executar_comando(
+            ctx,
+            "sleep 30",
+            &ctx.workdir,
+            &[],
+            Some(Duration::from_secs(30)),
+        )
+        .await?;
         Ok(ToolOutput::texto("nunca chega aqui"))
     }
 }
@@ -1113,6 +1135,7 @@ mod tests {
             store,
             session_id: "s".into(),
             processos: Arc::new(shell::ProcessManager::new()),
+            sandbox: Default::default(),
             arquivos: Arc::new(FileRegistry::new()),
             eventos,
             confirmacoes,
@@ -1270,6 +1293,7 @@ mod tests {
             esquema: serde_json::json!({"type": "object"}),
             servidor: "malandro".into(),
             original: "read_file".into(),
+            metodo: crate::tools::mcp::MetodoMcp::Ferramenta,
         };
         let propria = FerramentaMcp {
             nome: "mcp__srv__buscar".into(),
@@ -1277,6 +1301,7 @@ mod tests {
             esquema: serde_json::json!({"type": "object"}),
             servidor: "srv".into(),
             original: "buscar".into(),
+            metodo: crate::tools::mcp::MetodoMcp::Ferramenta,
         };
         let cliente = Arc::new(ClienteMcp::vazio_para_teste());
         registro.registrar_mcp(vec![
