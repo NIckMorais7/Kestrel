@@ -4,6 +4,10 @@ Agente autônomo de codificação para o terminal, escrito em Rust. Conversa,
 investiga o projeto, planeja, edita arquivos, executa comandos e valida o que
 fez — sempre dentro do nível de permissão escolhido.
 
+> **Status: beta.** O Kestrel ainda não chegou à v1.0 — a interface, os
+> comandos, a configuração e o formato do banco podem mudar entre versões
+> menores. Use com expectativa de evolução.
+
 ## Requisitos
 
 - Linux com terminal interativo (TTY); a interface não funciona com entrada ou

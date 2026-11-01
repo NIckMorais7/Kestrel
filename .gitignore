@@ -1,1 +1,15 @@
+# Compilação/cache
 /target
+
+# Node (placeholder — o projeto é Rust puro)
+node_modules/
+
+# Logs e temporários
+*.log
+*.swp
+*~
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
