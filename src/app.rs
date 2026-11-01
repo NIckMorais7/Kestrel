@@ -3010,6 +3010,11 @@ impl App {
                 self.esforco = esforco.clone();
                 self.config.provider.model = modelo.clone();
                 self.config.provider.reasoning_effort = esforco.clone();
+                // O rodapé mostra a janela do modelo ATUAL. Antes isso só era
+                // atualizado no início de um turno: ao trocar de modelo via
+                // /model, a capacidade ficava presa no valor anterior (ex.:
+                // 262k do Mistral) até a próxima mensagem.
+                self.contexto.1 = self.config.context_window();
                 if mudou {
                     match &esforco {
                         Some(nivel) => self.avisar_rapido(
