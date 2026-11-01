@@ -8,6 +8,11 @@ fez — sempre dentro do nível de permissão escolhido.
 > comandos, a configuração e o formato do banco podem mudar entre versões
 > menores. Use com expectativa de evolução.
 
+![Status: beta](https://img.shields.io/badge/status-beta-orange)
+![Versão 0.9.8](https://img.shields.io/badge/versao-0.9.8-283593)
+![Licença MIT](https://img.shields.io/badge/licenca-MIT-brightgreen)
+![Rust](https://img.shields.io/badge/Rust-2024-000000?logo=rust&logoColor=white)
+
 ## Requisitos
 
 - Linux com terminal interativo (TTY); a interface não funciona com entrada ou
