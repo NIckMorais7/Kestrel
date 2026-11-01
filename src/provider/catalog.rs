@@ -123,6 +123,14 @@ pub fn known_capabilities(model_id: &str) -> Option<KnownCapabilities> {
         // Raciocínio com esforço *numérico* (1–100), não low/medium/high:
         // fica fora do seletor de esforços (o modelo pensa com o padrão).
         "deepseek-ai/deepseek-v4.1-flash" => Some(caps(128_000, true, true, true, &[])),
+        // ── Mistral ────────────────────────────────────────────────────
+        // Mistral Large 4: 1T-total/52B-ativo (MoE granular), texto+imagem,
+        // ferramentas e saída estruturada. Raciocínio com esforços
+        // low/medium/high — NÃO aceita none/minimal/xhigh/max. Free endpoint
+        // NVIDIA NIM confirmado; contexto 262K.
+        "mistralai/mistral-large-4-1t-a52b" => {
+            Some(caps(262_000, true, true, true, &["low", "medium", "high"]))
+        }
         _ => None,
     }
 }
@@ -398,6 +406,7 @@ mod tests {
             "google/gemma-4-31b-it",
             "minimaxai/minimax-m3.1-flash",
             "deepseek-ai/deepseek-v4.1-flash",
+            "mistralai/mistral-large-4-1t-a52b",
         ] {
             let c = known_capabilities(vivo).unwrap_or_else(|| panic!("{vivo} sumiu"));
             assert_eq!(c.tools, Capability::Sim, "{vivo}");
@@ -460,6 +469,21 @@ mod tests {
             .find(|e| e.id == "org/modelo-manual")
             .unwrap();
         assert_eq!(manual.supports_tools, Capability::Nao, "manual não muda");
+    }
+
+    /// Mistral Large 4 (NVIDIA NIM, free endpoint): raciocínio com esforços
+    /// low/medium/high — sem `none`/`minimal`/`xhigh`/`max`, contexto 262K.
+    #[test]
+    fn mistral_large_4_suporta_esforcos_low_medium_high() {
+        let c = known_capabilities("mistralai/mistral-large-4-1t-a52b")
+            .expect("mistral large 4 no catálogo");
+        assert_eq!(c.tools, Capability::Sim);
+        assert_eq!(c.reasoning, Capability::Sim);
+        assert_eq!(c.vision, Capability::Sim);
+        assert_eq!(c.ctx, 262_000);
+        assert_eq!(c.efforts, vec!["low", "medium", "high"]);
+        assert!(!c.efforts.contains(&"none".to_string()));
+        assert!(!c.efforts.contains(&"max".to_string()));
     }
 
     #[test]

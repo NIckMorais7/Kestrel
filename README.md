@@ -94,6 +94,8 @@ Esforços de raciocínio (`/effort`) seguem o que cada modelo aceita:
   GLM-5.3 (e flash), Step 5 Preview, GPT-OSS-20B: `low`/`medium`/`high`;
 - **MiniMax M3.1 Flash**: `low`/`medium`/`high`/`xhigh`/`max` — o
   raciocínio é sempre ligado e **não** aceita `none` (a API responde 400);
+- **Mistral Large 4** (`mistralai/mistral-large-4-1t-a52b`): `low`/`medium`/`high`
+  — raciocínio em três níveis (o modelo sempre raciocina; `none` não é aceito);
 - DeepSeek V4.1 Flash: raciocínio numérico (1–100), fora do seletor de
   esforços (pensa com o padrão);
 - Modelos sem esforços configuráveis (Muse Glimmer, Gemma 4, Laguna, Bolt):

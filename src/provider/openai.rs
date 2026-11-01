@@ -246,9 +246,8 @@ impl OpenAiCompatProvider {
             .ok_or_else(|| ProviderError::RespostaInvalida("resposta sem `message`".into()))?;
         let texto_resposta = mensagem
             .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or_default()
-            .to_string();
+            .map(extrair_texto_content)
+            .unwrap_or_default();
         let raciocinio = mensagem
             .get("reasoning_content")
             .or_else(|| mensagem.get("reasoning"))
@@ -663,6 +662,21 @@ fn extrair_mensagem(corpo: &str) -> String {
         return crate::util::truncate(msg, 400);
     }
     crate::util::truncate(corpo.trim(), 400)
+}
+
+/// Extrai o texto final de `message.content`: alguns modelos (Mistral Large
+/// 4, GLM) devolvem uma lista de chunks (thinking + text) em vez de uma
+/// string quando raciocinam. Só as partes de texto contam para a resposta; o
+/// raciocínio vem por `reasoning_content`/`reasoning`.
+fn extrair_texto_content(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(partes) => partes
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect(),
+        _ => String::new(),
+    }
 }
 
 fn backoff(tentativa: u32) -> Duration {

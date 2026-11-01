@@ -42,7 +42,7 @@ use std::path::PathBuf;
 ///
 /// O Cargo exige semver de três componentes, então o pacote continua em
 /// `0.9.5`; o hotfix é identificado como `0.9.5.5`.
-pub const VERSAO: &str = "0.9.7";
+pub const VERSAO: &str = "0.9.8";
 
 /// Kestrel — agente autônomo de codificação para o terminal.
 #[derive(Parser, Debug)]

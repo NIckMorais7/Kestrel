@@ -232,6 +232,12 @@ pub enum Bloco {
         dica: Option<String>,
     },
     Aviso(String),
+    /// Falha de recuperação automática: erro em vermelho, com a tentativa.
+    Recuperacao {
+        descricao: String,
+        tentativa: u32,
+        maximo: u32,
+    },
     Turno(String),
     /// Fio horizontal que abre um turno do usuário.
     Separador,
@@ -350,7 +356,7 @@ impl Bloco {
             }
             Bloco::Saida { nome, .. } => theme::Trilha::da_ferramenta(nome),
             Bloco::Subagente { .. } => theme::Trilha::Subagente,
-            Bloco::Erro { .. } => theme::Trilha::Erro,
+            Bloco::Erro { .. } | Bloco::Recuperacao { .. } => theme::Trilha::Erro,
             Bloco::Raciocinio(_) => theme::Trilha::Subagente,
             Bloco::Plano { .. } | Bloco::Tarefas { .. } => theme::Trilha::Shell,
             Bloco::Separador => theme::Trilha::Leitura,
@@ -491,6 +497,27 @@ impl Bloco {
             }
             Bloco::Aviso(texto) => {
                 prefixar_linhas(texto, "• ", theme::info(), "  ", theme::apagado())
+            }
+            Bloco::Recuperacao {
+                descricao,
+                tentativa,
+                maximo,
+            } => {
+                let mut linhas = vec![Line::from(vec![
+                    Span::styled("✖ erro ", theme::falha().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("· tentativa {tentativa}/{maximo}"),
+                        theme::apagado(),
+                    ),
+                ])];
+                for parte in descricao.lines() {
+                    linhas.push(Line::from(Span::styled(
+                        format!("  {parte}"),
+                        theme::falha(),
+                    )));
+                }
+                linhas.push(Line::default());
+                linhas
             }
             Bloco::Turno(texto) => {
                 // Rodapé de turno: uma linha curta e apagada, sem caixa nem
@@ -823,6 +850,13 @@ pub struct App {
     pub estado_expira: Option<u64>,
     pub estado_texto: String,
     pub turno_ativo: bool,
+    /// Momento em que o turno atual começou (timer da linha de atividade).
+    turno_iniciado_em: Option<std::time::Instant>,
+    /// Texto-chave da última linha de atividade renderizada (para não
+    /// reconstruir a cauda quando nada mudou visualmente).
+    atividade_chave: Option<String>,
+    /// Linha de atividade (spinner + tempo + estado) no fim da conversa.
+    atividade_linha: Option<Line<'static>>,
     pub modelo: String,
     pub esforco: Option<String>,
     pub nivel: PermissionLevel,
@@ -924,6 +958,9 @@ impl App {
             estado_expira: None,
             estado_texto: "pronto".into(),
             turno_ativo: false,
+            turno_iniciado_em: None,
+            atividade_chave: None,
+            atividade_linha: None,
             modelo,
             esforco,
             nivel,
@@ -1046,6 +1083,11 @@ impl App {
                 self.linhas.extend(self.blocos[i].linhas());
             }
         }
+        // A linha de atividade vive no fim da conversa, fora dos blocos: ela
+        // acompanha o raciocínio/ação mais recente enquanto o turno roda.
+        if let Some(linha) = &self.atividade_linha {
+            self.linhas.push(linha.clone());
+        }
     }
 
     /// Reconstrói tudo (usado ao alternar a exibição do raciocínio).
@@ -1060,6 +1102,59 @@ impl App {
             let indice = self.blocos.len() - 1;
             self.reconstruir_do(indice);
         }
+    }
+
+    /// Reconstrói só a cauda da conversa: o último bloco mais a linha de
+    /// atividade (que vive fora dos blocos).
+    fn reconstruir_cauda(&mut self) {
+        if self.blocos.is_empty() {
+            return;
+        }
+        let ultimo = self.blocos.len() - 1;
+        self.reconstruir_do(ultimo);
+    }
+
+    /// Atualiza a linha de atividade do turno corrente (spinner + tempo
+    /// decorrido + estado). Devolve `true` quando houve mudança visível.
+    fn atualizar_atividade(&mut self) -> bool {
+        let Some(iniciado) = self.turno_iniciado_em else {
+            let tinha = self.atividade_linha.is_some();
+            self.atividade_chave = None;
+            self.atividade_linha = None;
+            if tinha {
+                self.reconstruir_cauda();
+            }
+            return tinha;
+        };
+        // "Quadrado" girando: cantos que rotacionam (▘▝▗▖). Com movimento
+        // reduzido, fica parado.
+        let glifo = if self.movimento_reduzido {
+            "▘"
+        } else {
+            const QUADRADO: [&str; 4] = ["▘", "▝", "▗", "▖"];
+            QUADRADO[(self.tick / 2) as usize % QUADRADO.len()]
+        };
+        let tempo = crate::util::format_duration_ms(
+            iniciado.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        );
+        let estado = if self.estado_texto.trim().is_empty() {
+            "trabalhando".to_string()
+        } else {
+            self.estado_texto.to_lowercase()
+        };
+        let chave = format!("{glifo}|{tempo}|{estado}");
+        if self.atividade_chave.as_deref() == Some(chave.as_str()) {
+            return false;
+        }
+        self.atividade_chave = Some(chave);
+        self.atividade_linha = Some(Line::from(vec![
+            Span::styled("  ", theme::apagado()),
+            Span::styled(glifo, theme::em_execucao().add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {tempo}"), theme::apagado()),
+            Span::styled(format!(" · {estado}"), theme::texto()),
+        ]));
+        self.reconstruir_cauda();
+        true
     }
 
     fn limpar_conversa(&mut self) {
@@ -2407,6 +2502,10 @@ impl App {
         match evento {
             AgentEvent::TurnoIniciado => {
                 self.turno_ativo = true;
+                self.turno_iniciado_em = Some(std::time::Instant::now());
+                self.atividade_chave = None;
+                self.atividade_linha = None;
+                self.atualizar_atividade();
                 self.definir_estado(EstadoMascote::Pensando, "pensando");
             }
             AgentEvent::Texto { delta } => {
@@ -2694,17 +2793,19 @@ impl App {
                 tentativa,
                 maximo,
             } => {
-                let texto = if maximo > 0 {
-                    format!("{descricao} ({tentativa}/{maximo})")
-                } else {
-                    descricao
-                };
-                self.empurrar_bloco(Bloco::Aviso(texto));
+                self.empurrar_bloco(Bloco::Recuperacao {
+                    descricao,
+                    tentativa,
+                    maximo,
+                });
                 // Evento do agente: so arrasta para o fim quem ja estava la.
                 self.acompanhar_fim();
             }
             AgentEvent::TurnoConcluido { resumo } => {
                 self.turno_ativo = false;
+                self.turno_iniciado_em = None;
+                self.atividade_chave = None;
+                self.atividade_linha = None;
                 self.empurrar_bloco(Bloco::Turno(resumo));
                 self.estado = EstadoMascote::Concluindo;
                 self.estado_texto = "concluído".into();
@@ -2714,6 +2815,9 @@ impl App {
             }
             AgentEvent::Interrompido { resumo } => {
                 self.turno_ativo = false;
+                self.turno_iniciado_em = None;
+                self.atividade_chave = None;
+                self.atividade_linha = None;
                 self.empurrar_bloco(Bloco::Aviso(resumo));
                 self.definir_estado(EstadoMascote::Ocioso, "interrompido");
                 // Evento do agente: so arrasta para o fim quem ja estava la.
@@ -3625,6 +3729,10 @@ impl App {
     pub fn tiquetaquear(&mut self) -> bool {
         self.tick = self.tick.wrapping_add(1);
         let mut mudou = false;
+        // Linha de atividade no fim da conversa (spinner + tempo + estado).
+        if self.atualizar_atividade() {
+            mudou = true;
+        }
         // Aviso temporário: expira sozinho, sem ninguém precisar limpá-lo.
         if let Some((_, expira)) = &self.toast
             && self.tick >= *expira

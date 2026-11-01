@@ -582,19 +582,10 @@ fn desenhar_entrada(f: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(Text::from(linhas_render)).scroll((scroll_v, 0)),
         texto_area,
     );
-    let estilo_prompt = if app.turno_ativo {
-        theme::pulso(app.tick, true).add_modifier(Modifier::BOLD)
-    } else {
-        theme::acento().add_modifier(Modifier::BOLD)
-    };
-    // Durante um turno o glifo do prompt vira spinner: a atividade fica ao
-    // lado de onde se digita, sem ocupar linha da conversa.
-    let glifo_prompt: &str = if app.turno_ativo {
-        const SPIINER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-        SPIINER[(app.tick as usize) % SPIINER.len()]
-    } else {
-        "❯"
-    };
+    // O spinner saiu do campo de mensagem: a atividade agora vive na conversa,
+    // junto do raciocínio/ação mais recente (linha de atividade em app.rs).
+    let estilo_prompt = theme::acento().add_modifier(Modifier::BOLD);
+    let glifo_prompt: &str = "❯";
     f.render_widget(
         Paragraph::new(Span::styled(glifo_prompt, estilo_prompt)),
         Rect {
