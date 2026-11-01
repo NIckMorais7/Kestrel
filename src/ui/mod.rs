@@ -111,8 +111,9 @@ fn desenhar_cabecalho(f: &mut Frame, app: &App, area: Rect) {
         theme::apagado(),
     ));
     titulo.push(Span::styled("   ", theme::apagado()));
+    let nome_modelo = crate::provider::catalog::nome_amigavel(&app.modelo);
     titulo.push(Span::styled(
-        crate::util::truncate(&app.modelo, 42),
+        crate::util::truncate(&nome_modelo, 42),
         theme::apagado(),
     ));
     if let Some(esforco) = &app.esforco {
@@ -1442,7 +1443,9 @@ mod tests {
     fn cabecalho_mostra_modelo_modo_e_permissao() {
         let mut app = app_de_teste();
         let tela = desenhar_em(&mut app, 120, 30);
-        assert!(tela.contains("modelo/teste"));
+        // O cabeçalho mostra o nome amigável, não o id bruto (`modelo/teste`).
+        assert!(!tela.contains("modelo/teste"));
+        assert!(tela.contains("Teste"));
         // O provedor não é informação de cabeçalho: saiu do topo a pedido do
         // usuário e continua disponível em /config.
         assert!(!tela.contains("nvidia"));

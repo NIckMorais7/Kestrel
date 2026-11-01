@@ -696,6 +696,10 @@ fn com_trilha(linhas: Vec<Line<'static>>, trilha: theme::Trilha) -> Vec<Line<'st
     let cor = trilha.cor();
     linhas
         .into_iter()
+        // Linhas vazias (espaçamento entre/ao redor dos blocos) não ganham o
+        // glifo: um traço solto no ar, acima/abaixo do texto, parecia mal
+        // posicionado.
+        .filter(|linha| linha.spans.iter().any(|s| !s.content.trim().is_empty()))
         .map(|mut linha| {
             let mut spans = vec![Span::styled(
                 theme::GLIFO_TRILHA,
@@ -1114,16 +1118,25 @@ impl App {
         self.reconstruir_do(ultimo);
     }
 
+    /// Remove a linha de atividade da conversa. Na CO do turno isso precisa
+    /// acontecer ANTES de empurrar o bloco final: a reconstrução que segue um
+    /// empurrão não trunca linhas antigas (o novo bloco não tem marco ainda),
+    /// e a linha de atividade sobrava no fim — duplicando o tempo no chat.
+    fn limpar_atividade(&mut self) {
+        if self.atividade_linha.is_none() && self.atividade_chave.is_none() {
+            return;
+        }
+        self.atividade_chave = None;
+        self.atividade_linha = None;
+        self.reconstruir_cauda();
+    }
+
     /// Atualiza a linha de atividade do turno corrente (spinner + tempo
     /// decorrido + estado). Devolve `true` quando houve mudança visível.
     fn atualizar_atividade(&mut self) -> bool {
         let Some(iniciado) = self.turno_iniciado_em else {
             let tinha = self.atividade_linha.is_some();
-            self.atividade_chave = None;
-            self.atividade_linha = None;
-            if tinha {
-                self.reconstruir_cauda();
-            }
+            self.limpar_atividade();
             return tinha;
         };
         // "Quadrado" girando: cantos que rotacionam (▘▝▗▖). Com movimento
@@ -2804,8 +2817,7 @@ impl App {
             AgentEvent::TurnoConcluido { resumo } => {
                 self.turno_ativo = false;
                 self.turno_iniciado_em = None;
-                self.atividade_chave = None;
-                self.atividade_linha = None;
+                self.limpar_atividade();
                 self.empurrar_bloco(Bloco::Turno(resumo));
                 self.estado = EstadoMascote::Concluindo;
                 self.estado_texto = "concluído".into();
@@ -2816,8 +2828,7 @@ impl App {
             AgentEvent::Interrompido { resumo } => {
                 self.turno_ativo = false;
                 self.turno_iniciado_em = None;
-                self.atividade_chave = None;
-                self.atividade_linha = None;
+                self.limpar_atividade();
                 self.empurrar_bloco(Bloco::Aviso(resumo));
                 self.definir_estado(EstadoMascote::Ocioso, "interrompido");
                 // Evento do agente: so arrasta para o fim quem ja estava la.
@@ -4894,6 +4905,43 @@ mod tests {
             }
             outra => panic!("esperava toast de troca de modelo, veio {outra:?}"),
         }
+    }
+
+    /// O tempo não pode aparecer duas vezes sob a mensagem: a linha de
+    /// atividade (spinner + timer) some ao fim do turno, sobrando só o
+    /// rodapé do turno (duração · tok/s · modelo).
+    #[test]
+    fn fim_do_turno_remove_linha_de_atividade() {
+        let (mut app, _rx) = app_de_teste();
+        app.empurrar_bloco(Bloco::Usuario("oi".into()));
+        app.tratar_evento(AgentEvent::TurnoIniciado);
+        app.turno_iniciado_em = Some(std::time::Instant::now());
+        app.atualizar_atividade();
+
+        let com_atividade = app
+            .linhas
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("▘")));
+        assert!(
+            com_atividade,
+            "atividade deveria estar visível durante o turno"
+        );
+
+        app.tratar_evento(AgentEvent::TurnoConcluido {
+            resumo: "2s · 1.0 tok/s · modelo · build".into(),
+        });
+        assert!(
+            !app.linhas
+                .iter()
+                .any(|l| { l.spans.iter().any(|s| s.content.contains("▘")) }),
+            "linha de atividade deveria sumir ao fim do turno"
+        );
+        let fins = app
+            .linhas
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| s.content.contains("tok/s")))
+            .count();
+        assert_eq!(fins, 1, "o resumo do turno deve aparecer uma única vez");
     }
 
     #[test]

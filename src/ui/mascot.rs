@@ -235,10 +235,10 @@ impl PipGrafico {
             cor_do_pelo(&redimensionada, escala, OLHOS[0]),
             cor_do_pelo(&redimensionada, escala, OLHOS[1]),
         ];
-        let cor_tinta = [
-            cor_da_tinta(&redimensionada, escala, OLHOS[0]),
-            cor_da_tinta(&redimensionada, escala, OLHOS[1]),
-        ];
+        // Olhos: tinta escura fixa (quase preta), em contraste com o pelo
+        // branco — amostrar o contorno resultava num cinza estranho, e o
+        // fundo deixava o olho branco demais em skins claras.
+        let cor_tinta = [COR_TINTA; 2];
         let fechado = olhos_fechados(
             &base,
             escala,
@@ -247,7 +247,7 @@ impl PipGrafico {
             &cor_pelo,
             &cor_tinta,
         );
-        // Os furos são pintados com a tinta do contorno, não com o fundo: em
+        // Os furos são pintados com a tinta escura fixa, não com o fundo: em
         // skin clara o fundo deixava o olho claro e ele sumia no pelo branco.
         pintar_olhos(
             &mut base,
@@ -324,6 +324,11 @@ fn codificar(picker: &Picker, imagem: &RgbaImage) -> anyhow::Result<Protocol> {
         )
         .map_err(|e| anyhow::anyhow!("falha ao codificar o Pip: {e}"))
 }
+
+/// Tinta dos olhos (abertos e pálpebra fechada): quase preta, para contrastar
+/// com o pelo branco em qualquer skin. Amostrar o contorno resultava num cinza
+/// estranho; o fundo deixava o olho branco demais em skins claras.
+const COR_TINTA: Rgba<u8> = Rgba([0x13, 0x15, 0x1a, 255]);
 
 /// Cor de fundo da aplicação como pixel opaco. O Pip usa o tema já
 /// inicializado; em skins claras os olhos acompanham o fundo claro.
@@ -468,42 +473,6 @@ fn cor_do_pelo(imagem: &RgbaImage, escala: f32, olho: (u32, u32, u32, u32)) -> R
     ])
 }
 
-/// Cor da tinta (contorno/olho) ao redor de um buraco: o pixel opaco mais
-/// escuro do anel externo. É o que dá contraste contra o pelo branco — usar a
-/// cor do pelo na piscada fazia o olho desaparecer.
-fn cor_da_tinta(imagem: &RgbaImage, escala: f32, olho: (u32, u32, u32, u32)) -> Rgba<u8> {
-    let (x0, y0, x1, y1) = olho;
-    let e0 = (x0 as f32 * escala).round() as i64;
-    let e1 = (x1 as f32 * escala).round() as i64;
-    let f0 = (y0 as f32 * escala).round() as i64;
-    let f1 = (y1 as f32 * escala).round() as i64;
-    let margem = 3i64;
-    let inicio_x = (e0 - margem).max(0);
-    let inicio_y = (f0 - margem).max(0);
-    let fim_x = (e1 + margem).min(imagem.width() as i64 - 1);
-    let fim_y = (f1 + margem).min(imagem.height() as i64 - 1);
-    let mut melhor = None;
-    let mut luminancia_min = u32::MAX;
-    for y in inicio_y..=fim_y {
-        for x in inicio_x..=fim_x {
-            if x >= e0 && x <= e1 && y >= f0 && y <= f1 {
-                continue; // só o anel externo
-            }
-            let px = imagem.get_pixel(x as u32, y as u32);
-            if px[3] == 0 {
-                continue;
-            }
-            let luminancia =
-                299 * u32::from(px[0]) + 587 * u32::from(px[1]) + 114 * u32::from(px[2]);
-            if luminancia < luminancia_min {
-                luminancia_min = luminancia;
-                melhor = Some(Rgba([px[0], px[1], px[2], 255]));
-            }
-        }
-    }
-    melhor.unwrap_or(Rgba([36, 38, 44, 255]))
-}
-
 /// Compõe um pixel RGBA sobre um fundo opaco. O resultado é sempre opaco:
 /// transparência sobrando na moldura virava bloco branco em alguns protocolos.
 fn misturar(fundo: Rgba<u8>, frente: Rgba<u8>) -> Rgba<u8> {
@@ -646,23 +615,14 @@ mod tests {
         }
     }
 
-    /// A cor do pelo amostrada ao redor do olho acompanha o tom real da
-    /// imagem — não um branco puro fixo. Com o pelo em (220,220,220), a
-    /// piscada fecha o olho com ~220, não 255.
+    /// O olho usa uma tinta escura fixa (quase preta) para contrastar com o
+    /// pelo branco em qualquer skin — nem cinza amostrado do contorno, nem o
+    /// branco do fundo.
     #[test]
-    fn tinta_do_olho_vem_do_contorno_escuro() {
-        let mut imagem = RgbaImage::from_pixel(30, 30, Rgba([255, 255, 255, 255]));
-        // Contorno escuro ao redor de um buraco 10..=20.
-        for y in 7..=23 {
-            for x in 7..=23 {
-                if !(10..=20).contains(&x) || !(10..=20).contains(&y) {
-                    imagem.put_pixel(x, y, Rgba([70, 74, 82, 255]));
-                }
-            }
-        }
-        let tinta = cor_da_tinta(&imagem, 1.0, (10, 10, 20, 20));
-        assert!(tinta[0] < 100 && tinta[1] < 100, "veio: {tinta:?}");
-        assert_eq!(tinta[3], 255);
+    fn olho_usa_tinta_escura_fixa() {
+        assert_eq!(COR_TINTA, Rgba([0x13, 0x15, 0x1a, 255]));
+        assert!(COR_TINTA[0] < 40 && COR_TINTA[1] < 40, "tinta clara demais");
+        assert_eq!(COR_TINTA[3], 255);
     }
 
     #[test]

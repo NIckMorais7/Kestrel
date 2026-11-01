@@ -135,6 +135,49 @@ pub fn known_capabilities(model_id: &str) -> Option<KnownCapabilities> {
     }
 }
 
+/// Nome amigável de um modelo para exibição (lista `/model`, cabeçalho).
+/// Usa uma tabela curada para os modelos do catálogo; para os demais, deriva
+/// do id (remove o provedor e humaniza os separadores).
+pub fn nome_amigavel(model_id: &str) -> String {
+    let nome = match model_id.to_lowercase().as_str() {
+        "nvidia/nemotron-3.5-super-vl-120b-a12b" => "Nemotron 3.5 Super VL",
+        "nvidia/nemotron-3-super-120b-a12b" => "Nemotron 3 Super",
+        "nvidia/nemotron-3-ultra-550b-a55b" => "Nemotron 3 Ultra",
+        "nvidia/nemotron-3.5-lightning-30b-a3b" => "Nemotron 3.5 Lightning",
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" => "Nemotron 3 Nano Omni",
+        "nvidia/nemotron-3.5-bolt-e4b" => "Nemotron 3.5 Bolt",
+        "z-ai/glm-5.3" => "GLM-5.3",
+        "z-ai/glm-5.3-flash" => "GLM-5.3 Flash",
+        "stepfun-ai/step-5-preview" => "Step 5 Preview",
+        "openai/gpt-oss-20b" => "GPT-OSS-20B",
+        "meta/muse-glimmer-30b" => "Muse Glimmer",
+        "poolside/laguna-xs-2.1" => "Laguna XS 2.1",
+        "google/gemma-4-31b-it" => "Gemma 4 31B",
+        "minimaxai/minimax-m3.1-flash" => "MiniMax M3.1 Flash",
+        "deepseek-ai/deepseek-v4.1-flash" => "DeepSeek V4.1 Flash",
+        "mistralai/mistral-large-4-1t-a52b" => "Mistral Large 4",
+        _ => return nome_fallback(model_id),
+    };
+    nome.to_string()
+}
+
+/// Derivação genérica de nome: último segmento do id, com separadores
+/// humanizados (`org/modelo-manual` → `Modelo Manual`).
+fn nome_fallback(model_id: &str) -> String {
+    let base = model_id.rsplit('/').next().unwrap_or(model_id);
+    base.split(['-', '_'])
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let mut chars = s.chars();
+            match chars.next() {
+                Some(primeira) => primeira.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Aplica capacidades conhecidas a uma entrada recém-descoberta, sem
 /// sobrescrever escolhas manuais explícitas.
 pub fn enrich(entry: ModelEntry) -> ModelEntry {
@@ -151,6 +194,9 @@ pub fn enrich(entry: ModelEntry) -> ModelEntry {
         if entry.notes.is_none() {
             entry.notes = Some(c.nota.to_string());
         }
+    }
+    if entry.display_name.is_none() {
+        entry.display_name = Some(nome_amigavel(&entry.id));
     }
     entry
 }
@@ -183,7 +229,9 @@ fn preservar_ajustes(anterior: &ModelEntry, mesclado: &mut ModelEntry) {
     if anterior.supports_vision != Capability::Desconhecido {
         mesclado.supports_vision = anterior.supports_vision;
     }
-    mesclado.display_name = anterior.display_name.clone();
+    if anterior.display_name.is_some() {
+        mesclado.display_name = anterior.display_name.clone();
+    }
     if anterior.notes.is_some() {
         mesclado.notes = anterior.notes.clone();
     }
