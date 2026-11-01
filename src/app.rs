@@ -720,6 +720,10 @@ pub enum ValorSeletor {
     Permissao(PermissionLevel),
     Sessao(String),
     Projeto(String),
+    /// Índice de um servidor MCP na configuração.
+    McpServidor(usize),
+    /// Ação "adicionar servidor MCP".
+    NovoMcp,
     Nada,
 }
 
@@ -728,6 +732,12 @@ pub struct ItemSeletor {
     pub titulo: String,
     pub detalhe: String,
     pub valor: ValorSeletor,
+}
+
+/// Documento TOML usado pelo editor `/mcp`: um ou mais blocos `[[mcp]]`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DocMcp {
+    mcp: Vec<crate::config::McpServidor>,
 }
 /// Seletor modal reutilizado por vários comandos.
 pub struct Seletor {
@@ -825,6 +835,22 @@ pub enum Modal {
     ConfirmarComp {
         nome: String,
     },
+    /// Gerenciamento de servidores MCP (listar, adicionar, editar, remover).
+    Mcp {
+        seletor: Seletor,
+    },
+    /// Editor TOML de um servidor MCP (`indice` = posição em `config.mcp`;
+    /// `None` = novo servidor).
+    McpEditor {
+        indice: Option<usize>,
+        editor: Editor,
+        erro: Option<String>,
+        scroll: u16,
+    },
+    /// Confirmação de remoção de um servidor MCP.
+    ConfirmarMcp {
+        indice: usize,
+    },
     /// Busca textual na conversa, com salto entre ocorrências.
     Busca {
         consulta: String,
@@ -864,6 +890,15 @@ pub struct App {
     /// Nome da ferramenta em execução no momento (se houver): aparece na
     /// linha de atividade ("usando create_file") enquanto a ferramenta roda.
     ferramenta_atual: Option<String>,
+    /// Seleção de texto na conversa (intervalo de linhas lógicas), para copiar
+    /// com Ctrl+V/Ctrl+Shift+V/Ctrl+C/Ctrl+Shift+C.
+    pub selecao: Option<(usize, usize)>,
+    /// Célula onde o botão esquerdo foi pressionado (para distinguir clique de
+    /// arrasto/seleção).
+    mouse_origem: Option<(u16, u16)>,
+    mouse_arrasto: bool,
+    /// Último retângulo da área de conversa (para mapear mouse → linha).
+    pub area_conversa: ratatui::layout::Rect,
     pub modelo: String,
     pub esforco: Option<String>,
     pub nivel: PermissionLevel,
@@ -969,6 +1004,10 @@ impl App {
             atividade_chave: None,
             atividade_linha: None,
             ferramenta_atual: None,
+            selecao: None,
+            mouse_origem: None,
+            mouse_arrasto: false,
+            area_conversa: ratatui::layout::Rect::default(),
             modelo,
             esforco,
             nivel,
@@ -1155,11 +1194,12 @@ impl App {
             iniciado.elapsed().as_millis().min(u64::MAX as u128) as u64,
         );
         let estado = if let Some(ferramenta) = &self.ferramenta_atual {
-            format!("usando {ferramenta}")
+            format!("Usando {ferramenta}")
         } else if self.estado_texto.trim().is_empty() {
-            "trabalhando".to_string()
+            "Trabalhando".to_string()
         } else {
-            self.estado_texto.to_lowercase()
+            // `estado_texto` já vem capitalizado (`com_maiuscula`).
+            self.estado_texto.clone()
         };
         let chave = format!("{glifo}|{tempo}|{estado}");
         if self.atividade_chave.as_deref() == Some(chave.as_str()) {
@@ -1341,6 +1381,9 @@ impl App {
                      retomado com /historico."
                         .into(),
                 ));
+            }
+            "/mcp" | "/servidores_mcp" | "/mcps" => {
+                self.abrir_seletor_mcps();
             }
             "/model" | "/modelo" => {
                 if !argumento.is_empty() {
@@ -2511,6 +2554,12 @@ impl App {
                 self.config.agent.workdir = Some(caminho.clone().into());
                 let _ = self.cmd_tx.send(UiCommand::TrocarProjeto(caminho));
             }
+            ValorSeletor::McpServidor(indice) => {
+                self.abrir_mcp_editor(Some(indice));
+            }
+            ValorSeletor::NovoMcp => {
+                self.abrir_mcp_editor(None);
+            }
             ValorSeletor::Nada => {}
         }
     }
@@ -3106,6 +3155,11 @@ impl App {
     }
 
     fn tratar_mouse(&mut self, mouse: MouseEvent) {
+        // Com modal aberto, o mouse pertence ao modal (nada de seleção na
+        // conversa por baixo dele).
+        if self.modal.is_some() {
+            return;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 let alvo = self.scroll_alvo.saturating_sub(3);
@@ -3120,7 +3174,7 @@ impl App {
                     self.rolar_para(alvo);
                 }
             }
-            MouseEventKind::Down(botao) => {
+            MouseEventKind::Down(MouseButton::Left) => {
                 // Clique no atalho "voltar para o último".
                 if let Some(area) = self.area_voltar
                     && mouse.column >= area.x
@@ -3131,27 +3185,81 @@ impl App {
                     self.ir_para_o_fim();
                     return;
                 }
-                // Clique num bloco da conversa: abre ou fecha. Só o botão
-                // esquerdo, e só sobre um bloco — clicar em texto não faz
-                // nada, então não há risco de fechar sem querer.
-                if botao == MouseButton::Left {
-                    let alvo = self
-                        .areas_blocos
-                        .iter()
-                        .find(|(_, area)| {
-                            mouse.column >= area.x
-                                && mouse.column < area.x + area.width
-                                && mouse.row >= area.y
-                                && mouse.row < area.y + area.height
-                        })
-                        .map(|(indice, _)| *indice);
-                    if let Some(indice) = alvo {
-                        self.alternar_bloco(indice);
+                self.mouse_origem = Some((mouse.column, mouse.row));
+                self.mouse_arrasto = false;
+                self.selecao = None;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(origem) = self.mouse_origem else {
+                    return;
+                };
+                const LIMIAR: u16 = 2;
+                if mouse.column.abs_diff(origem.0) >= LIMIAR
+                    || mouse.row.abs_diff(origem.1) >= LIMIAR
+                {
+                    self.mouse_arrasto = true;
+                }
+                if self.mouse_arrasto {
+                    let inicio = self.linha_logica_do_cursor(origem.1);
+                    let fim = self.linha_logica_do_cursor(mouse.row);
+                    if let (Some(a), Some(b)) = (inicio, fim) {
+                        self.selecao = Some((a.min(b), a.max(b)));
                     }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let arrasto = self.mouse_arrasto;
+                self.mouse_origem = None;
+                self.mouse_arrasto = false;
+                if arrasto {
+                    // Finaliza a seleção na linha sob o cursor.
+                    if let Some(b) = self.linha_logica_do_cursor(mouse.row)
+                        && let Some((a, _)) = self.selecao
+                    {
+                        self.selecao = Some((a, b.max(a)));
+                    }
+                    return;
+                }
+                // Clique simples (sem arrasto): abre/fecha o bloco clicado.
+                if let Some(alvo) = self
+                    .areas_blocos
+                    .iter()
+                    .find(|(_, area)| {
+                        mouse.column >= area.x
+                            && mouse.column < area.x + area.width
+                            && mouse.row >= area.y
+                            && mouse.row < area.y + area.height
+                    })
+                    .map(|(indice, _)| *indice)
+                {
+                    self.alternar_bloco(alvo);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Mapeia uma linha da tela (área de conversa) para a linha lógica do
+    /// histórico. Devolve `None` fora da área ou sem cache de alturas.
+    fn linha_logica_do_cursor(&self, row: u16) -> Option<usize> {
+        let interno = self.area_conversa;
+        if row < interno.y || row >= interno.y + interno.height {
+            return None;
+        }
+        let prefixo = self.cache_alturas.as_ref().map(|(_, _, p)| p)?;
+        if prefixo.is_empty() {
+            return None;
+        }
+        let total = self.linhas.len();
+        if total == 0 {
+            return None;
+        }
+        let wrapped = usize::from(row - interno.y) + usize::from(self.scroll);
+        let indice = prefixo
+            .partition_point(|p| *p <= wrapped)
+            .saturating_sub(1)
+            .min(total - 1);
+        Some(indice)
     }
 
     /// Converte uma linha lógica para o deslocamento renderizado, quando o
@@ -3247,6 +3355,40 @@ impl App {
             self.avisar(self.idioma.t(crate::i18n::Chave::SemResposta).to_string());
             return;
         };
+        self.enviar_osc52(texto);
+    }
+
+    /// Copia o texto selecionado na conversa via OSC 52. Devolve `false`
+    /// quando não há seleção (ou ela está vazia).
+    fn copiar_selecao(&mut self) -> bool {
+        let Some((a, b)) = self.selecao else {
+            return false;
+        };
+        if a >= self.linhas.len() {
+            self.selecao = None;
+            return false;
+        }
+        let fim = b.min(self.linhas.len() - 1);
+        let texto: String = self.linhas[a..=fim]
+            .iter()
+            .map(|linha| {
+                linha
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.selecao = None;
+        if texto.trim().is_empty() {
+            return false;
+        }
+        self.enviar_osc52(texto);
+        true
+    }
+
+    fn enviar_osc52(&mut self, texto: String) {
         let codificado = crate::util::base64(texto.as_bytes());
         use std::io::Write;
         let mut saida = std::io::stdout();
@@ -3258,6 +3400,133 @@ impl App {
         } else {
             self.avisar("não foi possível enviar a cópia ao terminal".into());
         }
+    }
+
+    fn abrir_seletor_mcps(&mut self) {
+        let mut itens: Vec<ItemSeletor> = self
+            .config
+            .mcp
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let (transporte, alvo) = match s.transporte {
+                    crate::config::McpTransporte::Stdio => {
+                        ("stdio", format!("{} {}", s.comando, s.args.join(" ")))
+                    }
+                    crate::config::McpTransporte::Http => {
+                        ("http", s.url.clone().unwrap_or_default())
+                    }
+                };
+                ItemSeletor {
+                    titulo: if s.nome.is_empty() {
+                        "(sem nome)".into()
+                    } else {
+                        s.nome.clone()
+                    },
+                    detalhe: format!("{transporte} · {alvo}"),
+                    valor: ValorSeletor::McpServidor(i),
+                }
+            })
+            .collect();
+        itens.push(ItemSeletor {
+            titulo: "＋ Adicionar servidor MCP".into(),
+            detalhe: "configura um novo servidor (stdio ou HTTP)".into(),
+            valor: ValorSeletor::NovoMcp,
+        });
+        self.abrir_modal(Modal::Mcp {
+            seletor: Seletor::novo(
+                "Servidores MCP",
+                "enter abre o editor · d remove · esc fecha",
+                itens,
+            ),
+        });
+    }
+
+    fn abrir_mcp_editor(&mut self, indice: Option<usize>) {
+        let conteudo = match indice {
+            Some(i) => self.config.mcp.get(i).map(|s| {
+                toml::to_string(&DocMcp {
+                    mcp: vec![s.clone()],
+                })
+                .unwrap_or_default()
+            }),
+            None => None,
+        }
+        .unwrap_or_else(|| {
+            [
+                "[[mcp]]",
+                "nome = \"meu-servidor\"",
+                "comando = \"npx\"",
+                "args = [\"-y\", \"@modelcontextprotocol/server-exemplo\"]",
+            ]
+            .join("\n")
+        });
+        let mut editor = Editor::novo(128);
+        editor.inserir_texto(&conteudo);
+        self.abrir_modal(Modal::McpEditor {
+            indice,
+            editor,
+            erro: None,
+            scroll: 0,
+        });
+    }
+
+    fn salvar_mcp_editor(&mut self) {
+        let Some(Modal::McpEditor {
+            indice,
+            editor,
+            erro,
+            ..
+        }) = self.modal.as_mut()
+        else {
+            return;
+        };
+        match toml::from_str::<DocMcp>(editor.texto()) {
+            Err(e) => *erro = Some(format!("TOML inválido: {e}")),
+            Ok(doc) if doc.mcp.is_empty() => {
+                *erro = Some("nenhum [[mcp]] no texto".into());
+            }
+            Ok(doc) => {
+                match *indice {
+                    Some(i) if doc.mcp.len() == 1 => {
+                        if i < self.config.mcp.len() {
+                            self.config.mcp[i] = doc.mcp.into_iter().next().unwrap();
+                        } else {
+                            *erro = Some("índice do servidor não existe mais".into());
+                            return;
+                        }
+                    }
+                    Some(_) => {
+                        *erro = Some("ao editar, use um único [[mcp]]".into());
+                        return;
+                    }
+                    None => self.config.mcp.extend(doc.mcp),
+                }
+                if let Err(e) = self.config.save(&self.paths) {
+                    *erro = Some(format!("não foi possível salvar a configuração: {e}"));
+                    return;
+                }
+                self.fechar_modal();
+                let _ = self.cmd_tx.send(UiCommand::RecarregarMcp);
+                self.avisar_rapido("servidor MCP salvo; recarregando…".into(), 24);
+            }
+        }
+    }
+
+    fn remover_mcp_confirmado(&mut self) {
+        let Some(Modal::ConfirmarMcp { indice }) = self.modal else {
+            return;
+        };
+        if indice < self.config.mcp.len() {
+            self.config.mcp.remove(indice);
+            if let Err(e) = self.config.save(&self.paths) {
+                self.avisar(format!("não foi possível salvar a configuração: {e}"));
+                return;
+            }
+        }
+        self.fechar_modal();
+        let _ = self.cmd_tx.send(UiCommand::RecarregarMcp);
+        self.avisar_rapido("servidor MCP removido; recarregando…".into(), 24);
     }
 
     fn abrir_busca(&mut self) {
@@ -3406,6 +3675,15 @@ impl App {
         }
         let alt = tecla.modifiers.contains(KeyModifiers::ALT);
         let shift = tecla.modifiers.contains(KeyModifiers::SHIFT);
+        // Cópia da seleção: Ctrl+V / Ctrl+Shift+V / Ctrl+Shift+C (Ctrl+C
+        // puro continua sendo interromper/encerrar).
+        if controle
+            && (matches!(tecla.code, KeyCode::Char('v') | KeyCode::Char('V'))
+                || (shift && matches!(tecla.code, KeyCode::Char('c') | KeyCode::Char('C'))))
+            && self.copiar_selecao()
+        {
+            return;
+        }
         match tecla.code {
             KeyCode::Enter if alt || shift => self.entrada.nova_linha(),
             KeyCode::Enter => self.enviar_entrada(),
@@ -3496,6 +3774,9 @@ impl App {
             Escolher(ItemSeletor),
             SalvarComp,
             RemoverComp,
+            SalvarMcp,
+            RemoverMcp,
+            PedirConfirmacaoRemoverMcp(usize),
             Avisar(String),
             PedirConfirmacaoExcluir(Vec<String>),
             ConfirmarExcluir(Vec<String>),
@@ -3622,6 +3903,118 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Reacao::Fechar,
                 _ => Reacao::Nada,
             },
+            Some(Modal::Mcp { seletor }) => {
+                let mut reacao = Reacao::Nada;
+                match tecla.code {
+                    KeyCode::Esc => reacao = Reacao::Fechar,
+                    KeyCode::Up => seletor.sel = seletor.sel.saturating_sub(1),
+                    KeyCode::Down => {
+                        let total = seletor.filtrados().len();
+                        if total > 0 {
+                            seletor.sel = (seletor.sel + 1).min(total - 1);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        seletor.filtro.pop();
+                        seletor.sel = 0;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(item) = seletor.selecionado() {
+                            reacao = Reacao::Escolher(item.clone());
+                        }
+                    }
+                    // D: pede confirmação para remover o servidor selecionado.
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        if let Some((_, item)) = seletor.filtrados().get(seletor.sel)
+                            && let ValorSeletor::McpServidor(indice) = item.valor
+                        {
+                            reacao = Reacao::PedirConfirmacaoRemoverMcp(indice);
+                        }
+                    }
+                    KeyCode::Char(c) if !controle && !alt => {
+                        seletor.filtro.push(c);
+                        seletor.sel = 0;
+                    }
+                    _ => {}
+                }
+                seletor.ajustar_selecao();
+                reacao
+            }
+            Some(Modal::McpEditor {
+                editor,
+                erro,
+                scroll,
+                ..
+            }) => {
+                if controle {
+                    match tecla.code {
+                        KeyCode::Char('s') | KeyCode::Char('S') => Reacao::SalvarMcp,
+                        _ => Reacao::Nada,
+                    }
+                } else {
+                    match tecla.code {
+                        KeyCode::Esc => Reacao::Fechar,
+                        KeyCode::Enter => {
+                            editor.nova_linha();
+                            *erro = None;
+                            Reacao::Nada
+                        }
+                        KeyCode::Backspace => {
+                            editor.backspace();
+                            *erro = None;
+                            Reacao::Nada
+                        }
+                        KeyCode::Delete => {
+                            editor.apagar();
+                            *erro = None;
+                            Reacao::Nada
+                        }
+                        KeyCode::Left => {
+                            editor.esquerda();
+                            Reacao::Nada
+                        }
+                        KeyCode::Right => {
+                            editor.direita();
+                            Reacao::Nada
+                        }
+                        KeyCode::Home => {
+                            editor.home();
+                            Reacao::Nada
+                        }
+                        KeyCode::End => {
+                            editor.fim();
+                            Reacao::Nada
+                        }
+                        KeyCode::Up => {
+                            editor.cima();
+                            Reacao::Nada
+                        }
+                        KeyCode::Down => {
+                            editor.baixo();
+                            Reacao::Nada
+                        }
+                        KeyCode::PageUp => {
+                            *scroll = scroll.saturating_sub(10);
+                            Reacao::Nada
+                        }
+                        KeyCode::PageDown => {
+                            *scroll = scroll.saturating_add(10);
+                            Reacao::Nada
+                        }
+                        KeyCode::Char(c) if !alt => {
+                            editor.inserir_char(c);
+                            *erro = None;
+                            Reacao::Nada
+                        }
+                        _ => Reacao::Nada,
+                    }
+                }
+            }
+            Some(Modal::ConfirmarMcp { .. }) => match tecla.code {
+                KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Enter => Reacao::RemoverMcp,
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Reacao::Fechar,
+                _ => Reacao::Nada,
+            },
             Some(Modal::CompEditor {
                 editor,
                 erro,
@@ -3727,6 +4120,11 @@ impl App {
             Reacao::Confirmar(resposta) => self.responder_confirmacao(resposta),
             Reacao::SalvarComp => self.salvar_comp_modal(),
             Reacao::RemoverComp => self.remover_comp_confirmado(),
+            Reacao::SalvarMcp => self.salvar_mcp_editor(),
+            Reacao::RemoverMcp => self.remover_mcp_confirmado(),
+            Reacao::PedirConfirmacaoRemoverMcp(indice) => {
+                self.abrir_modal(Modal::ConfirmarMcp { indice });
+            }
             Reacao::Avisar(mensagem) => self.avisar(mensagem),
             Reacao::PedirConfirmacaoExcluir(ids) => {
                 self.abrir_modal(Modal::ConfirmarSessoes { ids });
@@ -4957,7 +5355,7 @@ mod tests {
     }
 
     /// Enquanto QUALQUER ferramenta roda, o nome dela aparece na linha de
-    /// atividade ("usando create_file", "usando read_file", …) — e some
+    /// atividade ("Usando create_file", "Usando read_file", …) — e some
     /// quando ela conclui. Não é específico de `create_file`.
     #[test]
     fn ferramenta_em_execucao_aparece_na_atividade() {
@@ -4979,7 +5377,7 @@ mod tests {
                 subagente: None,
             });
             app.atualizar_atividade();
-            let esperado = format!("usando {nome}");
+            let esperado = format!("Usando {nome}");
             assert!(
                 app.linhas
                     .iter()

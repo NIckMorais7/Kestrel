@@ -294,6 +294,9 @@ pub enum UiCommand {
     },
     /// Relê os diretórios de skills (instalação sem reiniciar).
     RecarregarSkills,
+    /// Recarrega os servidores MCP a partir da configuração atual (após
+    /// adicionar/editar/remover via `/mcp` na interface).
+    RecarregarMcp,
     /// Troca o diretório de trabalho, reanalisa o projeto e abre nova sessão.
     TrocarProjeto(String),
     AnalisarProjeto,

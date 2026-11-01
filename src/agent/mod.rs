@@ -789,6 +789,55 @@ impl Agente {
                                 ),
                             });
                         }
+                        UiCommand::RecarregarMcp => {
+                            let cfg = self.comp.config();
+                            let servidores = cfg.mcp.clone();
+                            let confiaveis = cfg.mcp_trusted_keys.clone();
+                            let sandbox = crate::sandbox::SandboxSettings::novo(
+                                cfg.agent.sandbox,
+                                cfg.agent.sandbox_allow_network,
+                                cfg.agent.sandbox_extra_writable.clone(),
+                            );
+                            // Remove ferramentas de servidores antigos antes de
+                            // reconectar; senão edições ficavam retidas.
+                            self.comp.registro.write().await.remover_todos_mcp();
+                            if servidores.is_empty() {
+                                self.comp.evento(AgentEvent::Aviso {
+                                    mensagem: "MCP: nenhum servidor configurado".into(),
+                                });
+                            } else {
+                                let comp_mcp = self.comp.clone();
+                                tokio::spawn(async move {
+                                    let (descobertas, avisos) =
+                                        crate::tools::mcp::conectar_todos(
+                                            &servidores,
+                                            &confiaveis,
+                                            &sandbox,
+                                        )
+                                        .await;
+                                    for aviso in avisos {
+                                        comp_mcp.evento(AgentEvent::Aviso {
+                                            mensagem: aviso,
+                                        });
+                                    }
+                                    if !descobertas.is_empty() {
+                                        let total = descobertas.len();
+                                        comp_mcp.registro.write().await.registrar_mcp(descobertas);
+                                        comp_mcp.evento(AgentEvent::Aviso {
+                                            mensagem: format!(
+                                                "MCP recarregado: {total} ferramentas de servidores disponíveis"
+                                            ),
+                                        });
+                                    } else {
+                                        comp_mcp.evento(AgentEvent::Aviso {
+                                            mensagem:
+                                                "MCP recarregado: nenhuma ferramenta descoberta"
+                                                    .into(),
+                                        });
+                                    }
+                                });
+                            }
+                        }
                         UiCommand::AnalisarProjeto => {
                             let info = self.comp.reanalisar_projeto();
                             self.comp.evento(AgentEvent::Aviso {

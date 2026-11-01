@@ -172,6 +172,7 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let largura = interno.width.max(1) as usize;
     app.areas_blocos.clear();
+    app.area_conversa = interno;
 
     // Estado vazio: recepção de nova sessão. Card com moldura, o mascote e
     // sugestões derivadas do estado real — o que não se aplica não aparece.
@@ -236,7 +237,19 @@ fn desenhar_conversa(f: &mut Frame, app: &mut App, area: Rect) {
         .partition_point(|p| *p < scroll + visivel + 1)
         .min(total_linhas)
         .max(inicio + 1);
-    let fatia = &app.linhas[inicio..fim];
+    let mut fatia: Vec<Line<'static>> = app.linhas[inicio..fim].to_vec();
+    if let Some((sa, sb)) = app.selecao {
+        let cor_fundo = theme::selecao_fundo();
+        let cor_texto = theme::selecao_texto();
+        for (offset, linha) in fatia.iter_mut().enumerate() {
+            let global = inicio + offset;
+            if global >= sa && global <= sb {
+                for span in linha.spans.iter_mut() {
+                    span.style = span.style.bg(cor_fundo).fg(cor_texto);
+                }
+            }
+        }
+    }
     let paragrafo = Paragraph::new(fatia)
         .wrap(Wrap { trim: false })
         .scroll((local_scroll, 0));
@@ -848,6 +861,26 @@ fn desenhar_modal(f: &mut Frame, app: &mut App, area: Rect) {
         Modal::ConfirmarComp { nome } => {
             desenhar_confirmar_comp(f, nome, retangulo_central(area, 54, 32));
         }
+        Modal::Mcp { seletor } => {
+            desenhar_seletor(f, seletor, None, area_modal, app.tick);
+        }
+        Modal::McpEditor {
+            editor,
+            erro,
+            scroll,
+            ..
+        } => {
+            desenhar_mcp_editor(
+                f,
+                editor,
+                erro.as_deref(),
+                *scroll,
+                retangulo_central(area, 90, 80),
+            );
+        }
+        Modal::ConfirmarMcp { .. } => {
+            desenhar_confirmar_mcp(f, retangulo_central(area, 54, 32));
+        }
         Modal::Busca { consulta, indice } => {
             let total = app.linhas_com(consulta).len();
             desenhar_busca(
@@ -970,6 +1003,133 @@ fn desenhar_comp_editor(
         + (linha_cursor.saturating_sub(rolagem as usize))
             .min(altura_texto.saturating_sub(1) as usize) as u16;
     f.set_cursor_position((x, y));
+}
+
+/// Editor TOML de um servidor MCP (mesmo modelo visual do editor de Comp).
+fn desenhar_mcp_editor(
+    f: &mut Frame,
+    editor: &crate::ui::input::Editor,
+    erro: Option<&str>,
+    scroll: u16,
+    area: Rect,
+) {
+    f.render_widget(Clear, area);
+    let bloco = theme::bloco()
+        .border_style(theme::modal_borda())
+        .style(theme::superficie())
+        .title(Span::styled(" servidor MCP ", theme::titulo()))
+        .title_bottom(Span::styled(
+            " Ctrl+S salva · Esc cancela · Enter quebra linha ",
+            theme::apagado(),
+        ));
+    let interno = bloco.inner(area);
+    f.render_widget(bloco, area);
+    if interno.height == 0 {
+        return;
+    }
+    let altura_erro = if erro.is_some() { 2 } else { 0 };
+    let altura_texto = interno.height.saturating_sub(altura_erro).max(1);
+    let largura = interno.width.max(1) as usize;
+    let (linha_cursor, coluna_cursor) = editor.posicao_cursor();
+    let rolagem = if linha_cursor < scroll as usize {
+        linha_cursor as u16
+    } else if linha_cursor >= scroll as usize + altura_texto as usize {
+        (linha_cursor + 1 - altura_texto as usize) as u16
+    } else {
+        scroll
+    };
+    let mut linhas = Vec::new();
+    if editor.vazio() {
+        linhas.push(Line::from(Span::styled(
+            "# bloqueio [[mcp]] com nome, transporte e comando/url…",
+            theme::apagado(),
+        )));
+    } else {
+        for linha in editor.texto().split('\n') {
+            let recorte: String = linha.chars().take(largura.saturating_sub(1)).collect();
+            linhas.push(Line::from(Span::styled(recorte, theme::texto())));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(linhas)).scroll((rolagem, 0)),
+        Rect {
+            x: interno.x,
+            y: interno.y,
+            width: interno.width,
+            height: altura_texto,
+        },
+    );
+    if let Some(mensagem) = erro {
+        let y = interno.y + interno.height.saturating_sub(2);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("erro: {}", crate::util::truncate(mensagem, largura)),
+                theme::falha(),
+            )),
+            Rect {
+                x: interno.x,
+                y,
+                width: interno.width,
+                height: 1,
+            },
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "corrija o texto e tente Ctrl+S de novo",
+                theme::apagado(),
+            )),
+            Rect {
+                x: interno.x,
+                y: y + 1,
+                width: interno.width,
+                height: 1,
+            },
+        );
+    }
+    let x = interno.x + (coluna_cursor).min(largura.saturating_sub(1)) as u16;
+    let y = interno.y
+        + (linha_cursor.saturating_sub(rolagem as usize))
+            .min(altura_texto.saturating_sub(1) as usize) as u16;
+    f.set_cursor_position((x, y));
+}
+
+/// Confirmação de remoção de um servidor MCP.
+fn desenhar_confirmar_mcp(f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    let bloco = theme::bloco()
+        .border_style(theme::modal_borda())
+        .style(theme::superficie())
+        .title(Span::styled(" remover servidor MCP ", theme::titulo()));
+    let interno = bloco.inner(area);
+    f.render_widget(bloco, area);
+    let linhas = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            "Remover este servidor MCP da configuração?",
+            theme::texto().add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            "As ferramentas dele deixam de ficar disponíveis ao modelo.",
+            theme::apagado(),
+        )),
+        Line::default(),
+        Line::from(vec![
+            Span::styled(" S ", theme::botao_permitir()),
+            Span::styled(" remover   ", theme::texto()),
+            Span::styled(" N ", theme::botao_negar()),
+            Span::styled(" cancelar", theme::texto()),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "Esc cancela · a configuração é salva e os MCPs são recarregados",
+            theme::apagado(),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(Text::from(linhas)).wrap(Wrap { trim: false }),
+        interno,
+    );
 }
 
 /// Confirmação de remoção de Comp: separada do fluxo de ferramentas porque a

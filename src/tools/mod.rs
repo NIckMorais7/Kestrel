@@ -392,6 +392,12 @@ impl ToolRegistry {
         }
     }
 
+    /// Remove todas as ferramentas de servidores MCP (usado ao recarregar os
+    /// servidores pela interface — evita manter servidores removidos).
+    pub fn remover_todos_mcp(&mut self) {
+        self.tools.retain(|t| !t.nome().starts_with("mcp__"));
+    }
+
     /// Quantas ferramentas vieram de servidores MCP (diagnóstico e `/config`).
     #[cfg(test)]
     pub fn total_mcp(&self) -> usize {
